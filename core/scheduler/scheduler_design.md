@@ -1,8 +1,6 @@
 Kubernetes Scheduler Principle
 ==============================
 
-## Overview
-
 Scheduler是Kubernetes组件中功能&逻辑相对单一&简单的模块，分析Kubernetes源码从scheduler开始是一个不错的选择
 
 一句话总结scheduler的功能就是：watch kube-apiserver，监听`PodSpec.NodeName`为空的pod，并利用预选和优选算法为该pod选择一个最佳的调度node节点，最终将pod与该node进行绑定

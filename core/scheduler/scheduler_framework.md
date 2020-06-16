@@ -1,7 +1,7 @@
 Kubernetes Scheduler Framework
 ==============================
 
-这里，我们在简单介绍完Scheduler的初始化流程后，下面开始分析scheduler的整体框架代码
+在简单介绍完Scheduler的初始化流程后，下面开始分析scheduler的整体框架代码
 
 如下是框架入口代码：
 

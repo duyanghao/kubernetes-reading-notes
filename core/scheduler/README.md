@@ -2,7 +2,7 @@ Kubernetes Scheduler
 ====================
 
 * [原理](scheduler_design.md)
-* [schduler初始化](scheduler_init.md)
+* [scheduler初始化](scheduler_init.md)
 * [框架](scheduler_arch.md)
 * [预选过程](scheduler_predicate_algorithm.md)
 * [优选过程](scheduler_priority_algorithm.md)

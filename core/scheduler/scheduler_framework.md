@@ -27,7 +27,7 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 
 我们对该函数逐块进行分析，依次整理各个步骤要完成的事情
 
-## step - 获取待调度的pod
+## step1 - 获取待调度的pod
 
 ```go
 podInfo := sched.NextPod()

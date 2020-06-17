@@ -38,7 +38,7 @@ func (g *genericScheduler) Schedule(ctx context.Context, state *framework.CycleS
 * prioritizeNodes：优选算法，对预选过滤出的节点filteredNodes，根据优选策略分别进行打分，得到priorityList
 * selectHost：从优选列表中选择出总分最高的一个节点，最后返回该节点名称和相关信息
 
-1. 给节点打分(prioritizeNodes)
+## step1 - 给节点打分(prioritizeNodes)
 
 优选核心代码是prioritizeNodes函数：
 
@@ -148,7 +148,7 @@ for i := range nodes {
 }
 ```
 
-可以看到是按照如下公司进行总和的：
+可以看到是按照如下公式进行总和的：
 
 ```
 nodeScores =  prioritize1Scores * weight1 + ... + prioritizeNScores * weightN
@@ -267,7 +267,7 @@ func RegisterPriorityConfigFactory(name string, pcf PriorityConfigFactory) strin
 }
 ```
 
-这里我们以`NodeAffinityPriority`为例子进行分析，从上面代码片段中可以看出该优选算法对应的Map函数为：`CalculateNodeAffinityPriorityMap`；而Reduce函数为：`CalculateNodeAffinityPriorityReduce`，这里我们先看Map函数：
+这里我们以`NodeAffinityPriority`为例子进行分析，从上面代码片段中可以看出该优选算法对应的Map函数为：`CalculateNodeAffinityPriorityMap`；而Reduce函数为：`CalculateNodeAffinityPriorityReduce`，这里我们先看Map函数
 
 在分析`CalculateNodeAffinityPriorityMap`逻辑前，我们先看看`NodeAffinity`作用：
 
@@ -277,7 +277,7 @@ func RegisterPriorityConfigFactory(name string, pcf PriorityConfigFactory) strin
 
 >> The weight field in preferredDuringSchedulingIgnoredDuringExecution is in the range 1-100. For each node that meets all of the scheduling requirements (resource request, RequiredDuringScheduling affinity expressions, etc.), the scheduler will compute a sum by iterating through the elements of this field and adding "weight" to the sum if the node matches the corresponding MatchExpressions. This score is then combined with the scores of other priority functions for the node. The node(s) with the highest total score are the most preferred.
 
-`NodeAffinity`作用类似于`NodeSelector`，用于根据node labels限制pod运行的节点，有两种类型：`requiredDuringSchedulingIgnoredDuringExecution`(硬限制) 与 `preferredDuringSchedulingIgnoredDuringExecution`(软限制)。
+`NodeAffinity`作用类似于`NodeSelector`，用于根据node labels限制pod运行的节点，有两种类型：`requiredDuringSchedulingIgnoredDuringExecution`(硬限制) 与 `preferredDuringSchedulingIgnoredDuringExecution`(软限制)
 
 另外，`preferredDuringSchedulingIgnoredDuringExecution`会有一个`weight`域(0-100)，对应node亲和优先权重，用于scheduler优选算法
 
@@ -312,7 +312,7 @@ spec:
     image: k8s.gcr.io/pause:2.0
 ```
 
-该pod只能被调度到标签key为：`kubernetes.io/e2e-az-name`，且值在`e2e-az1` or `e2e-az2`中的node上。同时具有标签key：`another-node-label-key`，值：`another-node-label-value`的node会优先调度
+该pod只能被调度到标签key为：`kubernetes.io/e2e-az-name`，且值在`e2e-az1` or `e2e-az2`中的node上。同时具有标签key：`another-node-label-key`，值：`another-node-label-value`的node会被优先调度
 
 而`NodeAffinityPriority`主要针对`preferredDuringSchedulingIgnoredDuringExecution`(软限制)进行打分，如下：
 
@@ -456,7 +456,7 @@ func (g *genericScheduler) prioritizeNodes(
 }
 ```
 
-2. 选取最优节点(selectHost)
+## step2 - 选取最优节点(selectHost)
 
 ```go
 // selectHost takes a prioritized list of nodes and then picks one

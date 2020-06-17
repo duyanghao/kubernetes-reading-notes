@@ -27,7 +27,7 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 
 我们对该函数逐块进行分析，依次整理各个步骤要完成的事情
 
-1. 获取待调度的pod
+## step - 获取待调度的pod
 
 ```go
 podInfo := sched.NextPod()
@@ -47,7 +47,7 @@ klog.V(3).Infof("Attempting to schedule pod: %v/%v", pod.Namespace, pod.Name)
 
 典型的controller代码逻辑，从cache队列中获取待调度的pod，进行简单的容错判断，最后打印标示功能
 
-2. 对pod寻找待调度node
+## step2 - 对pod寻找待调度node
 
 ```go
 // Synchronously attempt to find a fit for the pod.
@@ -109,7 +109,7 @@ type ScheduleResult struct {
 }
 ```
 
-3. Assume volume&Assume pod
+## step3 - Assume volume&Assume pod
 
 ```go
 // Tell the cache to assume that a pod now is running on a given node, even though it hasn't been bound yet.
@@ -157,7 +157,7 @@ if err != nil {
 
 AssumePodVolumes用于产生pod对应的PVs and PVCs；而assume用于设置pod属性`NodeName=scheduleResult.SuggestedHost`
 
-4. pod与node进行绑定
+## step4 - pod与node进行绑定
 
 ```go
 // bind the pod to its host asynchronously (we can do this b/c of the assumption step above).

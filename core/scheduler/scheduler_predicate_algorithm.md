@@ -47,7 +47,7 @@ func (g *genericScheduler) Schedule(ctx context.Context, state *framework.CycleS
 
 本章主要分析预选算法，也就是`findNodesThatFit`部分。预选可以大致分为三个步骤：
 
-1. 获取节点信息
+## step1 - 获取节点信息
 
 获取所有节点以及最少可行的节点数目(达到这个数目就可以停止预选，进入优选了)：
 
@@ -81,7 +81,7 @@ func (g *genericScheduler) numFeasibleNodesToFind(numAllNodes int32) (numNodes i
 }
 ```
 
-2. 并发执行预选算法
+## step2 - 并发执行预选算法
 
 在分析具体代码前，我们先看一下Kubernetes构建的内部[goroutine pool](https://github.com/kubernetes/kubernetes/blob/v1.17.4/staging/src/k8s.io/client-go/util/workqueue/parallelizer.go)，如下：
 

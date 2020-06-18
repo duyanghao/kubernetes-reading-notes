@@ -632,7 +632,7 @@ podInformer.Informer().AddEventHandler(
 注意到assignedPod和responsibleForPod函数，这两个函数含义如下：
 
 * assignedPod：pod.Spec.NodeName为空(表示待调度)
-* responsibleForPod：pod.Spec.SchedulerName为指定的scheduler，默认为`default-scheduler`，也就是`genericScheduler`(k8s.io/kubernetes/pkg/scheduler/core/generic_scheduler.go)
+* responsibleForPod：pod.Spec.SchedulerName为指定的scheduler，默认为`default-scheduler`(k8s.io/kubernetes/pkg/scheduler/scheduler.go)
 
 ```go
 // assignedPod selects pods that are assigned (scheduled and running).
@@ -707,11 +707,13 @@ func (p *PriorityQueue) Add(pod *v1.Pod) error {
 }
 ```
 
-**这里也就是我们要找的往activeQ中添加pod信息的入口。总结nextPod的流程如下：**
+**这里就是我们要找的往activeQ中添加pod信息的入口。总结nextPod的流程如下：**
 
 ```
 Pod Add Event => sched.addPodToSchedulingQueue => PriorityQueue.Add => activeQ => PriorityQueue.Pop => sched.NextPod
 ```
+
+总结：scheduler监听`spec.NodeName`为空以及`spec.SchedulerName`为自己的pod事件，当监听到Add事件时，将其添加到PriorityQueue activeQ中。而scheduler主体不断执行NextPod，从activeQ中获取待调度的pod，之后对该pod进行调度
 
 ## PriorityQueue子队列转换关系
 
@@ -723,8 +725,488 @@ Pod Add Event => sched.addPodToSchedulingQueue => PriorityQueue.Add => activeQ =
 
 #### activeQ=>unschedulableQ
 
+回到调度框架入口：
 
+```go
+// scheduleOne does the entire scheduling workflow for a single pod.  It is serialized on the scheduling algorithm's host fitting.
+func (sched *Scheduler) scheduleOne(ctx context.Context) {
+	fwk := sched.Framework
+
+	podInfo := sched.NextPod()
+	// pod could be nil when schedulerQueue is closed
+	if podInfo == nil || podInfo.Pod == nil {
+		return
+	}
+	pod := podInfo.Pod
+	if pod.DeletionTimestamp != nil {
+		sched.Recorder.Eventf(pod, nil, v1.EventTypeWarning, "FailedScheduling", "Scheduling", "skip schedule deleting pod: %v/%v", pod.Namespace, pod.Name)
+		klog.V(3).Infof("Skip schedule deleting pod: %v/%v", pod.Namespace, pod.Name)
+		return
+	}
+
+	klog.V(3).Infof("Attempting to schedule pod: %v/%v", pod.Namespace, pod.Name)
+
+	// Synchronously attempt to find a fit for the pod.
+	start := time.Now()
+	state := framework.NewCycleState()
+	state.SetRecordFrameworkMetrics(rand.Intn(100) < frameworkMetricsSamplePercent)
+	schedulingCycleCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	scheduleResult, err := sched.Algorithm.Schedule(schedulingCycleCtx, state, pod)
+	if err != nil {
+		sched.recordSchedulingFailure(podInfo.DeepCopy(), err, v1.PodReasonUnschedulable, err.Error())
+		// Schedule() may have failed because the pod would not fit on any host, so we try to
+		// preempt, with the expectation that the next time the pod is tried for scheduling it
+		// will fit due to the preemption. It is also possible that a different pod will schedule
+		// into the resources that were preempted, but this is harmless.
+		if fitError, ok := err.(*core.FitError); ok {
+			if sched.DisablePreemption {
+				klog.V(3).Infof("Pod priority feature is not enabled or preemption is disabled by scheduler configuration." +
+					" No preemption is performed.")
+			} else {
+				preemptionStartTime := time.Now()
+				sched.preempt(schedulingCycleCtx, state, fwk, pod, fitError)
+				metrics.PreemptionAttempts.Inc()
+				metrics.SchedulingAlgorithmPreemptionEvaluationDuration.Observe(metrics.SinceInSeconds(preemptionStartTime))
+				metrics.DeprecatedSchedulingAlgorithmPreemptionEvaluationDuration.Observe(metrics.SinceInMicroseconds(preemptionStartTime))
+				metrics.SchedulingLatency.WithLabelValues(metrics.PreemptionEvaluation).Observe(metrics.SinceInSeconds(preemptionStartTime))
+				metrics.DeprecatedSchedulingLatency.WithLabelValues(metrics.PreemptionEvaluation).Observe(metrics.SinceInSeconds(preemptionStartTime))
+			}
+			// Pod did not fit anywhere, so it is counted as a failure. If preemption
+			// succeeds, the pod should get counted as a success the next time we try to
+			// schedule it. (hopefully)
+			metrics.PodScheduleFailures.Inc()
+		} else {
+			klog.Errorf("error selecting node for pod: %v", err)
+			metrics.PodScheduleErrors.Inc()
+		}
+		return
+	}
+...
+}
+```
+
+可以看到在scheduler调度`sched.Algorithm.Schedule`执行失败后，会进行错误处理`sched.recordSchedulingFailure`：
+
+```go
+// recordFailedSchedulingEvent records an event for the pod that indicates the
+// pod has failed to schedule.
+// NOTE: This function modifies "pod". "pod" should be copied before being passed.
+func (sched *Scheduler) recordSchedulingFailure(podInfo *framework.PodInfo, err error, reason string, message string) {
+	sched.Error(podInfo, err)
+	pod := podInfo.Pod
+	sched.Recorder.Eventf(pod, nil, v1.EventTypeWarning, "FailedScheduling", "Scheduling", message)
+	if err := sched.podConditionUpdater.update(pod, &v1.PodCondition{
+		Type:    v1.PodScheduled,
+		Status:  v1.ConditionFalse,
+		Reason:  reason,
+		Message: err.Error(),
+	}); err != nil {
+		klog.Errorf("Error updating the condition of the pod %s/%s: %v", pod.Namespace, pod.Name, err)
+	}
+}
+```
+
+关注`sched.Error(podInfo, err)`：
+
+```go
+// CreateFromKeys creates a scheduler from a set of registered fit predicate keys and priority keys.
+func (c *Configurator) CreateFromKeys(predicateKeys, priorityKeys sets.String, extenders []algorithm.SchedulerExtender) (*Scheduler, error) {
+	klog.V(2).Infof("Creating scheduler with fit predicates '%v' and priority functions '%v'", predicateKeys, priorityKeys)
+
+	podQueue := internalqueue.NewSchedulingQueue(
+		c.StopEverything,
+		framework,
+		internalqueue.WithPodInitialBackoffDuration(time.Duration(c.podInitialBackoffSeconds)*time.Second),
+		internalqueue.WithPodMaxBackoffDuration(time.Duration(c.podMaxBackoffSeconds)*time.Second),
+	)
+
+	algo := core.NewGenericScheduler(
+		c.schedulerCache,
+		podQueue,
+		predicateFuncs,
+		predicateMetaProducer,
+		priorityConfigs,
+		priorityMetaProducer,
+		c.nodeInfoSnapshot,
+		framework,
+		extenders,
+		c.volumeBinder,
+		c.informerFactory.Core().V1().PersistentVolumeClaims().Lister(),
+		GetPodDisruptionBudgetLister(c.informerFactory),
+		c.alwaysCheckAllPredicates,
+		c.disablePreemption,
+		c.percentageOfNodesToScore,
+		c.enableNonPreempting,
+	)
+
+	return &Scheduler{
+		SchedulerCache:  c.schedulerCache,
+		Algorithm:       algo,
+		GetBinder:       getBinderFunc(c.client, extenders),
+		Framework:       framework,
+		NextPod:         internalqueue.MakeNextPodFunc(podQueue),
+		Error:           MakeDefaultErrorFunc(c.client, podQueue, c.schedulerCache),
+		StopEverything:  c.StopEverything,
+		VolumeBinder:    c.volumeBinder,
+		SchedulingQueue: podQueue,
+		Plugins:         plugins,
+		PluginConfig:    pluginConfig,
+	}, nil
+}
+```
+
+`sched.Error`也就是`MakeDefaultErrorFunc(c.client, podQueue, c.schedulerCache)`(k8s.io/kubernetes/pkg/scheduler/factory.go)，如下：
+
+```go
+// MakeDefaultErrorFunc construct a function to handle pod scheduler error
+func MakeDefaultErrorFunc(client clientset.Interface, podQueue internalqueue.SchedulingQueue, schedulerCache internalcache.Cache) func(*framework.PodInfo, error) {
+	return func(podInfo *framework.PodInfo, err error) {
+		pod := podInfo.Pod
+		if err == core.ErrNoNodesAvailable {
+			klog.V(2).Infof("Unable to schedule %v/%v: no nodes are registered to the cluster; waiting", pod.Namespace, pod.Name)
+		} else {
+			if _, ok := err.(*core.FitError); ok {
+				klog.V(2).Infof("Unable to schedule %v/%v: no fit: %v; waiting", pod.Namespace, pod.Name, err)
+			} else if errors.IsNotFound(err) {
+				klog.V(2).Infof("Unable to schedule %v/%v: possibly due to node not found: %v; waiting", pod.Namespace, pod.Name, err)
+				if errStatus, ok := err.(errors.APIStatus); ok && errStatus.Status().Details.Kind == "node" {
+					nodeName := errStatus.Status().Details.Name
+					// when node is not found, We do not remove the node right away. Trying again to get
+					// the node and if the node is still not found, then remove it from the scheduler cache.
+					_, err := client.CoreV1().Nodes().Get(nodeName, metav1.GetOptions{})
+					if err != nil && errors.IsNotFound(err) {
+						node := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+						if err := schedulerCache.RemoveNode(&node); err != nil {
+							klog.V(4).Infof("Node %q is not found; failed to remove it from the cache.", node.Name)
+						}
+					}
+				}
+			} else {
+				klog.Errorf("Error scheduling %v/%v: %v; retrying", pod.Namespace, pod.Name, err)
+			}
+		}
+
+		podSchedulingCycle := podQueue.SchedulingCycle()
+		// Retry asynchronously.
+		// Note that this is extremely rudimentary and we need a more real error handling path.
+		go func() {
+			defer runtime.HandleCrash()
+			podID := types.NamespacedName{
+				Namespace: pod.Namespace,
+				Name:      pod.Name,
+			}
+
+			// An unschedulable pod will be placed in the unschedulable queue.
+			// This ensures that if the pod is nominated to run on a node,
+			// scheduler takes the pod into account when running predicates for the node.
+			// Get the pod again; it may have changed/been scheduled already.
+			getBackoff := initialGetBackoff
+			for {
+				pod, err := client.CoreV1().Pods(podID.Namespace).Get(podID.Name, metav1.GetOptions{})
+				if err == nil {
+					if len(pod.Spec.NodeName) == 0 {
+						podInfo.Pod = pod
+						if err := podQueue.AddUnschedulableIfNotPresent(podInfo, podSchedulingCycle); err != nil {
+							klog.Error(err)
+						}
+					}
+					break
+				}
+				if errors.IsNotFound(err) {
+					klog.Warningf("A pod %v no longer exists", podID)
+					return
+				}
+				klog.Errorf("Error getting pod %v for retry: %v; retrying...", podID, err)
+				if getBackoff = getBackoff * 2; getBackoff > maximalGetBackoff {
+					getBackoff = maximalGetBackoff
+				}
+				time.Sleep(getBackoff)
+			}
+		}()
+	}
+}
+```
+
+MakeDefaultErrorFunc首先打印pod调度失败原因，接着获取调度轮次(每执行一次nextPod就会累加一次)，最后起一个goroutine异步将该pod添加到unschedulableQ中，具体添加过程看`AddUnschedulableIfNotPresent`(k8s.io/kubernetes/pkg/scheduler/internal/queue/scheduling_queue.go)，如下：
+
+```go
+// AddUnschedulableIfNotPresent inserts a pod that cannot be scheduled into
+// the queue, unless it is already in the queue. Normally, PriorityQueue puts
+// unschedulable pods in `unschedulableQ`. But if there has been a recent move
+// request, then the pod is put in `podBackoffQ`.
+func (p *PriorityQueue) AddUnschedulableIfNotPresent(pInfo *framework.PodInfo, podSchedulingCycle int64) error {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	pod := pInfo.Pod
+	if p.unschedulableQ.get(pod) != nil {
+		return fmt.Errorf("pod is already present in unschedulableQ")
+	}
+
+	// Refresh the timestamp since the pod is re-added.
+	pInfo.Timestamp = p.clock.Now()
+	if _, exists, _ := p.activeQ.Get(pInfo); exists {
+		return fmt.Errorf("pod is already present in the activeQ")
+	}
+	if _, exists, _ := p.podBackoffQ.Get(pInfo); exists {
+		return fmt.Errorf("pod is already present in the backoffQ")
+	}
+
+	// Every unschedulable pod is subject to backoff timers.
+	p.backoffPod(pod)
+
+	// If a move request has been received, move it to the BackoffQ, otherwise move
+	// it to unschedulableQ.
+	if p.moveRequestCycle >= podSchedulingCycle {
+		if err := p.podBackoffQ.Add(pInfo); err != nil {
+			return fmt.Errorf("error adding pod %v to the backoff queue: %v", pod.Name, err)
+		}
+		metrics.SchedulerQueueIncomingPods.WithLabelValues("backoff", ScheduleAttemptFailure).Inc()
+	} else {
+		p.unschedulableQ.addOrUpdate(pInfo)
+		metrics.SchedulerQueueIncomingPods.WithLabelValues("unschedulable", ScheduleAttemptFailure).Inc()
+	}
+
+	p.nominatedPods.add(pod, "")
+	return nil
+
+}
+```
+
+首先检查unschedulableQ中是否已经存在对应pod，如果不存在则执行`p.unschedulableQ.addOrUpdate(pInfo)`将其添加到unschedulableQ中，如下：
+
+```go
+// Add adds a pod to the unschedulable podInfoMap.
+func (u *UnschedulablePodsMap) addOrUpdate(pInfo *framework.PodInfo) {
+	podID := u.keyFunc(pInfo.Pod)
+	if _, exists := u.podInfoMap[podID]; !exists && u.metricRecorder != nil {
+		u.metricRecorder.Inc()
+	}
+	u.podInfoMap[podID] = pInfo
+}
+
+...
+// UnschedulablePodsMap holds pods that cannot be scheduled. This data structure
+// is used to implement unschedulableQ.
+type UnschedulablePodsMap struct {
+	// podInfoMap is a map key by a pod's full-name and the value is a pointer to the PodInfo.
+	podInfoMap map[string]*framework.PodInfo
+	keyFunc    func(*v1.Pod) string
+	// metricRecorder updates the counter when elements of an unschedulablePodsMap
+	// get added or removed, and it does nothing if it's nil
+	metricRecorder metrics.MetricRecorder
+}
+```
 
 #### unschedulableQ=>podBackoffQ
 
+我们再来看看unschedulableQ=>podBackoffQ之间如何转化的：
+
+```go
+// NewPriorityQueue creates a PriorityQueue object.
+func NewPriorityQueue(
+	stop <-chan struct{},
+	fwk framework.Framework,
+	opts ...Option,
+) *PriorityQueue {
+	options := defaultPriorityQueueOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	comp := activeQComp
+	if fwk != nil {
+		if queueSortFunc := fwk.QueueSortFunc(); queueSortFunc != nil {
+			comp = func(podInfo1, podInfo2 interface{}) bool {
+				pInfo1 := podInfo1.(*framework.PodInfo)
+				pInfo2 := podInfo2.(*framework.PodInfo)
+
+				return queueSortFunc(pInfo1, pInfo2)
+			}
+		}
+	}
+
+	pq := &PriorityQueue{
+		clock:            options.clock,
+		stop:             stop,
+		podBackoff:       NewPodBackoffMap(options.podInitialBackoffDuration, options.podMaxBackoffDuration, options.clock),
+		activeQ:          heap.NewWithRecorder(podInfoKeyFunc, comp, metrics.NewActivePodsRecorder()),
+		unschedulableQ:   newUnschedulablePodsMap(metrics.NewUnschedulablePodsRecorder()),
+		nominatedPods:    newNominatedPodMap(),
+		moveRequestCycle: -1,
+	}
+	pq.cond.L = &pq.lock
+	pq.podBackoffQ = heap.NewWithRecorder(podInfoKeyFunc, pq.podsCompareBackoffCompleted, metrics.NewBackoffPodsRecorder())
+
+	pq.run()
+
+	return pq
+}
+
+// run starts the goroutine to pump from podBackoffQ to activeQ
+func (p *PriorityQueue) run() {
+	go wait.Until(p.flushBackoffQCompleted, 1.0*time.Second, p.stop)
+	go wait.Until(p.flushUnschedulableQLeftover, 30*time.Second, p.stop)
+}
+```
+
+产生PriorityQueue时，会在后台执行两个goroutine，其中一个便是`wait.Until(p.flushUnschedulableQLeftover, 30*time.Second, p.stop)`：
+
+```go
+// flushUnschedulableQLeftover moves pod which stays in unschedulableQ longer than the durationStayUnschedulableQ
+// to activeQ.
+func (p *PriorityQueue) flushUnschedulableQLeftover() {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	var podsToMove []*framework.PodInfo
+	currentTime := p.clock.Now()
+	for _, pInfo := range p.unschedulableQ.podInfoMap {
+		lastScheduleTime := pInfo.Timestamp
+		if currentTime.Sub(lastScheduleTime) > unschedulableQTimeInterval {
+			podsToMove = append(podsToMove, pInfo)
+		}
+	}
+
+	if len(podsToMove) > 0 {
+		p.movePodsToActiveOrBackoffQueue(podsToMove, UnschedulableTimeout)
+	}
+}
+
+...
+const (
+	// If the pod stays in unschedulableQ longer than the unschedulableQTimeInterval,
+	// the pod will be moved from unschedulableQ to activeQ.
+	unschedulableQTimeInterval = 60 * time.Second
+
+	queueClosed = "scheduling queue is closed"
+)
+```
+
+从这个函数可以看出当unschedulableQ中pod存放的时间超过`unschedulableQTimeInterval`(60s)后，该pod会从unschedulableQ移到activeQ或者podBackoffQ
+
+前面分析activeQ => unschedulableQ时，注意到有一个`backoffPod`操作：
+
+```go
+// Every unschedulable pod is subject to backoff timers.
+p.backoffPod(pod)
+
+// backoffPod checks if pod is currently undergoing backoff. If it is not it updates the backoff
+// timeout otherwise it does nothing.
+func (p *PriorityQueue) backoffPod(pod *v1.Pod) {
+	p.podBackoff.CleanupPodsCompletesBackingoff()
+
+	podID := nsNameForPod(pod)
+	boTime, found := p.podBackoff.GetBackoffTime(podID)
+	if !found || boTime.Before(p.clock.Now()) {
+		p.podBackoff.BackoffPod(podID)
+	}
+}
+
+// BackoffPod updates the lastUpdateTime for an nsPod,
+// and increases its numberOfAttempts by 1
+func (pbm *PodBackoffMap) BackoffPod(nsPod ktypes.NamespacedName) {
+	pbm.lock.Lock()
+	pbm.podLastUpdateTime[nsPod] = pbm.clock.Now()
+	pbm.podAttempts[nsPod]++
+	pbm.lock.Unlock()
+}
+```
+
+每个unschedulableQ队列中的pod都会对应一个backoff timers，回到`movePodsToActiveOrBackoffQueue`：
+
+```go
+// NOTE: this function assumes lock has been acquired in caller
+func (p *PriorityQueue) movePodsToActiveOrBackoffQueue(podInfoList []*framework.PodInfo, event string) {
+	for _, pInfo := range podInfoList {
+		pod := pInfo.Pod
+		if p.isPodBackingOff(pod) {
+			if err := p.podBackoffQ.Add(pInfo); err != nil {
+				klog.Errorf("Error adding pod %v to the backoff queue: %v", pod.Name, err)
+			} else {
+				metrics.SchedulerQueueIncomingPods.WithLabelValues("backoff", event).Inc()
+				p.unschedulableQ.delete(pod)
+			}
+		} else {
+			if err := p.activeQ.Add(pInfo); err != nil {
+				klog.Errorf("Error adding pod %v to the scheduling queue: %v", pod.Name, err)
+			} else {
+				metrics.SchedulerQueueIncomingPods.WithLabelValues("active", event).Inc()
+				p.unschedulableQ.delete(pod)
+			}
+		}
+	}
+	p.moveRequestCycle = p.schedulingCycle
+	p.cond.Broadcast()
+}
+
+// isPodBackingOff returns true if a pod is still waiting for its backoff timer.
+// If this returns true, the pod should not be re-tried.
+func (p *PriorityQueue) isPodBackingOff(pod *v1.Pod) bool {
+	boTime, exists := p.podBackoff.GetBackoffTime(nsNameForPod(pod))
+	if !exists {
+		return false
+	}
+	return boTime.After(p.clock.Now())
+}
+```
+
+如果unschedulableQ pod对应的backoff timer还没有过期，则将其添加到podBackoffQ中；否则将其添加到activeQ中。另外如果添加失败则从unschedulableQ中删除
+
 #### podBackoffQ=>activeQ
+
+最后分析一下podBackoffQ=>activeQ的转换，回到run()：
+
+```go
+// run starts the goroutine to pump from podBackoffQ to activeQ
+func (p *PriorityQueue) run() {
+	go wait.Until(p.flushBackoffQCompleted, 1.0*time.Second, p.stop)
+	go wait.Until(p.flushUnschedulableQLeftover, 30*time.Second, p.stop)
+}
+```
+
+每隔1s执行flushBackoffQCompleted，将pod从backoffQ移到activeQ，如下：
+
+```go
+// flushBackoffQCompleted Moves all pods from backoffQ which have completed backoff in to activeQ
+func (p *PriorityQueue) flushBackoffQCompleted() {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	for {
+		rawPodInfo := p.podBackoffQ.Peek()
+		if rawPodInfo == nil {
+			return
+		}
+		pod := rawPodInfo.(*framework.PodInfo).Pod
+		boTime, found := p.podBackoff.GetBackoffTime(nsNameForPod(pod))
+		if !found {
+			klog.Errorf("Unable to find backoff value for pod %v in backoffQ", nsNameForPod(pod))
+			p.podBackoffQ.Pop()
+			p.activeQ.Add(rawPodInfo)
+			metrics.SchedulerQueueIncomingPods.WithLabelValues("active", BackoffComplete).Inc()
+			defer p.cond.Broadcast()
+			continue
+		}
+
+		if boTime.After(p.clock.Now()) {
+			return
+		}
+		_, err := p.podBackoffQ.Pop()
+		if err != nil {
+			klog.Errorf("Unable to pop pod %v from backoffQ despite backoff completion.", nsNameForPod(pod))
+			return
+		}
+		p.activeQ.Add(rawPodInfo)
+		metrics.SchedulerQueueIncomingPods.WithLabelValues("active", BackoffComplete).Inc()
+		defer p.cond.Broadcast()
+	}
+}
+```
+
+从podBackoffQ队列中获取首部pod，得到对应的backoff timer，如果已经过期，则将pod从podBackoffQ中剔除，并移到activeQ中；否则直接结束
+
+#### nominatedPods作用
+
+
+
+## schedulerCache

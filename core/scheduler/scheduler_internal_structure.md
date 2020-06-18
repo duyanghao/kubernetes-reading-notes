@@ -602,7 +602,9 @@ func (p *PriorityQueue) Add(pod *v1.Pod) error {
 }
 ```
 
-这里也就是我们要找的往activeQ中添加pod信息的入口
+这里也就是我们要找的往activeQ中添加pod信息的入口。总结nextPod的流程如下：
 
-
+```
+Pod Add Event => sched.addPodToSchedulingQueue => PriorityQueue.Add => activeQ => PriorityQueue.Pop => sched.NextPod
+```
 

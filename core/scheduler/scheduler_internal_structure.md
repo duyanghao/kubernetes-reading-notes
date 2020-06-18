@@ -527,7 +527,79 @@ func AddAllEventHandlers(
 }
 ```
 
-可以看到`AddAllEventHandlers`用于controller初始化informer逻辑，具体看与`SchedulingQueue`相关的代码逻辑：
+我们先看一下`podInformer`如何产生的(k8s.io/kubernetes/cmd/kube-scheduler/app/options/options.go)：
+
+```go
+// Config return a scheduler config object
+func (o *Options) Config() (*schedulerappconfig.Config, error) {
+	if o.SecureServing != nil {
+		if err := o.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", nil, []net.IP{net.ParseIP("127.0.0.1")}); err != nil {
+			return nil, fmt.Errorf("error creating self-signed certificates: %v", err)
+		}
+	}
+
+	c := &schedulerappconfig.Config{}
+	if err := o.ApplyTo(c); err != nil {
+		return nil, err
+	}
+
+	// Prepare kube clients.
+	client, leaderElectionClient, eventClient, err := createClients(c.ComponentConfig.ClientConnection, o.Master, c.ComponentConfig.LeaderElection.RenewDeadline.Duration)
+	if err != nil {
+		return nil, err
+	}
+
+	coreBroadcaster := record.NewBroadcaster()
+	coreRecorder := coreBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: c.ComponentConfig.SchedulerName})
+
+	// Set up leader election if enabled.
+	var leaderElectionConfig *leaderelection.LeaderElectionConfig
+	if c.ComponentConfig.LeaderElection.LeaderElect {
+		leaderElectionConfig, err = makeLeaderElectionConfig(c.ComponentConfig.LeaderElection, leaderElectionClient, coreRecorder)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	c.Client = client
+	c.InformerFactory = informers.NewSharedInformerFactory(client, 0)
+	c.PodInformer = scheduler.NewPodInformer(client, 0)
+	c.EventClient = eventClient.EventsV1beta1()
+	c.CoreEventClient = eventClient.CoreV1()
+	c.CoreBroadcaster = coreBroadcaster
+	c.LeaderElection = leaderElectionConfig
+
+	return c, nil
+}
+
+...
+type podInformer struct {
+	informer cache.SharedIndexInformer
+}
+
+func (i *podInformer) Informer() cache.SharedIndexInformer {
+	return i.informer
+}
+
+func (i *podInformer) Lister() corelisters.PodLister {
+	return corelisters.NewPodLister(i.informer.GetIndexer())
+}
+
+// NewPodInformer creates a shared index informer that returns only non-terminal pods.
+func NewPodInformer(client clientset.Interface, resyncPeriod time.Duration) coreinformers.PodInformer {
+	selector := fields.ParseSelectorOrDie(
+		"status.phase!=" + string(v1.PodSucceeded) +
+			",status.phase!=" + string(v1.PodFailed))
+	lw := cache.NewListWatchFromClient(client.CoreV1().RESTClient(), string(v1.ResourcePods), metav1.NamespaceAll, selector)
+	return &podInformer{
+		informer: cache.NewSharedIndexInformer(lw, &v1.Pod{}, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}),
+	}
+}
+```
+
+这里podInformer返回`non-terminal pods`，也即`pod.status.phase != Succeeded`且`pod.status.phase != Failed`的pod
+
+再看`AddAllEventHandlers`中podInformer事件注册逻辑：
 
 ```go
 // unscheduled pod queue
@@ -557,13 +629,46 @@ podInformer.Informer().AddEventHandler(
 )
 ```
 
-这里给podInformer添加了事件监听处理函数：
+注意到assignedPod和responsibleForPod函数，这两个函数含义如下：
+
+* assignedPod：pod.Spec.NodeName为空(表示待调度)
+* responsibleForPod：pod.Spec.SchedulerName为指定的scheduler，默认为`default-scheduler`，也就是`genericScheduler`(k8s.io/kubernetes/pkg/scheduler/core/generic_scheduler.go)
+
+```go
+// assignedPod selects pods that are assigned (scheduled and running).
+func assignedPod(pod *v1.Pod) bool {
+	return len(pod.Spec.NodeName) != 0
+}
+
+...
+AddAllEventHandlers(sched, options.schedulerName, informerFactory, podInformer)
+
+...
+// responsibleForPod returns true if the pod has asked to be scheduled by the given scheduler.
+func responsibleForPod(pod *v1.Pod, schedulerName string) bool {
+	return schedulerName == pod.Spec.SchedulerName
+}
+
+...
+const (
+	// "default-scheduler" is the name of default scheduler.
+	DefaultSchedulerName = "default-scheduler"
+
+	// RequiredDuringScheduling affinity is not symmetric, but there is an implicit PreferredDuringScheduling affinity rule
+	// corresponding to every RequiredDuringScheduling affinity rule.
+	// When the --hard-pod-affinity-weight scheduler flag is not specified,
+	// DefaultHardPodAffinityWeight defines the weight of the implicit PreferredDuringScheduling affinity rule.
+	DefaultHardPodAffinitySymmetricWeight int32 = 1
+)
+```
+
+只有满足上述两个条件的pod才会被保留在podInformer中。这个逻辑很正常，因为scheduler只需要处理需要被调度的pod(assignedPod)，同时只处理自己负责的pod(responsibleForPod)。而podInformer对应的事件监听处理函数如下：
 
 * Pod Add：Pod添加事件，对应处理函数为`sched.addPodToSchedulingQueue`
 * Pod Update：Pod更新事件，对应处理函数为`sched.updatePodInSchedulingQueue`
 * Pod Delete：Pod删除事件，对应处理函数为`sched.deletePodFromSchedulingQueue`
 
-我们依次看一下事件处理函数逻辑，先看`sched.addPodToSchedulingQueue`：
+重点看`sched.addPodToSchedulingQueue`：
 
 ```go
 func (sched *Scheduler) addPodToSchedulingQueue(obj interface{}) {
@@ -602,9 +707,24 @@ func (p *PriorityQueue) Add(pod *v1.Pod) error {
 }
 ```
 
-这里也就是我们要找的往activeQ中添加pod信息的入口。总结nextPod的流程如下：
+**这里也就是我们要找的往activeQ中添加pod信息的入口。总结nextPod的流程如下：**
 
 ```
 Pod Add Event => sched.addPodToSchedulingQueue => PriorityQueue.Add => activeQ => PriorityQueue.Pop => sched.NextPod
 ```
 
+## PriorityQueue子队列转换关系
+
+如下是转换关系图：
+
+![](images/PriorityQueue.png)
+
+下面开始分析各个转换
+
+#### activeQ=>unschedulableQ
+
+
+
+#### unschedulableQ=>podBackoffQ
+
+#### podBackoffQ=>activeQ

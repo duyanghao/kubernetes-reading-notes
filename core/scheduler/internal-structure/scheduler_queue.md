@@ -1,4 +1,4 @@
-Kubernetes Internal Structure - Queue
+Kubernetes Scheduler Internal Structure - Queue
 =====================================
 
 在分析完预选和优选过程后，我们对整个scheduler架构有了一个大致的了解，但是对于内部的一些数据结构似乎还不太清晰，于是有必要继续深入研究
@@ -273,11 +273,9 @@ PriorityQueue实现了SchedulingQueue，它本身是一个优先级队列，队�
 * unschedulableQ：该队列中存放着已经发起调度算法，但是调度失败(无法调度)的pod
 * podBackoffQ(Heap)：该队列中存放着从unschedulableQ中移出的pod，并会在backoff周期后从本队列移到activeQ队列
 
-另外注意：`nominatedPods`，该结构存储着被任命的pod(成功执行调度，分配到某个节点上)
-
 它们之间的关系可以归纳如下：
 
-![](images/PriorityQueue.png)
+![](../images/PriorityQueue.png)
 
 再回来看`NextPod()`，其实是调用`queue.Pop()`，对应如下：
 
@@ -719,7 +717,7 @@ Pod Add Event => sched.addPodToSchedulingQueue => PriorityQueue.Add => activeQ =
 
 如下是转换关系图：
 
-![](images/PriorityQueue.png)
+![](../images/PriorityQueue.png)
 
 下面开始分析各个转换
 

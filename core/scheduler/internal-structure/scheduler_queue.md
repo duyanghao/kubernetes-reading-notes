@@ -1,5 +1,5 @@
-Kubernetes Internal Structure
-=============================
+Kubernetes Internal Structure - Queue
+=====================================
 
 在分析完预选和优选过程后，我们对整个scheduler架构有了一个大致的了解，但是对于内部的一些数据结构似乎还不太清晰，于是有必要继续深入研究
 
@@ -723,7 +723,7 @@ Pod Add Event => sched.addPodToSchedulingQueue => PriorityQueue.Add => activeQ =
 
 下面开始分析各个转换
 
-#### activeQ=>unschedulableQ
+#### 1. activeQ=>unschedulableQ
 
 回到调度框架入口：
 
@@ -998,7 +998,7 @@ type UnschedulablePodsMap struct {
 }
 ```
 
-#### unschedulableQ=>podBackoffQ
+#### 2. unschedulableQ=>podBackoffQ
 
 我们再来看看unschedulableQ=>podBackoffQ之间如何转化的：
 
@@ -1153,7 +1153,7 @@ func (p *PriorityQueue) isPodBackingOff(pod *v1.Pod) bool {
 
 如果unschedulableQ pod对应的backoff timer还没有过期，则将其添加到podBackoffQ中；否则将其添加到activeQ中。另外如果添加失败则从unschedulableQ中删除
 
-#### podBackoffQ=>activeQ
+#### 3. podBackoffQ=>activeQ
 
 最后分析一下podBackoffQ=>activeQ的转换，回到run()：
 
@@ -1205,8 +1205,3 @@ func (p *PriorityQueue) flushBackoffQCompleted() {
 
 从podBackoffQ队列中获取首部pod，得到对应的backoff timer，如果已经过期，则将pod从podBackoffQ中剔除，并移到activeQ中；否则直接结束
 
-#### nominatedPods作用
-
-
-
-## schedulerCache

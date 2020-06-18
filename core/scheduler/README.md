@@ -8,5 +8,5 @@ Kubernetes Scheduler
 * [框架](scheduler_framework.md)
 * [预选过程](scheduler_predicate_algorithm.md)
 * [优选过程](scheduler_priority_algorithm.md)
-* [scheduler内部结构](scheduler_internal_structure.md)
+* [scheduler内部结构](internal-structure/README.md)
 * [扩展](scheduler_extensibility.md)

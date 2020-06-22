@@ -766,7 +766,7 @@ func (cache *schedulerCache) UpdateNodeInfoSnapshot(nodeSnapshot *nodeinfosnapsh
 }
 ```
 
-之后利用该快照信息进行预选与优选相关字段(node)查询
+之后利用该快照信息进行预选与优选相关字段(node与pod)查询
 
 #### 相关事件
 
@@ -904,9 +904,9 @@ func (cache *schedulerCache) addPod(pod *v1.Pod) {
 }
 ```
 
-将pod从assume中移除，并添加到Add中，同时添加相关的node信息到schedulerCache
+将pod从Assumed中移除，并添加到Added中，同时添加相关的node信息到schedulerCache
 
-这里面涉及一个assume过期的问题：assume只是假设的pod成功调度到node上，实际真正成功是有对应的pod Add事件发生，顺序是先assume后Add Event，这里面就存在一个过期时间了，看代码：
+这里面涉及一个Assume过期的问题：Assume只是假设pod成功调度到node上，实际真正成功调度是有对应的pod Add事件(pod.Spec.NodeName != nil)发生，顺序是先Assume后Add Event，这里面就存在一个过期时间了，看代码：
 
 ```go
 var (
@@ -1009,7 +1009,7 @@ func (cache *schedulerCache) removePod(pod *v1.Pod) error {
 }
 ```
 
-在创建完schedulerCache后，会执行定期(1s)清理过期assume的逻辑，只要assume过期，则将相关pod和node信息从cache删除
+在创建完schedulerCache后，会执行定期(1s)清理过期Assume的逻辑，只要Assume过期，则将相关pod和node信息从cache删除
 
 这里会涉及到一个如何判断是否过期的逻辑：
 
@@ -1043,7 +1043,7 @@ func (cache *schedulerCache) finishBinding(pod *v1.Pod, now time.Time) error {
 
 在成功结束调度流程最后的bind步骤后，scheduler会执行finishBinding操作，该操作会设置podStates对应的bindingFinished标志为true，表示bind成功结束了；另外设置deadline为此时延后30s时间
 
-也即在bind结束30s后，如果还没有收到Add Event，则将pod相关信息从assume移除(cache不会有任何该pod相关信息了)。之后如果收到该pod的Add Event，则重新添加相关信息到cache Add中
+也即在bind结束30s后，如果还没有收到Add Event，则将pod相关信息从Assume移除(cache不会有任何该pod相关信息了)。之后如果收到该pod的Add Event，则重新添加相关信息到cache Added中
 
 * Pod Update
 
@@ -1231,4 +1231,6 @@ func (cache *schedulerCache) RemovePod(pod *v1.Pod) error {
 2. 状态转移解释：pod成功被调度(优选&预选)后，会执行Assume使其添加到cache中(Assumed)；之后执行bind操作触发过期时间(30s)，cache定期清理过期pod，发现如果30s后pod还是Assumed状态，也即过期了，则将其从cache中删除(Expired，其实也就是Deleted了)；如果没有过期，也即在过期前收到了Add Event，则执行`delete(cache.assumedPods, key)`(变成Added状态)；
 如果bind操作失败，则执行Forget操作，将pod从cache中删除(Initial，其实也是Deleted了)；在收到pod Update事件后，更新cache中的pod相关信息(依旧是Added状态)；最后如果收到pod Delete事件，则从cache中删除该pod相关信息(Deleted)
 
-通过schedulerCache维护Kubernetes集群的调度cache，其中包含node以及该node上成功(maybe assumed)调度的pod。genericScheduler通过该cache加速查找相关node以及pod信息，用于调度算法(预选&优选)
+**总结：通过schedulerCache维护Kubernetes集群的调度cache，其中包含node以及该node上成功(maybe assumed)调度的pod。genericScheduler通过该cache加速查找相关node以及pod信息，用于调度算法(预选&优选)**
+
+到此，scheduler内部结构分析结束……

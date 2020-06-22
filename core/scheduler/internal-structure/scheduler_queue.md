@@ -1215,4 +1215,4 @@ PriorityQueue是一个优先级队列，并维护了三个子优先级队列：
 
 ![](../images/PriorityQueue.png)
 
-Scheduler为pod设置了监听事件，监听`pod.Spec.NodeName`为空且`pod.Spec.SchedulerName`为自身的pod(需要被本scheduler调度)事件。当监听到Add事件时，也即创建了一个pod，将其添加到activeQ队列中，等待scheduler调度；当调度失败时(预选失败，没有合适的node)，则将pod移到unschedulableQ队列中执行backoff wait；最后当pod对应的backoff timer到期，则将pod从unschedulableQ或者podBackoffQ中移到activeQ队列等待调度
+Scheduler为pod设置了监听事件，监听`pod.Spec.NodeName`为空且`pod.Spec.SchedulerName`为自身的pod(需要被本scheduler调度)事件。当监听到Add事件时，也即创建了一个pod，将其添加到activeQ队列中，等待scheduler调度；当调度失败时(预选失败，没有合适的node)，则将pod移到unschedulableQ队列中执行backoff wait；最后当pod对应的backoff timer到期，则将pod从unschedulableQ或者podBackoffQ中移到activeQ队列等待重新调度

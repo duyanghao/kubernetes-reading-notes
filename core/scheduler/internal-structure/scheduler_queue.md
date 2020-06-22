@@ -1203,3 +1203,16 @@ func (p *PriorityQueue) flushBackoffQCompleted() {
 
 从podBackoffQ队列中获取首部pod，得到对应的backoff timer，如果已经过期，则将pod从podBackoffQ中剔除，并移到activeQ中；否则直接结束
 
+**最后，总结优先级队列如下：**
+
+PriorityQueue是一个优先级队列，并维护了三个子优先级队列：
+
+* activeQ：存放着等待调度的pod，scheduler从这个队列中获取pod进行调度
+* unschedulableQ：存放已经发起调度算法，但是调度失败的pod
+* podBackoffQ：存放从unschedulableQ中移出的pod，并会在backoff周期后从本队列移到activeQ队列
+
+它们之间的状态转化图如下：
+
+![](../images/PriorityQueue.png)
+
+Scheduler为pod设置了监听事件，监听`pod.Spec.NodeName`为空且`pod.Spec.SchedulerName`为自身的pod(需要被本scheduler调度)事件。当监听到Add事件时，也即创建了一个pod，将其添加到activeQ队列中，等待scheduler调度；当调度失败时(预选失败，没有合适的node)，则将pod移到unschedulableQ队列中执行backoff wait；最后当pod对应的backoff timer到期，则将pod从unschedulableQ或者podBackoffQ中移到activeQ队列等待调度

@@ -155,7 +155,7 @@ if err != nil {
 }
 ```
 
-AssumePodVolumes用于产生pod对应的PVs and PVCs；而assume用于设置pod属性`NodeName=scheduleResult.SuggestedHost`
+assume用于在pod成功调度后，将其添加到schedulerCache中，加速generic scheduler查找
 
 ## step4 - pod与node进行绑定
 

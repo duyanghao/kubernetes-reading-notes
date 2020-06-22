@@ -607,12 +607,12 @@ func pickOneNodeForPreemption(nodesToVictims map[*v1.Node]*extenderv1.Victims) *
 
 这里按照如下规则顺序从候选node列表中选择出最合适的节点：
 
-1.选取具有最小PDB violations数目的node
-2.选取具有最小的最高优先级的victims的node
-3.选取victim优先级之和最小的node
-4.选取具有最小victim数目的node
-5.选取victim中最高优先级启动时间最早的那个节点
-6.随机选取(第一个)
+1. 选取具有最小PDB violations数目的node
+2. 选取具有最小的最高优先级的victims的node
+3. 选取victim优先级之和最小的node
+4. 选取具有最小victim数目的node
+5. 选取victim中最高优先级启动时间最早的那个节点
+6. 随机选取(第一个)
 
 * step5 - 选出需要清理pod.status.nominatedNodeName的pod
 

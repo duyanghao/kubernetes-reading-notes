@@ -607,16 +607,16 @@ func pickOneNodeForPreemption(nodesToVictims map[*v1.Node]*extenderv1.Victims) *
 
 这里按照如下规则顺序从候选node列表中选择出最合适的节点：
 
-* 选取具有最小PDB violations数目的node
-* 选取具有最小的最高优先级的victims的node
-* 选取victim优先级之和最小的node
-* 选取具有最小victim数目的node
-* 选取victim中最高优先级启动时间最早的那个节点
-* 随机选取(第一个)
+1.选取具有最小PDB violations数目的node
+2.选取具有最小的最高优先级的victims的node
+3.选取victim优先级之和最小的node
+4.选取具有最小victim数目的node
+5.选取victim中最高优先级启动时间最早的那个节点
+6.随机选取(第一个)
 
 * step5 - 选出需要清理pod.status.nominatedNodeName的pod
 
-由于pod P对node进行了抢占，可能会导致以前抢占该node的低优先级(< pod P)pod后面无法成功调度到该node上，需要清除掉这部分pod的pod.status.nominatedNodeName使得它们可以移动到activeQ队列中，并对scheduler再次调度
+由于pod P对node进行了抢占，可能会导致以前抢占该node的低优先级(< pod P)pod后面无法成功调度到该node上，需要清除掉这部分pod的pod.status.nominatedNodeName使得它们可以移动到activeQ队列中，并让scheduler重新对它们进行调度：
 
 ```go
 // Lower priority pods nominated to run on this node, may no longer fit on
@@ -846,7 +846,7 @@ func (p *PriorityQueue) Delete(pod *v1.Pod) error {
 
 删除操作会出发scheduler pod DELETE事件，执行PriorityQueue相关的删除逻辑，其中就包括将pod相关信息从nominatedPodMap中删除
 
-在添加完nominatedPodMap，更新pod P的`pod.status.nominatedNodeName`以及删除victims后，执行清理pod `pod.status.nominatedNodeName`操作，使其回到activeQ队列，重新被scheduler调度：
+在添加完nominatedPodMap，更新pod P的`pod.status.nominatedNodeName`以及删除victims后，执行清理低优先级(< pod P)pod `pod.status.nominatedNodeName`操作，使其回到activeQ队列，重新被scheduler调度：
 
 ```go
 potentialNodes := nodesWherePreemptionMightHelp(g.nodeInfoSnapshot.NodeInfoMap, fitError)
@@ -957,9 +957,152 @@ func (p *PriorityQueue) Update(oldPod, newPod *v1.Pod) error {
 }
 ```
 
+这样整个scheduler抢占流程就分析完了，总结过程如下：
 
+首先从node列表中选取抢占node和对应的抢占victims，并枚举每个node上被抢占的最小pod列表；之后从这些node中按照一定规则选取出最佳抢占node
+
+在选取出抢占node以及对应的victims后，执行相关的清理工作，包括：更新pod P相关的nominated信息，将pod P对应的抢占node添加到nominatedPodMap中，同时调用kube-apiserver更新pod P的`pod.status.nominatedNodeName`，使pod P从unschedulableQ列队移到activeQ队列，等待scheduler重新调度；接着调用kube-apiserver删除抢占victims，使这些pod从被抢占的node上消失；最后，清空低优先级抢占pod的`pod.status.nominatedNodeName`信息，使它们被scheduler重新调度
+
+注意留意上述流程与nominatedPodMap之间的关系，nominatedPodMap记录了pod抢占相关信息，用于协助预选和抢占过程顺利完成
 
 ## Predicate(预选)
+
+再分析完抢占后，我们再回过头来看看预选过程：
+
+```go
+// podFitsOnNode checks whether a node given by NodeInfo satisfies the given predicate functions.
+// For given pod, podFitsOnNode will check if any equivalent pod exists and try to reuse its cached
+// predicate results as possible.
+// This function is called from two different places: Schedule and Preempt.
+// When it is called from Schedule, we want to test whether the pod is schedulable
+// on the node with all the existing pods on the node plus higher and equal priority
+// pods nominated to run on the node.
+// When it is called from Preempt, we should remove the victims of preemption and
+// add the nominated pods. Removal of the victims is done by SelectVictimsOnNode().
+// It removes victims from meta and NodeInfo before calling this function.
+func (g *genericScheduler) podFitsOnNode(
+	ctx context.Context,
+	state *framework.CycleState,
+	pod *v1.Pod,
+	meta predicates.Metadata,
+	info *schedulernodeinfo.NodeInfo,
+	alwaysCheckAllPredicates bool,
+) (bool, []predicates.PredicateFailureReason, *framework.Status, error) {
+	var failedPredicates []predicates.PredicateFailureReason
+	var status *framework.Status
+
+	podsAdded := false
+	// We run predicates twice in some cases. If the node has greater or equal priority
+	// nominated pods, we run them when those pods are added to meta and nodeInfo.
+	// If all predicates succeed in this pass, we run them again when these
+	// nominated pods are not added. This second pass is necessary because some
+	// predicates such as inter-pod affinity may not pass without the nominated pods.
+	// If there are no nominated pods for the node or if the first run of the
+	// predicates fail, we don't run the second pass.
+	// We consider only equal or higher priority pods in the first pass, because
+	// those are the current "pod" must yield to them and not take a space opened
+	// for running them. It is ok if the current "pod" take resources freed for
+	// lower priority pods.
+	// Requiring that the new pod is schedulable in both circumstances ensures that
+	// we are making a conservative decision: predicates like resources and inter-pod
+	// anti-affinity are more likely to fail when the nominated pods are treated
+	// as running, while predicates like pod affinity are more likely to fail when
+	// the nominated pods are treated as not running. We can't just assume the
+	// nominated pods are running because they are not running right now and in fact,
+	// they may end up getting scheduled to a different node.
+	for i := 0; i < 2; i++ {
+		metaToUse := meta
+		stateToUse := state
+		nodeInfoToUse := info
+		if i == 0 {
+			var err error
+			podsAdded, metaToUse, stateToUse, nodeInfoToUse, err = g.addNominatedPods(ctx, pod, meta, state, info)
+			if err != nil {
+				return false, []predicates.PredicateFailureReason{}, nil, err
+			}
+		} else if !podsAdded || len(failedPredicates) != 0 || !status.IsSuccess() {
+			break
+		}
+
+		for _, predicateKey := range predicates.Ordering() {
+			var (
+				fit     bool
+				reasons []predicates.PredicateFailureReason
+				err     error
+			)
+
+			if predicate, exist := g.predicates[predicateKey]; exist {
+				fit, reasons, err = predicate(pod, metaToUse, nodeInfoToUse)
+				if err != nil {
+					return false, []predicates.PredicateFailureReason{}, nil, err
+				}
+
+				if !fit {
+					// eCache is available and valid, and predicates result is unfit, record the fail reasons
+					failedPredicates = append(failedPredicates, reasons...)
+					// if alwaysCheckAllPredicates is false, short circuit all predicates when one predicate fails.
+					if !alwaysCheckAllPredicates {
+						klog.V(5).Infoln("since alwaysCheckAllPredicates has not been set, the predicate " +
+							"evaluation is short circuited and there are chances " +
+							"of other predicates failing as well.")
+						break
+					}
+				}
+			}
+		}
+
+		status = g.framework.RunFilterPlugins(ctx, stateToUse, pod, nodeInfoToUse)
+		if !status.IsSuccess() && !status.IsUnschedulable() {
+			return false, failedPredicates, status, status.AsError()
+		}
+	}
+
+	return len(failedPredicates) == 0 && status.IsSuccess(), failedPredicates, status, nil
+}
+
+...
+// addNominatedPods adds pods with equal or greater priority which are nominated
+// to run on the node given in nodeInfo to meta and nodeInfo. It returns 1) whether
+// any pod was added, 2) augmented metadata, 3) augmented CycleState 4) augmented nodeInfo.
+func (g *genericScheduler) addNominatedPods(ctx context.Context, pod *v1.Pod, meta predicates.Metadata, state *framework.CycleState,
+	nodeInfo *schedulernodeinfo.NodeInfo) (bool, predicates.Metadata,
+	*framework.CycleState, *schedulernodeinfo.NodeInfo, error) {
+	if g.schedulingQueue == nil || nodeInfo == nil || nodeInfo.Node() == nil {
+		// This may happen only in tests.
+		return false, meta, state, nodeInfo, nil
+	}
+	nominatedPods := g.schedulingQueue.NominatedPodsForNode(nodeInfo.Node().Name)
+	if len(nominatedPods) == 0 {
+		return false, meta, state, nodeInfo, nil
+	}
+	nodeInfoOut := nodeInfo.Clone()
+	var metaOut predicates.Metadata
+	if meta != nil {
+		metaOut = meta.ShallowCopy()
+	}
+	stateOut := state.Clone()
+	stateOut.Write(migration.PredicatesStateKey, &migration.PredicatesStateData{Reference: metaOut})
+	podsAdded := false
+	for _, p := range nominatedPods {
+		if podutil.GetPodPriority(p) >= podutil.GetPodPriority(pod) && p.UID != pod.UID {
+			nodeInfoOut.AddPod(p)
+			if metaOut != nil {
+				if err := metaOut.AddPod(p, nodeInfoOut.Node()); err != nil {
+					return false, meta, state, nodeInfo, err
+				}
+			}
+			status := g.framework.RunPreFilterExtensionAddPod(ctx, stateOut, pod, p, nodeInfoOut)
+			if !status.IsSuccess() {
+				return false, meta, state, nodeInfo, status.AsError()
+			}
+			podsAdded = true
+		}
+	}
+	return podsAdded, metaOut, stateOut, nodeInfoOut, nil
+}
+```
+
+这里我们应该对预选算法中2次执行的逻辑更加清晰了，第一遍是为了确保pod P在抢占pod(优先级 >= pod P)最终成功调度在node情况下能够正常运行；第二遍是为了确保pod P在抢占pod(优先级 >= pod P)最终没有调度在node情况下能够成功运行。最有这两种情况都满足，我们才能确保pod P是可以被调度到node上的
 
 ## Refs
 

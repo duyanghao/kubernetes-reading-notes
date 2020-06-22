@@ -172,9 +172,9 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 }
 ```
 
-在调度失败(其实是预选失败)后，执行`recordSchedulingFailure`将pod放入unschedulableQ队列，之后如果抢占开启(默认行为)，则scheduler执行抢占逻辑：
+在调度失败(其实是预选失败)后，执行`recordSchedulingFailure`将pod放入unschedulableQ队列，之后如果抢占开启(默认行为)，则scheduler执行抢占逻辑(k8s.io/kubernetes/pkg/scheduler/scheduler.go)：
 
-1. 获取抢占pod 
+#### 1. 获取抢占pod 
 
 ```go
 // preempt tries to create room for a pod that has failed to schedule, by preempting lower priority pods if possible.
@@ -276,7 +276,9 @@ func (p *podPreemptorImpl) getUpdatedPod(pod *v1.Pod) (*v1.Pod, error) {
 }
 ```
 
-2. 选取抢占node以及victims
+调用kube-apiserver获取最新的抢占pod对象
+
+#### 2. 选取抢占node以及victims
 
 ```go
 node, victims, nominatedPodsToClear, err := sched.Algorithm.Preempt(ctx, state, preemptor, scheduleErr)
@@ -299,71 +301,666 @@ if err != nil {
 // using the nominated resources and the nominated pod could take a long time
 // before it is retried after many other pending pods.
 func (g *genericScheduler) Preempt(ctx context.Context, state *framework.CycleState, pod *v1.Pod, scheduleErr error) (*v1.Node, []*v1.Pod, []*v1.Pod, error) {
-	// Scheduler may return various types of errors. Consider preemption only if
-	// the error is of type FitError.
-	fitError, ok := scheduleErr.(*FitError)
-	if !ok || fitError == nil {
-		return nil, nil, nil, nil
-	}
-	if !podEligibleToPreemptOthers(pod, g.nodeInfoSnapshot.NodeInfoMap, g.enableNonPreempting) {
-		klog.V(5).Infof("Pod %v/%v is not eligible for more preemption.", pod.Namespace, pod.Name)
-		return nil, nil, nil, nil
-	}
-	if len(g.nodeInfoSnapshot.NodeInfoMap) == 0 {
-		return nil, nil, nil, ErrNoNodesAvailable
-	}
-	potentialNodes := nodesWherePreemptionMightHelp(g.nodeInfoSnapshot.NodeInfoMap, fitError)
-	if len(potentialNodes) == 0 {
-		klog.V(3).Infof("Preemption will not help schedule pod %v/%v on any node.", pod.Namespace, pod.Name)
-		// In this case, we should clean-up any existing nominated node name of the pod.
-		return nil, nil, []*v1.Pod{pod}, nil
-	}
-	var (
-		pdbs []*policy.PodDisruptionBudget
-		err  error
-	)
-	if g.pdbLister != nil {
-		pdbs, err = g.pdbLister.List(labels.Everything())
-		if err != nil {
-			return nil, nil, nil, err
-		}
-	}
-	nodeToVictims, err := g.selectNodesForPreemption(ctx, state, pod, potentialNodes, pdbs)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	// We will only check nodeToVictims with extenders that support preemption.
-	// Extenders which do not support preemption may later prevent preemptor from being scheduled on the nominated
-	// node. In that case, scheduler will find a different host for the preemptor in subsequent scheduling cycles.
-	nodeToVictims, err = g.processPreemptionWithExtenders(pod, nodeToVictims)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	candidateNode := pickOneNodeForPreemption(nodeToVictims)
-	if candidateNode == nil {
-		return nil, nil, nil, nil
-	}
-
-	// Lower priority pods nominated to run on this node, may no longer fit on
-	// this node. So, we should remove their nomination. Removing their
-	// nomination updates these pods and moves them to the active queue. It
-	// lets scheduler find another place for them.
-	nominatedPods := g.getLowerPriorityNominatedPods(pod, candidateNode.Name)
-	if nodeInfo, ok := g.nodeInfoSnapshot.NodeInfoMap[candidateNode.Name]; ok {
-		return nodeInfo.Node(), nodeToVictims[candidateNode].Pods, nominatedPods, nil
-	}
-
-	return nil, nil, nil, fmt.Errorf(
-		"preemption failed: the target node %s has been deleted from scheduler cache",
-		candidateNode.Name)
+    ...
 }
 ```
+
+这里通过genericScheduler的Preempt(k8s.io/kubernetes/pkg/scheduler/core/generic_scheduler.go)进行抢占逻辑
+
+preempt为pod P寻找一个合适的node，通过剔除掉若干该节点上的pod最终使pod P可以成功调度在node上。该函数返回
+
+* 1.剔除节点
+* 2.节点上剔除的pod列表
+* 3.pod.status.nominatedNodeName需要被清除的pod列表
+* 4.任何错误
+
+下面我们分析该函数具体逻辑
+
+* step1 - 判断pod抢占是否合理
+
+```go
+...
+if !podEligibleToPreemptOthers(pod, g.nodeInfoSnapshot.NodeInfoMap, g.enableNonPreempting) {
+    klog.V(5).Infof("Pod %v/%v is not eligible for more preemption.", pod.Namespace, pod.Name)
+    return nil, nil, nil, nil
+}
+
+// podEligibleToPreemptOthers determines whether this pod should be considered
+// for preempting other pods or not. If this pod has already preempted other
+// pods and those are in their graceful termination period, it shouldn't be
+// considered for preemption.
+// We look at the node that is nominated for this pod and as long as there are
+// terminating pods on the node, we don't consider this for preempting more pods.
+func podEligibleToPreemptOthers(pod *v1.Pod, nodeNameToInfo map[string]*schedulernodeinfo.NodeInfo, enableNonPreempting bool) bool {
+	if enableNonPreempting && pod.Spec.PreemptionPolicy != nil && *pod.Spec.PreemptionPolicy == v1.PreemptNever {
+		klog.V(5).Infof("Pod %v/%v is not eligible for preemption because it has a preemptionPolicy of %v", pod.Namespace, pod.Name, v1.PreemptNever)
+		return false
+	}
+	nomNodeName := pod.Status.NominatedNodeName
+	if len(nomNodeName) > 0 {
+		if nodeInfo, found := nodeNameToInfo[nomNodeName]; found {
+			podPriority := podutil.GetPodPriority(pod)
+			for _, p := range nodeInfo.Pods() {
+				if p.DeletionTimestamp != nil && podutil.GetPodPriority(p) < podPriority {
+					// There is a terminating pod on the nominated node.
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+```
+
+如果pod已经发生过抢占，并且被抢占的pod依然有处于`graceful termination period`状态，则认为pod目前抢占不合理；否则认为合理
+
+* step2 - 查找用于抢占的node列表 
+
+```go
+potentialNodes := nodesWherePreemptionMightHelp(g.nodeInfoSnapshot.NodeInfoMap, fitError)
+if len(potentialNodes) == 0 {
+    klog.V(3).Infof("Preemption will not help schedule pod %v/%v on any node.", pod.Namespace, pod.Name)
+    // In this case, we should clean-up any existing nominated node name of the pod.
+    return nil, nil, []*v1.Pod{pod}, nil
+}
+
+...
+// nodesWherePreemptionMightHelp returns a list of nodes with failed predicates
+// that may be satisfied by removing pods from the node.
+func nodesWherePreemptionMightHelp(nodeNameToInfo map[string]*schedulernodeinfo.NodeInfo, fitErr *FitError) []*v1.Node {
+	potentialNodes := []*v1.Node{}
+	for name, node := range nodeNameToInfo {
+		if fitErr.FilteredNodesStatuses[name].Code() == framework.UnschedulableAndUnresolvable {
+			continue
+		}
+		failedPredicates := fitErr.FailedPredicates[name]
+
+		// If we assume that scheduler looks at all nodes and populates the failedPredicateMap
+		// (which is the case today), the !found case should never happen, but we'd prefer
+		// to rely less on such assumptions in the code when checking does not impose
+		// significant overhead.
+		// Also, we currently assume all failures returned by extender as resolvable.
+		if predicates.UnresolvablePredicateExists(failedPredicates) == nil {
+			klog.V(3).Infof("Node %v is a potential node for preemption.", name)
+			potentialNodes = append(potentialNodes, node.Node())
+		}
+	}
+	return potentialNodes
+}
+```
+
+从预选失败的节点中选择出可以用于抢占的node列表
+
+* step3 - 枚举每个node上被抢占的最小pod列表
+
+```go
+var (
+    pdbs []*policy.PodDisruptionBudget
+    err  error
+)
+if g.pdbLister != nil {
+    pdbs, err = g.pdbLister.List(labels.Everything())
+    if err != nil {
+        return nil, nil, nil, err
+    }
+}
+nodeToVictims, err := g.selectNodesForPreemption(ctx, state, pod, potentialNodes, pdbs)
+if err != nil {
+    return nil, nil, nil, err
+}
+...
+
+// selectNodesForPreemption finds all the nodes with possible victims for
+// preemption in parallel.
+func (g *genericScheduler) selectNodesForPreemption(
+	ctx context.Context,
+	state *framework.CycleState,
+	pod *v1.Pod,
+	potentialNodes []*v1.Node,
+	pdbs []*policy.PodDisruptionBudget,
+) (map[*v1.Node]*extenderv1.Victims, error) {
+	nodeToVictims := map[*v1.Node]*extenderv1.Victims{}
+	var resultLock sync.Mutex
+
+	// We can use the same metadata producer for all nodes.
+	meta := g.predicateMetaProducer(pod, g.nodeInfoSnapshot)
+	checkNode := func(i int) {
+		nodeName := potentialNodes[i].Name
+		if g.nodeInfoSnapshot.NodeInfoMap[nodeName] == nil {
+			return
+		}
+		nodeInfoCopy := g.nodeInfoSnapshot.NodeInfoMap[nodeName].Clone()
+		var metaCopy predicates.Metadata
+		if meta != nil {
+			metaCopy = meta.ShallowCopy()
+		}
+		stateCopy := state.Clone()
+		stateCopy.Write(migration.PredicatesStateKey, &migration.PredicatesStateData{Reference: metaCopy})
+		pods, numPDBViolations, fits := g.selectVictimsOnNode(ctx, stateCopy, pod, metaCopy, nodeInfoCopy, pdbs)
+		if fits {
+			resultLock.Lock()
+			victims := extenderv1.Victims{
+				Pods:             pods,
+				NumPDBViolations: int64(numPDBViolations),
+			}
+			nodeToVictims[potentialNodes[i]] = &victims
+			resultLock.Unlock()
+		}
+	}
+	workqueue.ParallelizeUntil(context.TODO(), 16, len(potentialNodes), checkNode)
+	return nodeToVictims, nil
+}
+```
+
+这里看到了我们熟悉的函数：ParallelizeUntil，依旧是起了16个goroutine对所有候选node并发执行checkNode func，如下：
+
+```go
+// selectVictimsOnNode finds minimum set of pods on the given node that should
+// be preempted in order to make enough room for "pod" to be scheduled. The
+// minimum set selected is subject to the constraint that a higher-priority pod
+// is never preempted when a lower-priority pod could be (higher/lower relative
+// to one another, not relative to the preemptor "pod").
+// The algorithm first checks if the pod can be scheduled on the node when all the
+// lower priority pods are gone. If so, it sorts all the lower priority pods by
+// their priority and then puts them into two groups of those whose PodDisruptionBudget
+// will be violated if preempted and other non-violating pods. Both groups are
+// sorted by priority. It first tries to reprieve as many PDB violating pods as
+// possible and then does them same for non-PDB-violating pods while checking
+// that the "pod" can still fit on the node.
+// NOTE: This function assumes that it is never called if "pod" cannot be scheduled
+// due to pod affinity, node affinity, or node anti-affinity reasons. None of
+// these predicates can be satisfied by removing more pods from the node.
+func (g *genericScheduler) selectVictimsOnNode(
+	ctx context.Context,
+	state *framework.CycleState,
+	pod *v1.Pod,
+	meta predicates.Metadata,
+	nodeInfo *schedulernodeinfo.NodeInfo,
+	pdbs []*policy.PodDisruptionBudget,
+) ([]*v1.Pod, int, bool) {
+    ...
+}
+```
+
+selectVictimsOnNode用于发现node上最小的抢占pod集，另外满足一个原则：低优先级永远先于高优先级pod(相互比较，不是与pod P比较)被抢占(但是最后有可能低优先级pod被保留，高优先级pod被抢占，这个不矛盾，需要好好理解)
+
+该函数首先检查如果抢占node上所有低优先级(低于pod P)的pod被删除后，pod P是否可以被调度在该节点上：
+
+```go
+// As the first step, remove all the lower priority pods from the node and
+// check if the given pod can be scheduled.
+podPriority := podutil.GetPodPriority(pod)
+for _, p := range nodeInfo.Pods() {
+    if podutil.GetPodPriority(p) < podPriority {
+        potentialVictims = append(potentialVictims, p)
+        if err := removePod(p); err != nil {
+            return nil, 0, false
+        }
+    }
+}
+// If the new pod does not fit after removing all the lower priority pods,
+// we are almost done and this node is not suitable for preemption. The only
+// condition that we could check is if the "pod" is failing to schedule due to
+// inter-pod affinity to one or more victims, but we have decided not to
+// support this case for performance reasons. Having affinity to lower
+// priority pods is not a recommended configuration anyway.
+if fits, _, _, err := g.podFitsOnNode(ctx, state, pod, meta, nodeInfo, false); !fits {
+    if err != nil {
+        klog.Warningf("Encountered error while selecting victims on node %v: %v", nodeInfo.Node().Name, err)
+    }
+
+    return nil, 0, false
+}
+```
+
+如果去掉所有低优先级pod，还是无法通过预选策略，则认为该节点不适合抢占，直接返回
+
+如果通过预选，则会将抢占pod按照优先级排序，并将它们分为两个队列(同样按照优先级排序)：PodDisruptionBudget被破坏，PodDisruptionBudget没有被破坏。之后，在保障pod P依旧可以被调度在node条件下，按照PDB被破坏 => PDB不被破坏顺序，从列表中尽可能赦免一些pod，使得他们可以继续运行在node上，不被抢占，从而达到选择最小抢占pod集
+
+```go
+var victims []*v1.Pod
+numViolatingVictim := 0
+sort.Slice(potentialVictims, func(i, j int) bool { return util.MoreImportantPod(potentialVictims[i], potentialVictims[j]) })
+// Try to reprieve as many pods as possible. We first try to reprieve the PDB
+// violating victims and then other non-violating ones. In both cases, we start
+// from the highest priority victims.
+violatingVictims, nonViolatingVictims := filterPodsWithPDBViolation(potentialVictims, pdbs)
+reprievePod := func(p *v1.Pod) (bool, error) {
+    if err := addPod(p); err != nil {
+        return false, err
+    }
+    fits, _, _, _ := g.podFitsOnNode(ctx, state, pod, meta, nodeInfo, false)
+    if !fits {
+        if err := removePod(p); err != nil {
+            return false, err
+        }
+        victims = append(victims, p)
+        klog.V(5).Infof("Pod %v/%v is a potential preemption victim on node %v.", p.Namespace, p.Name, nodeInfo.Node().Name)
+    }
+    return fits, nil
+}
+for _, p := range violatingVictims {
+    if fits, err := reprievePod(p); err != nil {
+        klog.Warningf("Failed to reprieve pod %q: %v", p.Name, err)
+        return nil, 0, false
+    } else if !fits {
+        numViolatingVictim++
+    }
+}
+// Now we try to reprieve non-violating victims.
+for _, p := range nonViolatingVictims {
+    if _, err := reprievePod(p); err != nil {
+        klog.Warningf("Failed to reprieve pod %q: %v", p.Name, err)
+        return nil, 0, false
+    }
+}
+return victims, numViolatingVictim, true
+
+...
+// MoreImportantPod return true when priority of the first pod is higher than
+// the second one. If two pods' priorities are equal, compare their StartTime.
+// It takes arguments of the type "interface{}" to be used with SortableList,
+// but expects those arguments to be *v1.Pod.
+func MoreImportantPod(pod1, pod2 *v1.Pod) bool {
+	p1 := podutil.GetPodPriority(pod1)
+	p2 := podutil.GetPodPriority(pod2)
+	if p1 != p2 {
+		return p1 > p2
+	}
+	return GetPodStartTime(pod1).Before(GetPodStartTime(pod2))
+}
+```
+
+最后成功返回抢占victims，对应的selectNodesForPreemption返回nodeToVictims： 
+
+```go
+pods, numPDBViolations, fits := g.selectVictimsOnNode(ctx, stateCopy, pod, metaCopy, nodeInfoCopy, pdbs)
+if fits {
+    resultLock.Lock()
+    victims := extenderv1.Victims{
+        Pods:             pods,
+        NumPDBViolations: int64(numPDBViolations),
+    }
+    nodeToVictims[potentialNodes[i]] = &victims
+    resultLock.Unlock()
+}
+```
+
+* step4 - 选出一个候选节点
+
+```go
+// pickOneNodeForPreemption chooses one node among the given nodes. It assumes
+// pods in each map entry are ordered by decreasing priority.
+// It picks a node based on the following criteria:
+// 1. A node with minimum number of PDB violations.
+// 2. A node with minimum highest priority victim is picked.
+// 3. Ties are broken by sum of priorities of all victims.
+// 4. If there are still ties, node with the minimum number of victims is picked.
+// 5. If there are still ties, node with the latest start time of all highest priority victims is picked.
+// 6. If there are still ties, the first such node is picked (sort of randomly).
+// The 'minNodes1' and 'minNodes2' are being reused here to save the memory
+// allocation and garbage collection time.
+func pickOneNodeForPreemption(nodesToVictims map[*v1.Node]*extenderv1.Victims) *v1.Node {
+    ...
+}
+```
+
+这里按照如下规则顺序从候选node列表中选择出最合适的节点：
+
+* 选取具有最小PDB violations数目的node
+* 选取具有最小的最高优先级的victims的node
+* 选取victim优先级之和最小的node
+* 选取具有最小victim数目的node
+* 选取victim中最高优先级启动时间最早的那个节点
+* 随机选取(第一个)
+
+* step5 - 选出需要清理pod.status.nominatedNodeName的pod
+
+由于pod P对node进行了抢占，可能会导致以前抢占该node的低优先级(< pod P)pod后面无法成功调度到该node上，需要清除掉这部分pod的pod.status.nominatedNodeName使得它们可以移动到activeQ队列中，并对scheduler再次调度
+
+```go
+// Lower priority pods nominated to run on this node, may no longer fit on
+// this node. So, we should remove their nomination. Removing their
+// nomination updates these pods and moves them to the active queue. It
+// lets scheduler find another place for them.
+nominatedPods := g.getLowerPriorityNominatedPods(pod, candidateNode.Name)
+if nodeInfo, ok := g.nodeInfoSnapshot.NodeInfoMap[candidateNode.Name]; ok {
+    return nodeInfo.Node(), nodeToVictims[candidateNode].Pods, nominatedPods, nil
+}
+
+// getLowerPriorityNominatedPods returns pods whose priority is smaller than the
+// priority of the given "pod" and are nominated to run on the given node.
+// Note: We could possibly check if the nominated lower priority pods still fit
+// and return those that no longer fit, but that would require lots of
+// manipulation of NodeInfo and PredicateMeta per nominated pod. It may not be
+// worth the complexity, especially because we generally expect to have a very
+// small number of nominated pods per node.
+func (g *genericScheduler) getLowerPriorityNominatedPods(pod *v1.Pod, nodeName string) []*v1.Pod {
+	pods := g.schedulingQueue.NominatedPodsForNode(nodeName)
+
+	if len(pods) == 0 {
+		return nil
+	}
+
+	var lowerPriorityPods []*v1.Pod
+	podPriority := podutil.GetPodPriority(pod)
+	for _, p := range pods {
+		if podutil.GetPodPriority(p) < podPriority {
+			lowerPriorityPods = append(lowerPriorityPods, p)
+		}
+	}
+	return lowerPriorityPods
+}
+
+// NominatedPodsForNode returns pods that are nominated to run on the given node,
+// but they are waiting for other pods to be removed from the node before they
+// can be actually scheduled.
+func (p *PriorityQueue) NominatedPodsForNode(nodeName string) []*v1.Pod {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	return p.nominatedPods.podsForNode(nodeName)
+}
+
+func (npm *nominatedPodMap) podsForNode(nodeName string) []*v1.Pod {
+	if list, ok := npm.nominatedPods[nodeName]; ok {
+		return list
+	}
+	return nil
+}
+```
+
+这里就用到了nominatedPodMap，返回该Map中同样node下，优先级低于pod P的pod列表
+
+#### 3. 对抢占node以及victims进行处理
+
+回到scheduler.preempt(k8s.io/kubernetes/pkg/scheduler/scheduler.go)：
+
+```go
+node, victims, nominatedPodsToClear, err := sched.Algorithm.Preempt(ctx, state, preemptor, scheduleErr)
+if err != nil {
+    klog.Errorf("Error preempting victims to make room for %v/%v: %v", preemptor.Namespace, preemptor.Name, err)
+    return "", err
+}
+var nodeName = ""
+if node != nil {
+    nodeName = node.Name
+    // Update the scheduling queue with the nominated pod information. Without
+    // this, there would be a race condition between the next scheduling cycle
+    // and the time the scheduler receives a Pod Update for the nominated pod.
+    sched.SchedulingQueue.UpdateNominatedPodForNode(preemptor, nodeName)
+
+    // Make a call to update nominated node name of the pod on the API server.
+    err = sched.podPreemptor.setNominatedNodeName(preemptor, nodeName)
+    if err != nil {
+        klog.Errorf("Error in preemption process. Cannot set 'NominatedPod' on pod %v/%v: %v", preemptor.Namespace, preemptor.Name, err)
+        sched.SchedulingQueue.DeleteNominatedPodIfExists(preemptor)
+        return "", err
+    }
+
+    for _, victim := range victims {
+        if err := sched.podPreemptor.deletePod(victim); err != nil {
+            klog.Errorf("Error preempting pod %v/%v: %v", victim.Namespace, victim.Name, err)
+            return "", err
+        }
+        // If the victim is a WaitingPod, send a reject message to the PermitPlugin
+        if waitingPod := fwk.GetWaitingPod(victim.UID); waitingPod != nil {
+            waitingPod.Reject("preempted")
+        }
+        sched.Recorder.Eventf(victim, preemptor, v1.EventTypeNormal, "Preempted", "Preempting", "Preempted by %v/%v on node %v", preemptor.Namespace, preemptor.Name, nodeName)
+
+    }
+    metrics.PreemptionVictims.Observe(float64(len(victims)))
+}
+```
+
+在获取抢占节点和victims后，首先更新pod P相关的nominated信息，将pod P对应的抢占node添加到nominatedPodMap中，如下：
+
+```go
+// Update the scheduling queue with the nominated pod information. Without
+// this, there would be a race condition between the next scheduling cycle
+// and the time the scheduler receives a Pod Update for the nominated pod.
+sched.SchedulingQueue.UpdateNominatedPodForNode(preemptor, nodeName)
+
+...
+// UpdateNominatedPodForNode adds a pod to the nominated pods of the given node.
+// This is called during the preemption process after a node is nominated to run
+// the pod. We update the structure before sending a request to update the pod
+// object to avoid races with the following scheduling cycles.
+func (p *PriorityQueue) UpdateNominatedPodForNode(pod *v1.Pod, nodeName string) {
+	p.lock.Lock()
+	p.nominatedPods.add(pod, nodeName)
+	p.lock.Unlock()
+}
+```
+
+接着调用kube-apiserver更新pod P的`pod.status.nominatedNodeName`，如下：
+
+```go
+// Make a call to update nominated node name of the pod on the API server.
+err = sched.podPreemptor.setNominatedNodeName(preemptor, nodeName)
+if err != nil {
+    klog.Errorf("Error in preemption process. Cannot set 'NominatedPod' on pod %v/%v: %v", preemptor.Namespace, preemptor.Name, err)
+    sched.SchedulingQueue.DeleteNominatedPodIfExists(preemptor)
+    return "", err
+}
+
+...
+func (p *podPreemptorImpl) setNominatedNodeName(pod *v1.Pod, nominatedNodeName string) error {
+	podCopy := pod.DeepCopy()
+	podCopy.Status.NominatedNodeName = nominatedNodeName
+	_, err := p.Client.CoreV1().Pods(pod.Namespace).UpdateStatus(podCopy)
+	return err
+}
+```
+
+之后，调用kube-apiserver删除抢占victims，如下：
+
+```go
+for _, victim := range victims {
+    if err := sched.podPreemptor.deletePod(victim); err != nil {
+        klog.Errorf("Error preempting pod %v/%v: %v", victim.Namespace, victim.Name, err)
+        return "", err
+    }
+    // If the victim is a WaitingPod, send a reject message to the PermitPlugin
+    if waitingPod := fwk.GetWaitingPod(victim.UID); waitingPod != nil {
+        waitingPod.Reject("preempted")
+    }
+    sched.Recorder.Eventf(victim, preemptor, v1.EventTypeNormal, "Preempted", "Preempting", "Preempted by %v/%v on node %v", preemptor.Namespace, preemptor.Name, nodeName)
+
+}
+
+...
+func (p *podPreemptorImpl) deletePod(pod *v1.Pod) error {
+	return p.Client.CoreV1().Pods(pod.Namespace).Delete(pod.Name, &metav1.DeleteOptions{})
+}
+
+...
+// unscheduled pod queue
+podInformer.Informer().AddEventHandler(
+    cache.FilteringResourceEventHandler{
+        FilterFunc: func(obj interface{}) bool {
+            switch t := obj.(type) {
+            case *v1.Pod:
+                return !assignedPod(t) && responsibleForPod(t, schedulerName)
+            case cache.DeletedFinalStateUnknown:
+                if pod, ok := t.Obj.(*v1.Pod); ok {
+                    return !assignedPod(pod) && responsibleForPod(pod, schedulerName)
+                }
+                utilruntime.HandleError(fmt.Errorf("unable to convert object %T to *v1.Pod in %T", obj, sched))
+                return false
+            default:
+                utilruntime.HandleError(fmt.Errorf("unable to handle object in %T: %T", sched, obj))
+                return false
+            }
+        },
+        Handler: cache.ResourceEventHandlerFuncs{
+            AddFunc:    sched.addPodToSchedulingQueue,
+            UpdateFunc: sched.updatePodInSchedulingQueue,
+            DeleteFunc: sched.deletePodFromSchedulingQueue,
+        },
+    },
+)
+
+...
+func (sched *Scheduler) deletePodFromSchedulingQueue(obj interface{}) {
+	var pod *v1.Pod
+	switch t := obj.(type) {
+	case *v1.Pod:
+		pod = obj.(*v1.Pod)
+	case cache.DeletedFinalStateUnknown:
+		var ok bool
+		pod, ok = t.Obj.(*v1.Pod)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("unable to convert object %T to *v1.Pod in %T", obj, sched))
+			return
+		}
+	default:
+		utilruntime.HandleError(fmt.Errorf("unable to handle object in %T: %T", sched, obj))
+		return
+	}
+	if err := sched.SchedulingQueue.Delete(pod); err != nil {
+		utilruntime.HandleError(fmt.Errorf("unable to dequeue %T: %v", obj, err))
+	}
+	if sched.VolumeBinder != nil {
+		// Volume binder only wants to keep unassigned pods
+		sched.VolumeBinder.DeletePodBindings(pod)
+	}
+	sched.Framework.RejectWaitingPod(pod.UID)
+}
+
+// Delete deletes the item from either of the two queues. It assumes the pod is
+// only in one queue.
+func (p *PriorityQueue) Delete(pod *v1.Pod) error {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	p.nominatedPods.delete(pod)
+	err := p.activeQ.Delete(newPodInfoNoTimestamp(pod))
+	if err != nil { // The item was probably not found in the activeQ.
+		p.clearPodBackoff(pod)
+		p.podBackoffQ.Delete(newPodInfoNoTimestamp(pod))
+		p.unschedulableQ.delete(pod)
+	}
+	return nil
+}
+```
+
+删除操作会出发scheduler pod DELETE事件，执行PriorityQueue相关的删除逻辑，其中就包括将pod相关信息从nominatedPodMap中删除
+
+在添加完nominatedPodMap，更新pod P的`pod.status.nominatedNodeName`以及删除victims后，执行清理pod `pod.status.nominatedNodeName`操作，使其回到activeQ队列，重新被scheduler调度：
+
+```go
+potentialNodes := nodesWherePreemptionMightHelp(g.nodeInfoSnapshot.NodeInfoMap, fitError)
+if len(potentialNodes) == 0 {
+    klog.V(3).Infof("Preemption will not help schedule pod %v/%v on any node.", pod.Namespace, pod.Name)
+    // In this case, we should clean-up any existing nominated node name of the pod.
+    return nil, nil, []*v1.Pod{pod}, nil
+}
+
+...
+// Clearing nominated pods should happen outside of "if node != nil". Node could
+// be nil when a pod with nominated node name is eligible to preempt again,
+// but preemption logic does not find any node for it. In that case Preempt()
+// function of generic_scheduler.go returns the pod itself for removal of
+// the 'NominatedPod' field.
+for _, p := range nominatedPodsToClear {
+    rErr := sched.podPreemptor.removeNominatedNodeName(p)
+    if rErr != nil {
+        klog.Errorf("Cannot remove 'NominatedPod' field of pod: %v", rErr)
+        // We do not return as this error is not critical.
+    }
+}
+
+func (p *podPreemptorImpl) removeNominatedNodeName(pod *v1.Pod) error {
+	if len(pod.Status.NominatedNodeName) == 0 {
+		return nil
+	}
+	return p.setNominatedNodeName(pod, "")
+}
+
+func (p *podPreemptorImpl) setNominatedNodeName(pod *v1.Pod, nominatedNodeName string) error {
+	podCopy := pod.DeepCopy()
+	podCopy.Status.NominatedNodeName = nominatedNodeName
+	_, err := p.Client.CoreV1().Pods(pod.Namespace).UpdateStatus(podCopy)
+	return err
+}
+```
+
+注意这里"if node != nil"的一个特殊情况，就是pod P已经发生了抢占，但是调度失败了，这种情况下再次抢占会返回node=nil，而nominatedPodsToClear为pod P
+
+对应的会触发pod的UPDATE事件，执行updatePodInSchedulingQueue函数，将pod放到activeQ队列中重新调度，同时，更新nominatedPodMap相关信息：
+
+```go
+func (sched *Scheduler) updatePodInSchedulingQueue(oldObj, newObj interface{}) {
+	pod := newObj.(*v1.Pod)
+	if sched.skipPodUpdate(pod) {
+		return
+	}
+	if err := sched.SchedulingQueue.Update(oldObj.(*v1.Pod), pod); err != nil {
+		utilruntime.HandleError(fmt.Errorf("unable to update %T: %v", newObj, err))
+	}
+}
+
+...
+// Update updates a pod in the active or backoff queue if present. Otherwise, it removes
+// the item from the unschedulable queue if pod is updated in a way that it may
+// become schedulable and adds the updated one to the active queue.
+// If pod is not present in any of the queues, it is added to the active queue.
+func (p *PriorityQueue) Update(oldPod, newPod *v1.Pod) error {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if oldPod != nil {
+		oldPodInfo := newPodInfoNoTimestamp(oldPod)
+		// If the pod is already in the active queue, just update it there.
+		if oldPodInfo, exists, _ := p.activeQ.Get(oldPodInfo); exists {
+			p.nominatedPods.update(oldPod, newPod)
+			err := p.activeQ.Update(updatePod(oldPodInfo, newPod))
+			return err
+		}
+
+		// If the pod is in the backoff queue, update it there.
+		if oldPodInfo, exists, _ := p.podBackoffQ.Get(oldPodInfo); exists {
+			p.nominatedPods.update(oldPod, newPod)
+			p.podBackoffQ.Delete(oldPodInfo)
+			err := p.activeQ.Add(updatePod(oldPodInfo, newPod))
+			if err == nil {
+				p.cond.Broadcast()
+			}
+			return err
+		}
+	}
+
+	// If the pod is in the unschedulable queue, updating it may make it schedulable.
+	if usPodInfo := p.unschedulableQ.get(newPod); usPodInfo != nil {
+		p.nominatedPods.update(oldPod, newPod)
+		if isPodUpdated(oldPod, newPod) {
+			// If the pod is updated reset backoff
+			p.clearPodBackoff(newPod)
+			p.unschedulableQ.delete(usPodInfo.Pod)
+			err := p.activeQ.Add(updatePod(usPodInfo, newPod))
+			if err == nil {
+				p.cond.Broadcast()
+			}
+			return err
+		}
+		// Pod is already in unschedulable queue and hasnt updated, no need to backoff again
+		p.unschedulableQ.addOrUpdate(updatePod(usPodInfo, newPod))
+		return nil
+	}
+	// If pod is not in any of the queues, we put it in the active queue.
+	err := p.activeQ.Add(p.newPodInfo(newPod))
+	if err == nil {
+		p.nominatedPods.add(newPod, "")
+		p.cond.Broadcast()
+	}
+	return err
+}
+```
+
+
 
 ## Predicate(预选)
 
 ## Refs
 
 * [Pod Priority and Preemption](https://kubernetes.io/docs/concepts/configuration/pod-priority-preemption/)
-

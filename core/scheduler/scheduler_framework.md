@@ -283,4 +283,6 @@ func (sched *Scheduler) bind(ctx context.Context, assumed *v1.Pod, targetNode st
 }
 ```
 
-接下来我们分析预选流程……
+这里第三，四步骤可能看起来太过模糊，详细分析可以参考[scheduler_cache](https://github.com/duyanghao/kubernetes-reading-notes/blob/master/core/scheduler/internal-structure/scheduler_cache.md)
+
+接下来我们分析第二步骤：调度流程(预选&优选)……

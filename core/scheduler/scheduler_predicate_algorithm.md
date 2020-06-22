@@ -249,7 +249,9 @@ func (g *genericScheduler) podFitsOnNode(
 
 通过注释知道：podFitsOnNode用于检查node是否满足给定的预选策略，这个函数会在`Schedule`和`Preempt`两种场景下被调用，`Preempt`相比`Schedule`会在调用这个函数前剔除掉被抢占的pods
 
-podFitsOnNode主体会有两遍检查，第一遍会假定优先级大于或等于检查pod的被任命的pod已经在node上运行了；第二遍假定优先级大于或等于检查pod的被任命的pod没有在node上运行。这两种场景下node都能通过预选策略，才可以认为是该节点可被调度
+podFitsOnNode主体会有两遍检查，第一遍会假定优先级大于或等于检查pod的抢占pod最终在node上运行了；第二遍假定优先级大于或等于检查pod的抢占pod最终没有在node上运行。这两种场景下node都能通过预选策略，才可以认为是该节点可被调度
+
+关于抢占的理解可以参考[Preempts(抢占)](https://github.com/duyanghao/kubernetes-reading-notes/blob/master/core/scheduler/internal-structure/scheduler_nominatedPods.md#preempts%E6%8A%A2%E5%8D%A0)
 
 查看核心预选代码：
 

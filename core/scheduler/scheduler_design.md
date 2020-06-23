@@ -73,6 +73,10 @@ Scheduler的总入口如下：
 
 我们后续将从这三个入口对scheduler源码展开分析
 
+## 扩展
+
+关于scheduler的扩展，单独分了一个模块进行详细介绍，见[scheduler extensibility](extension/README.md)
+
 ## Refs
 
 * [scheduler community](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-scheduling/scheduler.md)

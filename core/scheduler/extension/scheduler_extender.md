@@ -785,9 +785,14 @@ func (g *genericScheduler) prioritizeNodes(
 
 综上，如果要在kube-scheduler基础上添加策略，则按照如下步骤进行添加：
 
-* 
+* 设置默认预选&优选策略：defaultPredicates以及defaultPriorities(k8s.io/kubernetes/pkg/scheduler/algorithmprovider/defaults/defaults.go)
+* 注册预选和优选相关处理函数：注册预选函数(k8s.io/kubernetes/pkg/scheduler/algorithmprovider/defaults/register_predicates.go)；注册优选函数(k8s.io/kubernetes/pkg/scheduler/algorithmprovider/defaults/register_priorities.go)
+* 编写预选和优选处理函数：编写预选函数(k8s.io/kubernetes/pkg/scheduler/algorithm/predicates/predicates.go)；编写优选函数Map+Reduce(k8s.io/kubernetes/pkg/scheduler/algorithm/priorities/xxx.go)
+* 除了默认设置预选&优选外，还可以手动通过命令行`--policy-config-file`指定调度策略(会覆盖默认策略)，例如[examples/scheduler-policy-config.json](https://github.com/kubernetes/examples/blob/master/staging/scheduler-policy/scheduler-policy-config.json) 
 
 #### standalone
+
+
 
 #### scheduler extender
 

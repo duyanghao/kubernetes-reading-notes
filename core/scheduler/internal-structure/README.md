@@ -1,7 +1,7 @@
 Kubernetes Scheduler Internal Structure
 =======================================
 
-![](images/scheduler_process.png)
+![](../images/scheduler_process.png)
 
 ## Contents
 

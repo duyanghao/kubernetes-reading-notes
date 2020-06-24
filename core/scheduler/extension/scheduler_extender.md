@@ -10,7 +10,7 @@ Kubernetes Scheduler Extensibility - Scheduler extender
 
 本文介绍前面三种方法，对于scheduler framework，也就是目前Kubernetes推荐扩展的方式，单独分一章进行讲解
 
-#### default-scheduler recoding
+## default-scheduler recoding
 
 这里我们先分析一下kube-scheduler调度相关入口：
 
@@ -790,7 +790,7 @@ func (g *genericScheduler) prioritizeNodes(
 * 编写预选和优选处理函数：编写预选函数(k8s.io/kubernetes/pkg/scheduler/algorithm/predicates/predicates.go)；编写优选函数Map+Reduce(k8s.io/kubernetes/pkg/scheduler/algorithm/priorities/xxx.go)
 * 除了默认设置预选&优选外，还可以手动通过命令行`--policy-config-file`指定调度策略(会覆盖默认策略)，例如[examples/scheduler-policy-config.json](https://github.com/kubernetes/examples/blob/master/staging/scheduler-policy/scheduler-policy-config.json) 
 
-#### standalone
+## standalone
 
 相比recoding只修改简单代码，standalone在kube-scheduler基础上进行重度二次定制，这种方式优缺点如下：
 
@@ -803,9 +803,9 @@ func (g *genericScheduler) prioritizeNodes(
 
 因此建议在其它方案满足不了扩展需求时，才采用standalone方案，且生产环境仅部署一个scheduler
 
-#### scheduler extender
+## scheduler extender
 
-对于Kubernetes项目来说，它很喜欢开发者使用并向它提bug或者PR，但是不建议开发者直接修改Kubernetes核心代码，因为这样做会影响Kubernetes本身的代码质量以及稳定性。因此Kubernetes希望尽可能通过外围的方式来解决客户自定义的需求
+对于Kubernetes项目来说，它很乐意开发者使用并向它提bug或者PR(受欢迎)，但是不建议开发者为了实现业务需求直接修改Kubernetes核心代码，因为这样做会影响Kubernetes本身的代码质量以及稳定性。因此Kubernetes希望尽可能通过外围的方式来解决客户自定义的需求
 
 其实任何好的项目都应该这样思考：尽可能抽取核心代码，这部分代码不应该经常变动或者说只能由maintainer改动(提高代码质量，减小项目本身开发&运维成本)；将第三方客户需求尽可能提取到外围解决(满足客户自由)，例如：插件的形式(eg: CNI，CRI，CSI and scheduler framework etc)
 
@@ -816,6 +816,52 @@ scheduler extender类似于webhook，kube-scheduler会在默认调度算法执�
 scheduler extender适用于调度策略与非标准kube-scheduler管理资源相关的场景，当然你也可以使用extender完成与上述两种方式同样的功能
 
 下面我们结合代码说明extender的使用原理：
+
+```
+For given pod:
+
+    +---------------------------------------------+
+    |               Schedulable nodes:            |
+    |                                             |
+    | +--------+    +--------+      +--------+    |
+    | | node 1 |    | node 2 |  ... | node 4 |    |
+    | +--------+    +--------+      +--------+    |
+    |                                             |
+    +-------------------+-------------------------+
+                        |
+                        |
+                        v
+    +-------------------+-------------------------+
+
+    Pred. filters: node 4 doesn't have enough resource
+
+    +-------------------+-------------------------+
+                        |
+                        |
+                        v
+    +-------------------+-------------------------+
+    |             remaining nodes:                |
+    |   +--------+                 +--------+     |
+    |   | node 1 |     ...         | node 3 |     |
+    |   +--------+                 +--------+     |
+    |                                             |
+    +-------------------+-------------------------+
+                        |
+                        | - - - > scheduler extenders filter(drop node3) 
+                        |
+                        v
+    +-------------------+-------------------------+
+
+    Priority function:    node 1: p=2
+                          node 2: p=5
+
+    +-------------------+-------------------------+
+                        |
+                        | - - - > scheduler extenders Prioritize(node 1: p=5; node 2: p=1) 
+                        |
+                        v
+            select max{node priority} = node 1
+```
 
 * 定义scheduler extender
 
@@ -1457,7 +1503,7 @@ func (h *HTTPExtender) Prioritize(pod *v1.Pod, nodes []*v1.Node) (*extenderv1.Ho
 }
 ```
 
-scheduler会在默认优选算法执行完成后，会并发(wg.Wait)执行extender优选算法(预选需要顺序执行，优选可以并发执行)，请求参数为extenderv1.ExtenderArgs(和预选一样)，返回extenderv1.HostPriorityList(k8s.io/kubernetes/pkg/scheduler/apis/extender/v1/types.go)，如下：
+scheduler会在默认优选算法执行完成后，并发(wg.Wait)执行extender优选算法(预选需要顺序执行，优选可以并发执行)，请求参数为extenderv1.ExtenderArgs(和预选一样)，返回extenderv1.HostPriorityList(k8s.io/kubernetes/pkg/scheduler/apis/extender/v1/types.go)，如下：
 
 ```go
 // HostPriority represents the priority of scheduling to a particular host, higher priority is better.
@@ -1501,7 +1547,7 @@ const (
 )
 ```
 
-这里给一个scheduler extender扩展的[demo project](https://github.com/everpeace/k8s-scheduler-extender-example)，代码简单&无意义，不分析，只用于参考
+最后，给一个scheduler extender扩展的[demo project](https://github.com/everpeace/k8s-scheduler-extender-example)，代码简单&无意义，不分析，只用于参考
 
 至此，scheduler扩展的三种方式原理和实践指引都已经介绍完毕，下一章我们开始介绍scheduler framework……
 
@@ -1509,3 +1555,4 @@ const (
 
 * [Scheduler extender](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/scheduling/scheduler_extender.md)
 * [The Kubernetes Scheduler](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-scheduling/scheduler.md)
+* [扩展 Kubernetes 之 Scheduler](https://cloud.tencent.com/developer/article/1580234)

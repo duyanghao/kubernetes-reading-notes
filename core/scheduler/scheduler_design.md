@@ -5,6 +5,8 @@ Scheduler是Kubernetes组件中功能&逻辑相对单一&简单的模块，分�
 
 一句话总结scheduler的功能就是：watch kube-apiserver，监听`PodSpec.NodeName`为空的pod，并利用预选和优选算法为该pod选择一个最佳的调度node节点，最终将pod与该node进行绑定
 
+![](images/kubernetes_scheduler.png)
+
 ## The scheduling algorithm
 
 如上所述，scheduler会依次为每个pod选择一个node，选择的算法流程大致如下：

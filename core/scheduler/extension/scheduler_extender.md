@@ -1220,11 +1220,290 @@ func (h *HTTPExtender) send(action string, args interface{}, result interface{})
 }
 ```
 
-scheduler会在默认预选算法执行完成后，遍历extender列表，依次发出http/https POST请求给extender，并将上一次过滤后的node列表传递给下一个extender进行过滤
+scheduler会在默认预选算法执行完成后，遍历extender列表，依次发出http/https POST请求给extender，请求参数为extenderv1.ExtenderArgs，extender执行完预选算法后，返回extenderv1.ExtenderFilterResult(k8s.io/kubernetes/pkg/scheduler/apis/extender/v1/types.go)，如下：
+
+```go
+// ExtenderFilterResult represents the results of a filter call to an extender
+type ExtenderFilterResult struct {
+	// Filtered set of nodes where the pod can be scheduled; to be populated
+	// only if ExtenderConfig.NodeCacheCapable == false
+	Nodes *v1.NodeList
+	// Filtered set of nodes where the pod can be scheduled; to be populated
+	// only if ExtenderConfig.NodeCacheCapable == true
+	NodeNames *[]string
+	// Filtered out nodes where the pod can't be scheduled and the failure messages
+	FailedNodes FailedNodesMap
+	// Error message indicating failure
+	Error string
+}
+```
+
+并将上一次过滤后的node列表传递给下一个extender进行过滤
 
 * extender优选接口
 
+传递给extender优选接口的参数结构和预选相同(k8s.io/kubernetes/pkg/scheduler/apis/extender/v1/types.go)：
 
+```go
+// ExtenderArgs represents the arguments needed by the extender to filter/prioritize
+// nodes for a pod.
+type ExtenderArgs struct {
+	// Pod being scheduled
+	Pod *v1.Pod
+	// List of candidate nodes where the pod can be scheduled; to be populated
+	// only if ExtenderConfig.NodeCacheCapable == false
+	Nodes *v1.NodeList
+	// List of candidate node names where the pod can be scheduled; to be
+	// populated only if ExtenderConfig.NodeCacheCapable == true
+	NodeNames *[]string
+}
+```
+
+其中，Nodes结构体表示scheduler预选策略(默认+extender算法)通过的节点列表，我们看相关调用代码(k8s.io/kubernetes/pkg/scheduler/core/generic_scheduler.go)：
+
+```go
+// prioritizeNodes prioritizes the nodes by running the individual priority functions in parallel.
+// Each priority function is expected to set a score of 0-10
+// 0 is the lowest priority score (least preferred node) and 10 is the highest
+// Each priority function can also have its own weight
+// The node scores returned by the priority function are multiplied by the weights to get weighted scores
+// All scores are finally combined (added) to get the total weighted scores of all nodes
+func (g *genericScheduler) prioritizeNodes(
+	ctx context.Context,
+	state *framework.CycleState,
+	pod *v1.Pod,
+	meta interface{},
+	nodes []*v1.Node,
+) (framework.NodeScoreList, error) {
+	// If no priority configs are provided, then all nodes will have a score of one.
+	// This is required to generate the priority list in the required format
+	if len(g.prioritizers) == 0 && len(g.extenders) == 0 && !g.framework.HasScorePlugins() {
+		result := make(framework.NodeScoreList, 0, len(nodes))
+		for i := range nodes {
+			result = append(result, framework.NodeScore{
+				Name:  nodes[i].Name,
+				Score: 1,
+			})
+		}
+		return result, nil
+	}
+
+	var (
+		mu   = sync.Mutex{}
+		wg   = sync.WaitGroup{}
+		errs []error
+	)
+	appendError := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		errs = append(errs, err)
+	}
+
+	results := make([]framework.NodeScoreList, len(g.prioritizers))
+
+	for i := range g.prioritizers {
+		results[i] = make(framework.NodeScoreList, len(nodes))
+	}
+
+	workqueue.ParallelizeUntil(context.TODO(), 16, len(nodes), func(index int) {
+		nodeInfo := g.nodeInfoSnapshot.NodeInfoMap[nodes[index].Name]
+		for i := range g.prioritizers {
+			var err error
+			results[i][index], err = g.prioritizers[i].Map(pod, meta, nodeInfo)
+			if err != nil {
+				appendError(err)
+				results[i][index].Name = nodes[index].Name
+			}
+		}
+	})
+
+	for i := range g.prioritizers {
+		if g.prioritizers[i].Reduce == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(index int) {
+			metrics.SchedulerGoroutines.WithLabelValues("prioritizing_mapreduce").Inc()
+			defer func() {
+				metrics.SchedulerGoroutines.WithLabelValues("prioritizing_mapreduce").Dec()
+				wg.Done()
+			}()
+			if err := g.prioritizers[index].Reduce(pod, meta, g.nodeInfoSnapshot, results[index]); err != nil {
+				appendError(err)
+			}
+			if klog.V(10) {
+				for _, hostPriority := range results[index] {
+					klog.Infof("%v -> %v: %v, Score: (%d)", util.GetPodFullName(pod), hostPriority.Name, g.prioritizers[index].Name, hostPriority.Score)
+				}
+			}
+		}(i)
+	}
+	// Wait for all computations to be finished.
+	wg.Wait()
+	if len(errs) != 0 {
+		return framework.NodeScoreList{}, errors.NewAggregate(errs)
+	}
+
+	// Run the Score plugins.
+	state.Write(migration.PrioritiesStateKey, &migration.PrioritiesStateData{Reference: meta})
+	scoresMap, scoreStatus := g.framework.RunScorePlugins(ctx, state, pod, nodes)
+	if !scoreStatus.IsSuccess() {
+		return framework.NodeScoreList{}, scoreStatus.AsError()
+	}
+
+	// Summarize all scores.
+	result := make(framework.NodeScoreList, 0, len(nodes))
+
+	for i := range nodes {
+		result = append(result, framework.NodeScore{Name: nodes[i].Name, Score: 0})
+		for j := range g.prioritizers {
+			result[i].Score += results[j][i].Score * g.prioritizers[j].Weight
+		}
+
+		for j := range scoresMap {
+			result[i].Score += scoresMap[j][i].Score
+		}
+	}
+
+	if len(g.extenders) != 0 && nodes != nil {
+		combinedScores := make(map[string]int64, len(g.nodeInfoSnapshot.NodeInfoList))
+		for i := range g.extenders {
+			if !g.extenders[i].IsInterested(pod) {
+				continue
+			}
+			wg.Add(1)
+			go func(extIndex int) {
+				metrics.SchedulerGoroutines.WithLabelValues("prioritizing_extender").Inc()
+				defer func() {
+					metrics.SchedulerGoroutines.WithLabelValues("prioritizing_extender").Dec()
+					wg.Done()
+				}()
+				prioritizedList, weight, err := g.extenders[extIndex].Prioritize(pod, nodes)
+				if err != nil {
+					// Prioritization errors from extender can be ignored, let k8s/other extenders determine the priorities
+					return
+				}
+				mu.Lock()
+				for i := range *prioritizedList {
+					host, score := (*prioritizedList)[i].Host, (*prioritizedList)[i].Score
+					if klog.V(10) {
+						klog.Infof("%v -> %v: %v, Score: (%d)", util.GetPodFullName(pod), host, g.extenders[extIndex].Name(), score)
+					}
+					combinedScores[host] += score * weight
+				}
+				mu.Unlock()
+			}(i)
+		}
+		// wait for all go routines to finish
+		wg.Wait()
+		for i := range result {
+			// MaxExtenderPriority may diverge from the max priority used in the scheduler and defined by MaxNodeScore,
+			// therefore we need to scale the score returned by extenders to the score range used by the scheduler.
+			result[i].Score += combinedScores[result[i].Name] * (framework.MaxNodeScore / extenderv1.MaxExtenderPriority)
+		}
+	}
+
+	if klog.V(10) {
+		for i := range result {
+			klog.Infof("Host %s => Score %d", result[i].Name, result[i].Score)
+		}
+	}
+	return result, nil
+}
+
+...
+// Prioritize based on extender implemented priority functions. Weight*priority is added
+// up for each such priority function. The returned score is added to the score computed
+// by Kubernetes scheduler. The total score is used to do the host selection.
+func (h *HTTPExtender) Prioritize(pod *v1.Pod, nodes []*v1.Node) (*extenderv1.HostPriorityList, int64, error) {
+	var (
+		result    extenderv1.HostPriorityList
+		nodeList  *v1.NodeList
+		nodeNames *[]string
+		args      *extenderv1.ExtenderArgs
+	)
+
+	if h.prioritizeVerb == "" {
+		result := extenderv1.HostPriorityList{}
+		for _, node := range nodes {
+			result = append(result, extenderv1.HostPriority{Host: node.Name, Score: 0})
+		}
+		return &result, 0, nil
+	}
+
+	if h.nodeCacheCapable {
+		nodeNameSlice := make([]string, 0, len(nodes))
+		for _, node := range nodes {
+			nodeNameSlice = append(nodeNameSlice, node.Name)
+		}
+		nodeNames = &nodeNameSlice
+	} else {
+		nodeList = &v1.NodeList{}
+		for _, node := range nodes {
+			nodeList.Items = append(nodeList.Items, *node)
+		}
+	}
+
+	args = &extenderv1.ExtenderArgs{
+		Pod:       pod,
+		Nodes:     nodeList,
+		NodeNames: nodeNames,
+	}
+
+	if err := h.send(h.prioritizeVerb, args, &result); err != nil {
+		return nil, 0, err
+	}
+	return &result, h.weight, nil
+}
+```
+
+scheduler会在默认优选算法执行完成后，会并发(wg.Wait)执行extender优选算法(预选需要顺序执行，优选可以并发执行)，和预选一样请求参数为extenderv1.ExtenderArgs，extender返回extenderv1.HostPriorityList(k8s.io/kubernetes/pkg/scheduler/apis/extender/v1/types.go)，如下：
+
+```go
+// HostPriority represents the priority of scheduling to a particular host, higher priority is better.
+type HostPriority struct {
+	// Name of the host
+	Host string
+	// Score associated with the host
+	Score int64
+}
+
+// HostPriorityList declares a []HostPriority type.
+type HostPriorityList []HostPriority
+```
+
+这里返回了每个节点对应的extender优选算法分数，注意extender的优选算法实际上只是完成了Map过程(返回0-10分数)，所以需要scheduler对extender优选scores进行Reduce(替换成0-100分数)，如下：
+
+```go
+// MaxExtenderPriority may diverge from the max priority used in the scheduler and defined by MaxNodeScore,
+// therefore we need to scale the score returned by extenders to the score range used by the scheduler.
+result[i].Score += combinedScores[result[i].Name] * (framework.MaxNodeScore / extenderv1.MaxExtenderPriority)
+
+...
+const (
+	// MaxNodeScore is the maximum score a Score plugin is expected to return.
+	MaxNodeScore int64 = 100
+
+	// MinNodeScore is the minimum score a Score plugin is expected to return.
+	MinNodeScore int64 = 0
+
+	// MaxTotalScore is the maximum total score.
+	MaxTotalScore int64 = math.MaxInt64
+)
+
+...
+const (
+	// MinExtenderPriority defines the min priority value for extender.
+	MinExtenderPriority int64 = 0
+
+	// MaxExtenderPriority defines the max priority value for extender.
+	MaxExtenderPriority int64 = 10
+)
+```
+
+这里给一个scheduler extender扩展的[demo project](https://github.com/everpeace/k8s-scheduler-extender-example)，代码简单&无意义，不分析，只用于参考
+
+至此，scheduler扩展的三种方式原理和实践指引都已经介绍完毕，下一章我们开始介绍scheduler framework……
 
 ## Refs
 

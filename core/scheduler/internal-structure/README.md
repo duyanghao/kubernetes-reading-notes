@@ -1,6 +1,8 @@
 Kubernetes Scheduler Internal Structure
 =======================================
 
+## Workflow
+
 ![](../images/scheduler_process.png)
 
 ## Contents

@@ -1457,7 +1457,7 @@ func (h *HTTPExtender) Prioritize(pod *v1.Pod, nodes []*v1.Node) (*extenderv1.Ho
 }
 ```
 
-scheduler会在默认优选算法执行完成后，会并发(wg.Wait)执行extender优选算法(预选需要顺序执行，优选可以并发执行)，和预选一样请求参数为extenderv1.ExtenderArgs，extender返回extenderv1.HostPriorityList(k8s.io/kubernetes/pkg/scheduler/apis/extender/v1/types.go)，如下：
+scheduler会在默认优选算法执行完成后，会并发(wg.Wait)执行extender优选算法(预选需要顺序执行，优选可以并发执行)，请求参数为extenderv1.ExtenderArgs(和预选一样)，返回extenderv1.HostPriorityList(k8s.io/kubernetes/pkg/scheduler/apis/extender/v1/types.go)，如下：
 
 ```go
 // HostPriority represents the priority of scheduling to a particular host, higher priority is better.

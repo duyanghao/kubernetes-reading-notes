@@ -813,7 +813,7 @@ func (g *genericScheduler) prioritizeNodes(
 
 scheduler extender类似于webhook，kube-scheduler会在默认调度算法执行完成后以http/https的方式调用extender，extender server完成自定义的预选&优选逻辑，并返回规定字段给scheduler，scheduler结合这些信息进行最终的调度裁决，从而完成基于extender实现扩展的逻辑
 
-scheduler extender适用于调度策略与非标准kube-scheduler管理资源相关的场景，当然你也可以使用extender完成与上述两种方式同样的功能
+scheduler extender适用于调度策略与非标准kube-scheduler管理资源相关的场景，当然你也可以使用extender完成与上述两种方式同样的功能(简单场景)
 
 下面我们结合代码说明extender的使用原理：
 

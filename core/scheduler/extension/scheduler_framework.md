@@ -1,8 +1,6 @@
 Kubernetes Scheduler Extensibility - Scheduler Framework
 ========================================================
 
-## Overview
-
 extender提供了非侵入scheduler core的方式扩展scheduler，但是有如下缺点：
 
 * 缺少灵活性：extender提供的接口只能由scheduler core在固定点调用，比如："Filter" extenders只能在默认预选结束后进行调用；而"Prioritize" extenders只能在默认优选执行后调用
@@ -16,8 +14,8 @@ extender提供了非侵入scheduler core的方式扩展scheduler，但是有如�
 
 scheduler整个调度流程可以分为如下两个阶段：
 
-* scheduling cycle：选择出一个节点以供pod运行，主要包括预选&优选，串行执行
-* binding cycle：将scheduling cycle选择的node与pod进行绑定，主要包括bind操作，并发执行
+* scheduling cycle：选择出一个节点以供pod运行，主要包括预选&优选，串行执行(一个pod调度完成后才调度下一个)
+* binding cycle：将scheduling cycle选择的node与pod进行绑定，主要包括bind操作，并发执行(并发执行不同pod的绑定操作)
 
 这两个阶段合称为"scheduling context"，每个阶段在调度失败或者发生错误时都可能发生中断并被放入scheduler队列等待重新调度
 
@@ -34,9 +32,9 @@ pod调度流程以及对应的scheduler plugins扩展点如下：
 * Filter：对应scheduler预选算法，用于根据预选策略对节点进行过滤
 * Pre-Score：对应"Pre-filter"，主要用于优选 预处理，比如：更新cache，产生logs/metrics等
 * Scoring：对应scheduler优选算法，分为"score"(Map)和"normalize scoring"(Reduce)两个阶段
-  * score：并发执行node打分；同一个node在打分的时候，并发执行所有插件对该node进行score
+  * score：并发执行node打分；同一个node在打分的时候，顺序执行插件对该node进行score
   * normalize scoring：并发执行所有插件的normalize scoring；每个插件对所有节点score进行reduce，最终将分数限制在[MinNodeScore, MaxNodeScore]有效范围
-* Reserve(aka Assume)：scheduling cycle的最后一步，用于将node相关资源预留(assume)给pod，更新scheduler cache；binding cycle执行失败，则会执行对应的Un-reserve插件，清理掉与pod相关的assume资源，并进行scheduling queue等待重新调度
+* Reserve(aka Assume)：scheduling cycle的最后一步，用于将node相关资源预留(assume)给pod，更新scheduler cache；若binding cycle执行失败，则会执行对应的Un-reserve插件，清理掉与pod相关的assume资源，并进入scheduling queue等待重新调度
 * Permit：binding cycle的第一个步骤，判断是否允许pod与node执行bind，有如下三种行为：
   * approve：允许，进入Pre-bind流程
   * deny：不允许，执行Un-reserve插件，并进入scheduling queue等待重新调度
@@ -217,58 +215,6 @@ func NewFramework(r Registry, plugins *config.Plugins, args []config.PluginConfi
 	return f, nil
 }
 
-// Plugins include multiple extension points. When specified, the list of plugins for
-// a particular extension point are the only ones enabled. If an extension point is
-// omitted from the config, then the default set of plugins is used for that extension point.
-// Enabled plugins are called in the order specified here, after default plugins. If they need to
-// be invoked before default plugins, default plugins must be disabled and re-enabled here in desired order.
-type Plugins struct {
-	// QueueSort is a list of plugins that should be invoked when sorting pods in the scheduling queue.
-	QueueSort *PluginSet
-
-	// PreFilter is a list of plugins that should be invoked at "PreFilter" extension point of the scheduling framework.
-	PreFilter *PluginSet
-
-	// Filter is a list of plugins that should be invoked when filtering out nodes that cannot run the Pod.
-	Filter *PluginSet
-
-	// PostFilter is a list of plugins that are invoked after filtering out infeasible nodes.
-	PostFilter *PluginSet
-
-	// Score is a list of plugins that should be invoked when ranking nodes that have passed the filtering phase.
-	Score *PluginSet
-
-	// Reserve is a list of plugins invoked when reserving a node to run the pod.
-	Reserve *PluginSet
-
-	// Permit is a list of plugins that control binding of a Pod. These plugins can prevent or delay binding of a Pod.
-	Permit *PluginSet
-
-	// PreBind is a list of plugins that should be invoked before a pod is bound.
-	PreBind *PluginSet
-
-	// Bind is a list of plugins that should be invoked at "Bind" extension point of the scheduling framework.
-	// The scheduler call these plugins in order. Scheduler skips the rest of these plugins as soon as one returns success.
-	Bind *PluginSet
-
-	// PostBind is a list of plugins that should be invoked after a pod is successfully bound.
-	PostBind *PluginSet
-
-	// Unreserve is a list of plugins invoked when a pod that was previously reserved is rejected in a later phase.
-	Unreserve *PluginSet
-}
-
-// PluginSet specifies enabled and disabled plugins for an extension point.
-// If an array is empty, missing, or nil, default plugins at that extension point will be used.
-type PluginSet struct {
-	// Enabled specifies plugins that should be enabled in addition to default plugins.
-	// These are called after default plugins and in the same order specified here.
-	Enabled []Plugin
-	// Disabled specifies default plugins that should be disabled.
-	// When all default plugins need to be disabled, an array containing only one "*" should be provided.
-	Disabled []Plugin
-}
-
 func (f *framework) getExtensionPoints(plugins *config.Plugins) []extensionPoint {
 	return []extensionPoint{
 		{plugins.PreFilter, &f.preFilterPlugins},
@@ -401,13 +347,15 @@ type ScorePlugin interface {
 * 同一个插件可能在同一个scheduling context中被并发执行
 * 同一个插件可能在不同的scheduling context中被并发执行
 
-原因其实也很简单，就是：scheduling cycle是串行工作的(一个pod调度完成后才调度下一个)；binding cycle是并发执行的(可以并行绑定)，而scheduling context由这两部分组成
+原因其实也很简单，就是：scheduling cycle是串行工作的(一个pod调度完成后才调度下一个)；binding cycle是并发执行的(可以并行绑定pod)，而scheduling context由这两部分组成
+
+>> In the main thread of the scheduler, only one scheduling cycle is processed at a time. Any extension point up to and including reserve will be finished before the next scheduling cycle begins*. After the reserve phase, the binding cycle is executed asynchronously. This means that a plugin could be called concurrently from two different scheduling contexts, provided that at least one of the calls is to an extension point after reserve. Stateful plugins should take care to handle these situations.
 
 ![](../images/scheduler_parallel_threads.png)
 
 #### step3 - Configuring Plugins
 
-在开发完framework插件接口后，最后需要配置plugin(k8s.io/kubernetes/pkg/scheduler/apis/config/types.go)，如下：
+在开发完framework插件接口后，最后需要配置plugin(k8s.io/kubernetes/pkg/scheduler/apis/config/types.go)，使plugin生效，如下：
 
 ```go
 // KubeSchedulerConfiguration configures a scheduler
@@ -501,7 +449,7 @@ plugin配置按照作用分为两类：
 * 各扩展点的启动 or 禁止插件列表，scheduler会在该扩展点执行完默认插件后，按照列表顺序执行插件，如果该扩展点列表为空，则使用默认插件列表
 * 插件的参数列表，如果某个插件对应的参数配置为空，则该插件会使用默认配置
 
-这里要注意插件配置是按照扩展点组织的，如果一个插件同时实现了若干个扩展点功能(比如同时实现了预选&优选接口)，则需要分别填写在preFilter与score列表中，如下(PluginA)：
+这里要注意插件配置是按照扩展点组织的，如果一个插件同时实现了若干个扩展点功能(比如同时实现了预选&优选接口)，则需要分别填写在preFilter与score列表中，如下(PluginA)所示：
 
 ```
 {
@@ -545,8 +493,18 @@ plugin配置按照作用分为两类：
 }
 ```
 
-综上，给出了基于scheduler framework扩展scheduler的相关原理分析和操作指引。基于该框架的实现的项目可以参考[coscheduling(aka gang scheduling)](https://github.com/kubernetes-sigs/scheduler-plugins/tree/master/pkg/coscheduling)
-                                                                 
+综上，给出了基于scheduler framework扩展scheduler的相关原理分析和开发指引。基于该框架实现的项目可以参考[coscheduling(aka gang scheduling)](https://github.com/kubernetes-sigs/scheduler-plugins/tree/master/pkg/coscheduling)
+
+## Conclusion
+
+本文介绍了扩展kube-scheduler的四种方式。其中default-scheduler recoding与standalone属于侵入式的方案，两者都需要对scheduler core进行修改并编译。相比而言，standalone属于重度二次定制；scheduler extender与scheduler framework属于非侵入式的方案，无需修改scheduler core。extender采用webhook的方式进行扩展，在性能和灵活性方面都很欠缺，framework通过对scheduler core进行提取和重构，在调度流程几乎每个关键路径上都设置了插件扩展点，用户通过开发插件，达到非侵入scheduler core的目的，同时很大程度解决了extender在性能和灵活性上的短板
+
+最后关于扩展kube-scheduler，建议如下：
+
+* scheduler framework可以解决绝大多数扩展问题，同时也是Kubernetes官方推荐的方式，优先采用该方案进行扩展
+* extender适用于比较简单的扩展场景，在Kubernetes版本不支持framework的情况下可以使用
+* 如果以上方法都无法满足对scheduler扩展的需求(几乎不可能)，则建议采用standalone方案进行二次定制，同时建议只部署一个scheduler
+
 ## Refs
 
 * [Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)

@@ -3,6 +3,8 @@ Kubernetes Scheduler Framework
 
 在简单介绍完Scheduler的初始化流程后，下面开始分析scheduler的整体框架代码
 
+![](images/scheduler_process.png)
+
 如下是框架入口代码：
 
 ```go

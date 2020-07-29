@@ -1206,7 +1206,942 @@ const (
 
 Transport.IdleConnTimeout与net.Dialer.KeepAlive有什么关系，哪一个是所谓的HTTP keep-alives？？？
 
-回到Transport
+回到最开始的http.Client的使用：
+
+```go
+// construct encoded endpoint
+Url, err := url.Parse(fmt.Sprintf("http://%s:%d", addr, port))
+if err != nil {
+    return err
+}
+Url.Path += "/index"
+endpoint := Url.String()
+req, err := http.NewRequest("GET", endpoint, nil)
+if err != nil {
+    return err
+}
+// use httpClient to send request
+rsp, err := client.Do(req)
+if err != nil {
+    return err
+}
+// close the connection to reuse it
+defer rsp.Body.Close()
+// check status code
+if rsp.StatusCode != http.StatusOK {
+    return fmt.Errorf("get rsp error: %v", rsp)
+}
+```
+
+我们分析http.Client是如何使用http.Transport的：
+
+* 创建http.Request
+
+根据method，url，body创建http.Request：
+
+```go
+// NewRequest wraps NewRequestWithContext using the background context.
+func NewRequest(method, url string, body io.Reader) (*Request, error) {
+	return NewRequestWithContext(context.Background(), method, url, body)
+}
+
+// NewRequestWithContext returns a new Request given a method, URL, and
+// optional body.
+//
+// If the provided body is also an io.Closer, the returned
+// Request.Body is set to body and will be closed by the Client
+// methods Do, Post, and PostForm, and Transport.RoundTrip.
+//
+// NewRequestWithContext returns a Request suitable for use with
+// Client.Do or Transport.RoundTrip. To create a request for use with
+// testing a Server Handler, either use the NewRequest function in the
+// net/http/httptest package, use ReadRequest, or manually update the
+// Request fields. For an outgoing client request, the context
+// controls the entire lifetime of a request and its response:
+// obtaining a connection, sending the request, and reading the
+// response headers and body. See the Request type's documentation for
+// the difference between inbound and outbound request fields.
+//
+// If body is of type *bytes.Buffer, *bytes.Reader, or
+// *strings.Reader, the returned request's ContentLength is set to its
+// exact value (instead of -1), GetBody is populated (so 307 and 308
+// redirects can replay the body), and Body is set to NoBody if the
+// ContentLength is 0.
+func NewRequestWithContext(ctx context.Context, method, url string, body io.Reader) (*Request, error) {
+	if method == "" {
+		// We document that "" means "GET" for Request.Method, and people have
+		// relied on that from NewRequest, so keep that working.
+		// We still enforce validMethod for non-empty methods.
+		method = "GET"
+	}
+	if !validMethod(method) {
+		return nil, fmt.Errorf("net/http: invalid method %q", method)
+	}
+	if ctx == nil {
+		return nil, errors.New("net/http: nil Context")
+	}
+	u, err := parseURL(url) // Just url.Parse (url is shadowed for godoc).
+	if err != nil {
+		return nil, err
+	}
+	rc, ok := body.(io.ReadCloser)
+	if !ok && body != nil {
+		rc = ioutil.NopCloser(body)
+	}
+	// The host's colon:port should be normalized. See Issue 14836.
+	u.Host = removeEmptyPort(u.Host)
+	req := &Request{
+		ctx:        ctx,
+		Method:     method,
+		URL:        u,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     make(Header),
+		Body:       rc,
+		Host:       u.Host,
+	}
+	if body != nil {
+		switch v := body.(type) {
+		case *bytes.Buffer:
+			req.ContentLength = int64(v.Len())
+			buf := v.Bytes()
+			req.GetBody = func() (io.ReadCloser, error) {
+				r := bytes.NewReader(buf)
+				return ioutil.NopCloser(r), nil
+			}
+		case *bytes.Reader:
+			req.ContentLength = int64(v.Len())
+			snapshot := *v
+			req.GetBody = func() (io.ReadCloser, error) {
+				r := snapshot
+				return ioutil.NopCloser(&r), nil
+			}
+		case *strings.Reader:
+			req.ContentLength = int64(v.Len())
+			snapshot := *v
+			req.GetBody = func() (io.ReadCloser, error) {
+				r := snapshot
+				return ioutil.NopCloser(&r), nil
+			}
+		default:
+			// This is where we'd set it to -1 (at least
+			// if body != NoBody) to mean unknown, but
+			// that broke people during the Go 1.8 testing
+			// period. People depend on it being 0 I
+			// guess. Maybe retry later. See Issue 18117.
+		}
+		// For client requests, Request.ContentLength of 0
+		// means either actually 0, or unknown. The only way
+		// to explicitly say that the ContentLength is zero is
+		// to set the Body to nil. But turns out too much code
+		// depends on NewRequest returning a non-nil Body,
+		// so we use a well-known ReadCloser variable instead
+		// and have the http package also treat that sentinel
+		// variable to mean explicitly zero.
+		if req.GetBody != nil && req.ContentLength == 0 {
+			req.Body = NoBody
+			req.GetBody = func() (io.ReadCloser, error) { return NoBody, nil }
+		}
+	}
+
+	return req, nil
+}
+
+// A Request represents an HTTP request received by a server
+// or to be sent by a client.
+//
+// The field semantics differ slightly between client and server
+// usage. In addition to the notes on the fields below, see the
+// documentation for Request.Write and RoundTripper.
+type Request struct {
+	// Method specifies the HTTP method (GET, POST, PUT, etc.).
+	// For client requests, an empty string means GET.
+	//
+	// Go's HTTP client does not support sending a request with
+	// the CONNECT method. See the documentation on Transport for
+	// details.
+	Method string
+
+	// URL specifies either the URI being requested (for server
+	// requests) or the URL to access (for client requests).
+	//
+	// For server requests, the URL is parsed from the URI
+	// supplied on the Request-Line as stored in RequestURI.  For
+	// most requests, fields other than Path and RawQuery will be
+	// empty. (See RFC 7230, Section 5.3)
+	//
+	// For client requests, the URL's Host specifies the server to
+	// connect to, while the Request's Host field optionally
+	// specifies the Host header value to send in the HTTP
+	// request.
+	URL *url.URL
+
+	// The protocol version for incoming server requests.
+	//
+	// For client requests, these fields are ignored. The HTTP
+	// client code always uses either HTTP/1.1 or HTTP/2.
+	// See the docs on Transport for details.
+	Proto      string // "HTTP/1.0"
+	ProtoMajor int    // 1
+	ProtoMinor int    // 0
+
+	// Header contains the request header fields either received
+	// by the server or to be sent by the client.
+	//
+	// If a server received a request with header lines,
+	//
+	//	Host: example.com
+	//	accept-encoding: gzip, deflate
+	//	Accept-Language: en-us
+	//	fOO: Bar
+	//	foo: two
+	//
+	// then
+	//
+	//	Header = map[string][]string{
+	//		"Accept-Encoding": {"gzip, deflate"},
+	//		"Accept-Language": {"en-us"},
+	//		"Foo": {"Bar", "two"},
+	//	}
+	//
+	// For incoming requests, the Host header is promoted to the
+	// Request.Host field and removed from the Header map.
+	//
+	// HTTP defines that header names are case-insensitive. The
+	// request parser implements this by using CanonicalHeaderKey,
+	// making the first character and any characters following a
+	// hyphen uppercase and the rest lowercase.
+	//
+	// For client requests, certain headers such as Content-Length
+	// and Connection are automatically written when needed and
+	// values in Header may be ignored. See the documentation
+	// for the Request.Write method.
+	Header Header
+
+	// Body is the request's body.
+	//
+	// For client requests, a nil body means the request has no
+	// body, such as a GET request. The HTTP Client's Transport
+	// is responsible for calling the Close method.
+	//
+	// For server requests, the Request Body is always non-nil
+	// but will return EOF immediately when no body is present.
+	// The Server will close the request body. The ServeHTTP
+	// Handler does not need to.
+	Body io.ReadCloser
+
+	// GetBody defines an optional func to return a new copy of
+	// Body. It is used for client requests when a redirect requires
+	// reading the body more than once. Use of GetBody still
+	// requires setting Body.
+	//
+	// For server requests, it is unused.
+	GetBody func() (io.ReadCloser, error)
+
+	// ContentLength records the length of the associated content.
+	// The value -1 indicates that the length is unknown.
+	// Values >= 0 indicate that the given number of bytes may
+	// be read from Body.
+	//
+	// For client requests, a value of 0 with a non-nil Body is
+	// also treated as unknown.
+	ContentLength int64
+
+	// TransferEncoding lists the transfer encodings from outermost to
+	// innermost. An empty list denotes the "identity" encoding.
+	// TransferEncoding can usually be ignored; chunked encoding is
+	// automatically added and removed as necessary when sending and
+	// receiving requests.
+	TransferEncoding []string
+
+	// Close indicates whether to close the connection after
+	// replying to this request (for servers) or after sending this
+	// request and reading its response (for clients).
+	//
+	// For server requests, the HTTP server handles this automatically
+	// and this field is not needed by Handlers.
+	//
+	// For client requests, setting this field prevents re-use of
+	// TCP connections between requests to the same hosts, as if
+	// Transport.DisableKeepAlives were set.
+	Close bool
+
+	// For server requests, Host specifies the host on which the URL
+	// is sought. Per RFC 7230, section 5.4, this is either the value
+	// of the "Host" header or the host name given in the URL itself.
+	// It may be of the form "host:port". For international domain
+	// names, Host may be in Punycode or Unicode form. Use
+	// golang.org/x/net/idna to convert it to either format if
+	// needed.
+	// To prevent DNS rebinding attacks, server Handlers should
+	// validate that the Host header has a value for which the
+	// Handler considers itself authoritative. The included
+	// ServeMux supports patterns registered to particular host
+	// names and thus protects its registered Handlers.
+	//
+	// For client requests, Host optionally overrides the Host
+	// header to send. If empty, the Request.Write method uses
+	// the value of URL.Host. Host may contain an international
+	// domain name.
+	Host string
+
+	// Form contains the parsed form data, including both the URL
+	// field's query parameters and the PATCH, POST, or PUT form data.
+	// This field is only available after ParseForm is called.
+	// The HTTP client ignores Form and uses Body instead.
+	Form url.Values
+
+	// PostForm contains the parsed form data from PATCH, POST
+	// or PUT body parameters.
+	//
+	// This field is only available after ParseForm is called.
+	// The HTTP client ignores PostForm and uses Body instead.
+	PostForm url.Values
+
+	// MultipartForm is the parsed multipart form, including file uploads.
+	// This field is only available after ParseMultipartForm is called.
+	// The HTTP client ignores MultipartForm and uses Body instead.
+	MultipartForm *multipart.Form
+
+	// Trailer specifies additional headers that are sent after the request
+	// body.
+	//
+	// For server requests, the Trailer map initially contains only the
+	// trailer keys, with nil values. (The client declares which trailers it
+	// will later send.)  While the handler is reading from Body, it must
+	// not reference Trailer. After reading from Body returns EOF, Trailer
+	// can be read again and will contain non-nil values, if they were sent
+	// by the client.
+	//
+	// For client requests, Trailer must be initialized to a map containing
+	// the trailer keys to later send. The values may be nil or their final
+	// values. The ContentLength must be 0 or -1, to send a chunked request.
+	// After the HTTP request is sent the map values can be updated while
+	// the request body is read. Once the body returns EOF, the caller must
+	// not mutate Trailer.
+	//
+	// Few HTTP clients, servers, or proxies support HTTP trailers.
+	Trailer Header
+
+	// RemoteAddr allows HTTP servers and other software to record
+	// the network address that sent the request, usually for
+	// logging. This field is not filled in by ReadRequest and
+	// has no defined format. The HTTP server in this package
+	// sets RemoteAddr to an "IP:port" address before invoking a
+	// handler.
+	// This field is ignored by the HTTP client.
+	RemoteAddr string
+
+	// RequestURI is the unmodified request-target of the
+	// Request-Line (RFC 7230, Section 3.1.1) as sent by the client
+	// to a server. Usually the URL field should be used instead.
+	// It is an error to set this field in an HTTP client request.
+	RequestURI string
+
+	// TLS allows HTTP servers and other software to record
+	// information about the TLS connection on which the request
+	// was received. This field is not filled in by ReadRequest.
+	// The HTTP server in this package sets the field for
+	// TLS-enabled connections before invoking a handler;
+	// otherwise it leaves the field nil.
+	// This field is ignored by the HTTP client.
+	TLS *tls.ConnectionState
+
+	// Cancel is an optional channel whose closure indicates that the client
+	// request should be regarded as canceled. Not all implementations of
+	// RoundTripper may support Cancel.
+	//
+	// For server requests, this field is not applicable.
+	//
+	// Deprecated: Set the Request's context with NewRequestWithContext
+	// instead. If a Request's Cancel field and context are both
+	// set, it is undefined whether Cancel is respected.
+	Cancel <-chan struct{}
+
+	// Response is the redirect response which caused this request
+	// to be created. This field is only populated during client
+	// redirects.
+	Response *Response
+
+	// ctx is either the client or server context. It should only
+	// be modified via copying the whole Request using WithContext.
+	// It is unexported to prevent people from using Context wrong
+	// and mutating the contexts held by callers of the same request.
+	ctx context.Context
+}
+```
+
+* client.Do(req)
+
+使用http.Client发送请求，如下：
+
+```go
+// Do sends an HTTP request and returns an HTTP response, following
+// policy (such as redirects, cookies, auth) as configured on the
+// client.
+//
+// An error is returned if caused by client policy (such as
+// CheckRedirect), or failure to speak HTTP (such as a network
+// connectivity problem). A non-2xx status code doesn't cause an
+// error.
+//
+// If the returned error is nil, the Response will contain a non-nil
+// Body which the user is expected to close. If the Body is not both
+// read to EOF and closed, the Client's underlying RoundTripper
+// (typically Transport) may not be able to re-use a persistent TCP
+// connection to the server for a subsequent "keep-alive" request.
+//
+// The request Body, if non-nil, will be closed by the underlying
+// Transport, even on errors.
+//
+// On error, any Response can be ignored. A non-nil Response with a
+// non-nil error only occurs when CheckRedirect fails, and even then
+// the returned Response.Body is already closed.
+//
+// Generally Get, Post, or PostForm will be used instead of Do.
+//
+// If the server replies with a redirect, the Client first uses the
+// CheckRedirect function to determine whether the redirect should be
+// followed. If permitted, a 301, 302, or 303 redirect causes
+// subsequent requests to use HTTP method GET
+// (or HEAD if the original request was HEAD), with no body.
+// A 307 or 308 redirect preserves the original HTTP method and body,
+// provided that the Request.GetBody function is defined.
+// The NewRequest function automatically sets GetBody for common
+// standard library body types.
+//
+// Any returned error will be of type *url.Error. The url.Error
+// value's Timeout method will report true if request timed out or was
+// canceled.
+func (c *Client) Do(req *Request) (*Response, error) {
+	return c.do(req)
+}
+
+func (c *Client) do(req *Request) (retres *Response, reterr error) {
+	if testHookClientDoResult != nil {
+		defer func() { testHookClientDoResult(retres, reterr) }()
+	}
+	if req.URL == nil {
+		req.closeBody()
+		return nil, &url.Error{
+			Op:  urlErrorOp(req.Method),
+			Err: errors.New("http: nil Request.URL"),
+		}
+	}
+
+	var (
+		deadline      = c.deadline()
+		reqs          []*Request
+		resp          *Response
+		copyHeaders   = c.makeHeadersCopier(req)
+		reqBodyClosed = false // have we closed the current req.Body?
+
+		// Redirect behavior:
+		redirectMethod string
+		includeBody    bool
+	)
+	uerr := func(err error) error {
+		// the body may have been closed already by c.send()
+		if !reqBodyClosed {
+			req.closeBody()
+		}
+		var urlStr string
+		if resp != nil && resp.Request != nil {
+			urlStr = stripPassword(resp.Request.URL)
+		} else {
+			urlStr = stripPassword(req.URL)
+		}
+		return &url.Error{
+			Op:  urlErrorOp(reqs[0].Method),
+			URL: urlStr,
+			Err: err,
+		}
+	}
+	for {
+		// For all but the first request, create the next
+		// request hop and replace req.
+		if len(reqs) > 0 {
+			loc := resp.Header.Get("Location")
+			if loc == "" {
+				resp.closeBody()
+				return nil, uerr(fmt.Errorf("%d response missing Location header", resp.StatusCode))
+			}
+			u, err := req.URL.Parse(loc)
+			if err != nil {
+				resp.closeBody()
+				return nil, uerr(fmt.Errorf("failed to parse Location header %q: %v", loc, err))
+			}
+			host := ""
+			if req.Host != "" && req.Host != req.URL.Host {
+				// If the caller specified a custom Host header and the
+				// redirect location is relative, preserve the Host header
+				// through the redirect. See issue #22233.
+				if u, _ := url.Parse(loc); u != nil && !u.IsAbs() {
+					host = req.Host
+				}
+			}
+			ireq := reqs[0]
+			req = &Request{
+				Method:   redirectMethod,
+				Response: resp,
+				URL:      u,
+				Header:   make(Header),
+				Host:     host,
+				Cancel:   ireq.Cancel,
+				ctx:      ireq.ctx,
+			}
+			if includeBody && ireq.GetBody != nil {
+				req.Body, err = ireq.GetBody()
+				if err != nil {
+					resp.closeBody()
+					return nil, uerr(err)
+				}
+				req.ContentLength = ireq.ContentLength
+			}
+
+			// Copy original headers before setting the Referer,
+			// in case the user set Referer on their first request.
+			// If they really want to override, they can do it in
+			// their CheckRedirect func.
+			copyHeaders(req)
+
+			// Add the Referer header from the most recent
+			// request URL to the new one, if it's not https->http:
+			if ref := refererForURL(reqs[len(reqs)-1].URL, req.URL); ref != "" {
+				req.Header.Set("Referer", ref)
+			}
+			err = c.checkRedirect(req, reqs)
+
+			// Sentinel error to let users select the
+			// previous response, without closing its
+			// body. See Issue 10069.
+			if err == ErrUseLastResponse {
+				return resp, nil
+			}
+
+			// Close the previous response's body. But
+			// read at least some of the body so if it's
+			// small the underlying TCP connection will be
+			// re-used. No need to check for errors: if it
+			// fails, the Transport won't reuse it anyway.
+			const maxBodySlurpSize = 2 << 10
+			if resp.ContentLength == -1 || resp.ContentLength <= maxBodySlurpSize {
+				io.CopyN(ioutil.Discard, resp.Body, maxBodySlurpSize)
+			}
+			resp.Body.Close()
+
+			if err != nil {
+				// Special case for Go 1 compatibility: return both the response
+				// and an error if the CheckRedirect function failed.
+				// See https://golang.org/issue/3795
+				// The resp.Body has already been closed.
+				ue := uerr(err)
+				ue.(*url.Error).URL = loc
+				return resp, ue
+			}
+		}
+
+		reqs = append(reqs, req)
+		var err error
+		var didTimeout func() bool
+		if resp, didTimeout, err = c.send(req, deadline); err != nil {
+			// c.send() always closes req.Body
+			reqBodyClosed = true
+			if !deadline.IsZero() && didTimeout() {
+				err = &httpError{
+					// TODO: early in cycle: s/Client.Timeout exceeded/timeout or context cancellation/
+					err:     err.Error() + " (Client.Timeout exceeded while awaiting headers)",
+					timeout: true,
+				}
+			}
+			return nil, uerr(err)
+		}
+
+		var shouldRedirect bool
+		redirectMethod, shouldRedirect, includeBody = redirectBehavior(req.Method, resp, reqs[0])
+		if !shouldRedirect {
+			return resp, nil
+		}
+
+		req.closeBody()
+	}
+}
+```
+
+整个http.Client.Do逻辑分为两道，第一道执行send发送请求接收Response，关闭Req.Body；第二层对请求执行重定向等操作(若需要redirect)，并关闭Resp.Body
+
+其中，send执行请求的发送和接收动作，展开如下：
+
+```go
+// didTimeout is non-nil only if err != nil.
+func (c *Client) send(req *Request, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
+	if c.Jar != nil {
+		for _, cookie := range c.Jar.Cookies(req.URL) {
+			req.AddCookie(cookie)
+		}
+	}
+	resp, didTimeout, err = send(req, c.transport(), deadline)
+	if err != nil {
+		return nil, didTimeout, err
+	}
+	if c.Jar != nil {
+		if rc := resp.Cookies(); len(rc) > 0 {
+			c.Jar.SetCookies(req.URL, rc)
+		}
+	}
+	return resp, nil, nil
+}
+
+// send issues an HTTP request.
+// Caller should close resp.Body when done reading from it.
+func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
+	req := ireq // req is either the original request, or a modified fork
+
+	if rt == nil {
+		req.closeBody()
+		return nil, alwaysFalse, errors.New("http: no Client.Transport or DefaultTransport")
+	}
+
+	if req.URL == nil {
+		req.closeBody()
+		return nil, alwaysFalse, errors.New("http: nil Request.URL")
+	}
+
+	if req.RequestURI != "" {
+		req.closeBody()
+		return nil, alwaysFalse, errors.New("http: Request.RequestURI can't be set in client requests.")
+	}
+
+	// forkReq forks req into a shallow clone of ireq the first
+	// time it's called.
+	forkReq := func() {
+		if ireq == req {
+			req = new(Request)
+			*req = *ireq // shallow clone
+		}
+	}
+
+	// Most the callers of send (Get, Post, et al) don't need
+	// Headers, leaving it uninitialized. We guarantee to the
+	// Transport that this has been initialized, though.
+	if req.Header == nil {
+		forkReq()
+		req.Header = make(Header)
+	}
+
+	if u := req.URL.User; u != nil && req.Header.Get("Authorization") == "" {
+		username := u.Username()
+		password, _ := u.Password()
+		forkReq()
+		req.Header = cloneOrMakeHeader(ireq.Header)
+		req.Header.Set("Authorization", "Basic "+basicAuth(username, password))
+	}
+
+	if !deadline.IsZero() {
+		forkReq()
+	}
+	stopTimer, didTimeout := setRequestCancel(req, rt, deadline)
+
+	resp, err = rt.RoundTrip(req)
+	if err != nil {
+		stopTimer()
+		if resp != nil {
+			log.Printf("RoundTripper returned a response & error; ignoring response")
+		}
+		if tlsErr, ok := err.(tls.RecordHeaderError); ok {
+			// If we get a bad TLS record header, check to see if the
+			// response looks like HTTP and give a more helpful error.
+			// See golang.org/issue/11111.
+			if string(tlsErr.RecordHeader[:]) == "HTTP/" {
+				err = errors.New("http: server gave HTTP response to HTTPS client")
+			}
+		}
+		return nil, didTimeout, err
+	}
+	if !deadline.IsZero() {
+		resp.Body = &cancelTimerBody{
+			stop:          stopTimer,
+			rc:            resp.Body,
+			reqDidTimeout: didTimeout,
+		}
+	}
+	return resp, nil, nil
+}
+
+func (c *Client) transport() RoundTripper {
+	if c.Transport != nil {
+		return c.Transport
+	}
+	return DefaultTransport
+}
+```
+
+入参为http.Request，http.Transport以及deadline(http.Client.Timeout)。函数处理逻辑具体分为两个步骤，如下：
+
+1. setRequestCancel
+
+设置请求超时时间为http.Client.Timeout：
+
+```go
+// setRequestCancel sets the Cancel field of req, if deadline is
+// non-zero. The RoundTripper's type is used to determine whether the legacy
+// CancelRequest behavior should be used.
+//
+// As background, there are three ways to cancel a request:
+// First was Transport.CancelRequest. (deprecated)
+// Second was Request.Cancel (this mechanism).
+// Third was Request.Context.
+func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTimer func(), didTimeout func() bool) {
+	if deadline.IsZero() {
+		return nop, alwaysFalse
+	}
+
+	initialReqCancel := req.Cancel // the user's original Request.Cancel, if any
+
+	cancel := make(chan struct{})
+	req.Cancel = cancel
+
+	doCancel := func() {
+		// The newer way (the second way in the func comment):
+		close(cancel)
+
+		// The legacy compatibility way, used only
+		// for RoundTripper implementations written
+		// before Go 1.5 or Go 1.6.
+		type canceler interface {
+			CancelRequest(*Request)
+		}
+		switch v := rt.(type) {
+		case *Transport, *http2Transport:
+			// Do nothing. The net/http package's transports
+			// support the new Request.Cancel channel
+		case canceler:
+			v.CancelRequest(req)
+		}
+	}
+
+	stopTimerCh := make(chan struct{})
+	var once sync.Once
+	stopTimer = func() { once.Do(func() { close(stopTimerCh) }) }
+
+	timer := time.NewTimer(time.Until(deadline))
+	var timedOut atomicBool
+
+	go func() {
+		select {
+		case <-initialReqCancel:
+			doCancel()
+			timer.Stop()
+		case <-timer.C:
+			timedOut.setTrue()
+			doCancel()
+		case <-stopTimerCh:
+			timer.Stop()
+		}
+	}()
+
+	return stopTimer, timedOut.isSet
+}
+
+// A Request represents an HTTP request received by a server
+// or to be sent by a client.
+//
+// The field semantics differ slightly between client and server
+// usage. In addition to the notes on the fields below, see the
+// documentation for Request.Write and RoundTripper.
+type Request struct {
+    ...
+	// Cancel is an optional channel whose closure indicates that the client
+	// request should be regarded as canceled. Not all implementations of
+	// RoundTripper may support Cancel.
+	//
+	// For server requests, this field is not applicable.
+	//
+	// Deprecated: Set the Request's context with NewRequestWithContext
+	// instead. If a Request's Cancel field and context are both
+	// set, it is undefined whether Cancel is respected.
+	Cancel <-chan struct{}
+
+	// Response is the redirect response which caused this request
+	// to be created. This field is only populated during client
+	// redirects.
+	Response *Response
+
+	// ctx is either the client or server context. It should only
+	// be modified via copying the whole Request using WithContext.
+	// It is unexported to prevent people from using Context wrong
+	// and mutating the contexts held by callers of the same request.
+	ctx context.Context
+}
+```
+
+有三种方式取消一个请求，如下：
+
+* First was Transport.CancelRequest. (deprecated)
+* Second was Request.Cancel (this mechanism).
+* Third was Request.Context.
+
+setRequestCancel执行了前面两种方式
+
+2. resp, err = rt.RoundTrip(req)
+
+在设置了超时timer后，执行具体的请求操作
+
+回到http.Transport(net/http/transport.go)，Transport实现了RoundTripper接口，如下：
+
+```go
+client := &http.Client{
+    Transport: &http.Transport{
+        Proxy: http.ProxyFromEnvironment,
+        DialContext: (&net.Dialer{
+            Timeout:   30 * time.Second,
+            KeepAlive: 30 * time.Second,
+            DualStack: true,
+        }).DialContext,
+        MaxIdleConns:        100,
+        MaxIdleConnsPerHost: 100,
+        IdleConnTimeout:     90 * time.Second,
+    },
+}
+...
+
+// RoundTrip implements the RoundTripper interface.
+//
+// For higher-level HTTP client support (such as handling of cookies
+// and redirects), see Get, Post, and the Client type.
+//
+// Like the RoundTripper interface, the error types returned
+// by RoundTrip are unspecified.
+func (t *Transport) RoundTrip(req *Request) (*Response, error) {
+	return t.roundTrip(req)
+}
+
+// roundTrip implements a RoundTripper over HTTP.
+func (t *Transport) roundTrip(req *Request) (*Response, error) {
+	t.nextProtoOnce.Do(t.onceSetNextProtoDefaults)
+	ctx := req.Context()
+	trace := httptrace.ContextClientTrace(ctx)
+
+	if req.URL == nil {
+		req.closeBody()
+		return nil, errors.New("http: nil Request.URL")
+	}
+	if req.Header == nil {
+		req.closeBody()
+		return nil, errors.New("http: nil Request.Header")
+	}
+	scheme := req.URL.Scheme
+	isHTTP := scheme == "http" || scheme == "https"
+	if isHTTP {
+		for k, vv := range req.Header {
+			if !httpguts.ValidHeaderFieldName(k) {
+				return nil, fmt.Errorf("net/http: invalid header field name %q", k)
+			}
+			for _, v := range vv {
+				if !httpguts.ValidHeaderFieldValue(v) {
+					return nil, fmt.Errorf("net/http: invalid header field value %q for key %v", v, k)
+				}
+			}
+		}
+	}
+
+	if t.useRegisteredProtocol(req) {
+		altProto, _ := t.altProto.Load().(map[string]RoundTripper)
+		if altRT := altProto[scheme]; altRT != nil {
+			if resp, err := altRT.RoundTrip(req); err != ErrSkipAltProtocol {
+				return resp, err
+			}
+		}
+	}
+	if !isHTTP {
+		req.closeBody()
+		return nil, &badStringError{"unsupported protocol scheme", scheme}
+	}
+	if req.Method != "" && !validMethod(req.Method) {
+		return nil, fmt.Errorf("net/http: invalid method %q", req.Method)
+	}
+	if req.URL.Host == "" {
+		req.closeBody()
+		return nil, errors.New("http: no Host in request URL")
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			req.closeBody()
+			return nil, ctx.Err()
+		default:
+		}
+
+		// treq gets modified by roundTrip, so we need to recreate for each retry.
+		treq := &transportRequest{Request: req, trace: trace}
+		cm, err := t.connectMethodForRequest(treq)
+		if err != nil {
+			req.closeBody()
+			return nil, err
+		}
+
+		// Get the cached or newly-created connection to either the
+		// host (for http or https), the http proxy, or the http proxy
+		// pre-CONNECTed to https server. In any case, we'll be ready
+		// to send it requests.
+		pconn, err := t.getConn(treq, cm)
+		if err != nil {
+			t.setReqCanceler(req, nil)
+			req.closeBody()
+			return nil, err
+		}
+
+		var resp *Response
+		if pconn.alt != nil {
+			// HTTP/2 path.
+			t.setReqCanceler(req, nil) // not cancelable with CancelRequest
+			resp, err = pconn.alt.RoundTrip(req)
+		} else {
+			resp, err = pconn.roundTrip(treq)
+		}
+		if err == nil {
+			return resp, nil
+		}
+
+		// Failed. Clean up and determine whether to retry.
+
+		_, isH2DialError := pconn.alt.(http2erringRoundTripper)
+		if http2isNoCachedConnError(err) || isH2DialError {
+			t.removeIdleConn(pconn)
+			t.decConnsPerHost(pconn.cacheKey)
+		}
+		if !pconn.shouldRetryRequest(req, err) {
+			// Issue 16465: return underlying net.Conn.Read error from peek,
+			// as we've historically done.
+			if e, ok := err.(transportReadFromServerError); ok {
+				err = e.err
+			}
+			return nil, err
+		}
+		testHookRoundTripRetried()
+
+		// Rewind the body if we're able to.
+		if req.GetBody != nil {
+			newReq := *req
+			var err error
+			newReq.Body, err = req.GetBody()
+			if err != nil {
+				return nil, err
+			}
+			req = &newReq
+		}
+	}
+}
+```
+
+
+
+
+
+
+
 
 
 

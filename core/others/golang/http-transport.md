@@ -504,9 +504,709 @@ Transport只有在遇到网络故障的情况下会重`试幂等`的请求。另
 * h2transport：HTTP/2协议对应的transport
 * ForceAttemptHTTP2：当Dial, DialTLS, or DialContext func or TLSClientConfig提供时，默认情况下会禁止HTTP/2协议。当使用自定义的这些配置时，需要设置ForceAttemptHTTP2字段开启HTTP2
 
+我们看一下DefaultTransport配置：
 
+```go
+// DefaultTransport is the default implementation of Transport and is
+// used by DefaultClient. It establishes network connections as needed
+// and caches them for reuse by subsequent calls. It uses HTTP proxies
+// as directed by the $HTTP_PROXY and $NO_PROXY (or $http_proxy and
+// $no_proxy) environment variables.
+var DefaultTransport RoundTripper = &Transport{
+	Proxy: ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		DualStack: true,
+	}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          100,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+```
 
+重点看DialContext实例，展开net.Dialer结构体(net/dial.go)：
 
+```go
+// A Dialer contains options for connecting to an address.
+//
+// The zero value for each field is equivalent to dialing
+// without that option. Dialing with the zero value of Dialer
+// is therefore equivalent to just calling the Dial function.
+type Dialer struct {
+	// Timeout is the maximum amount of time a dial will wait for
+	// a connect to complete. If Deadline is also set, it may fail
+	// earlier.
+	//
+	// The default is no timeout.
+	//
+	// When using TCP and dialing a host name with multiple IP
+	// addresses, the timeout may be divided between them.
+	//
+	// With or without a timeout, the operating system may impose
+	// its own earlier timeout. For instance, TCP timeouts are
+	// often around 3 minutes.
+	Timeout time.Duration
+
+	// Deadline is the absolute point in time after which dials
+	// will fail. If Timeout is set, it may fail earlier.
+	// Zero means no deadline, or dependent on the operating system
+	// as with the Timeout option.
+	Deadline time.Time
+
+	// LocalAddr is the local address to use when dialing an
+	// address. The address must be of a compatible type for the
+	// network being dialed.
+	// If nil, a local address is automatically chosen.
+	LocalAddr Addr
+
+	// DualStack previously enabled RFC 6555 Fast Fallback
+	// support, also known as "Happy Eyeballs", in which IPv4 is
+	// tried soon if IPv6 appears to be misconfigured and
+	// hanging.
+	//
+	// Deprecated: Fast Fallback is enabled by default. To
+	// disable, set FallbackDelay to a negative value.
+	DualStack bool
+
+	// FallbackDelay specifies the length of time to wait before
+	// spawning a RFC 6555 Fast Fallback connection. That is, this
+	// is the amount of time to wait for IPv6 to succeed before
+	// assuming that IPv6 is misconfigured and falling back to
+	// IPv4.
+	//
+	// If zero, a default delay of 300ms is used.
+	// A negative value disables Fast Fallback support.
+	FallbackDelay time.Duration
+
+	// KeepAlive specifies the interval between keep-alive
+	// probes for an active network connection.
+	// If zero, keep-alive probes are sent with a default value
+	// (currently 15 seconds), if supported by the protocol and operating
+	// system. Network protocols or operating systems that do
+	// not support keep-alives ignore this field.
+	// If negative, keep-alive probes are disabled.
+	KeepAlive time.Duration
+
+	// Resolver optionally specifies an alternate resolver to use.
+	Resolver *Resolver
+
+	// Cancel is an optional channel whose closure indicates that
+	// the dial should be canceled. Not all types of dials support
+	// cancellation.
+	//
+	// Deprecated: Use DialContext instead.
+	Cancel <-chan struct{}
+
+	// If Control is not nil, it is called after creating the network
+	// connection but before actually dialing.
+	//
+	// Network and address parameters passed to Control method are not
+	// necessarily the ones passed to Dial. For example, passing "tcp" to Dial
+	// will cause the Control function to be called with "tcp4" or "tcp6".
+	Control func(network, address string, c syscall.RawConn) error
+}
+```
+
+net.Dialer包含了创建TCP连接的各种选项：
+
+* Timeout：TCP连接建立的超时时间(也即三次握手的超时时间)，操作系统的超时时间一般为3 minutes
+* Deadline：与Timeout作用类似，只不过限制了确定的超时时刻
+* LocalAddr：本地地址，TCP四元组的原始IP地址
+* DualStack(Deprecated)：enabled RFC 6555 Fast Fallback Feature
+* FallbackDelay：IPv6连接建立的等待时间，如果超时，则会切换到IPv4(A negative value disables Fast Fallback support.)
+* KeepAlive：设置了活跃连接的TCP keep-alive探针间隔，需要协议层以及操作系统支持(If zero, keep-alive probes are sent with a default value(currently 15 seconds))
+* Control：it is called after creating the network connection but before actually dialing ？
+
+接下来我们分析net.Dialer.DialContext，如下：
+
+```go
+// Dial connects to the address on the named network.
+//
+// Known networks are "tcp", "tcp4" (IPv4-only), "tcp6" (IPv6-only),
+// "udp", "udp4" (IPv4-only), "udp6" (IPv6-only), "ip", "ip4"
+// (IPv4-only), "ip6" (IPv6-only), "unix", "unixgram" and
+// "unixpacket".
+//
+// For TCP and UDP networks, the address has the form "host:port".
+// The host must be a literal IP address, or a host name that can be
+// resolved to IP addresses.
+// The port must be a literal port number or a service name.
+// If the host is a literal IPv6 address it must be enclosed in square
+// brackets, as in "[2001:db8::1]:80" or "[fe80::1%zone]:80".
+// The zone specifies the scope of the literal IPv6 address as defined
+// in RFC 4007.
+// The functions JoinHostPort and SplitHostPort manipulate a pair of
+// host and port in this form.
+// When using TCP, and the host resolves to multiple IP addresses,
+// Dial will try each IP address in order until one succeeds.
+//
+// Examples:
+//	Dial("tcp", "golang.org:http")
+//	Dial("tcp", "192.0.2.1:http")
+//	Dial("tcp", "198.51.100.1:80")
+//	Dial("udp", "[2001:db8::1]:domain")
+//	Dial("udp", "[fe80::1%lo0]:53")
+//	Dial("tcp", ":80")
+//
+// For IP networks, the network must be "ip", "ip4" or "ip6" followed
+// by a colon and a literal protocol number or a protocol name, and
+// the address has the form "host". The host must be a literal IP
+// address or a literal IPv6 address with zone.
+// It depends on each operating system how the operating system
+// behaves with a non-well known protocol number such as "0" or "255".
+//
+// Examples:
+//	Dial("ip4:1", "192.0.2.1")
+//	Dial("ip6:ipv6-icmp", "2001:db8::1")
+//	Dial("ip6:58", "fe80::1%lo0")
+//
+// For TCP, UDP and IP networks, if the host is empty or a literal
+// unspecified IP address, as in ":80", "0.0.0.0:80" or "[::]:80" for
+// TCP and UDP, "", "0.0.0.0" or "::" for IP, the local system is
+// assumed.
+//
+// For Unix networks, the address must be a file system path.
+func Dial(network, address string) (Conn, error) {
+	var d Dialer
+	return d.Dial(network, address)
+}
+
+...
+
+// DialContext connects to the address on the named network using
+// the provided context.
+//
+// The provided Context must be non-nil. If the context expires before
+// the connection is complete, an error is returned. Once successfully
+// connected, any expiration of the context will not affect the
+// connection.
+//
+// When using TCP, and the host in the address parameter resolves to multiple
+// network addresses, any dial timeout (from d.Timeout or ctx) is spread
+// over each consecutive dial, such that each is given an appropriate
+// fraction of the time to connect.
+// For example, if a host has 4 IP addresses and the timeout is 1 minute,
+// the connect to each single address will be given 15 seconds to complete
+// before trying the next one.
+//
+// See func Dial for a description of the network and address
+// parameters.
+func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn, error) {
+	if ctx == nil {
+		panic("nil context")
+	}
+	deadline := d.deadline(ctx, time.Now())
+	if !deadline.IsZero() {
+		if d, ok := ctx.Deadline(); !ok || deadline.Before(d) {
+			subCtx, cancel := context.WithDeadline(ctx, deadline)
+			defer cancel()
+			ctx = subCtx
+		}
+	}
+	if oldCancel := d.Cancel; oldCancel != nil {
+		subCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		go func() {
+			select {
+			case <-oldCancel:
+				cancel()
+			case <-subCtx.Done():
+			}
+		}()
+		ctx = subCtx
+	}
+
+	// Shadow the nettrace (if any) during resolve so Connect events don't fire for DNS lookups.
+	resolveCtx := ctx
+	if trace, _ := ctx.Value(nettrace.TraceKey{}).(*nettrace.Trace); trace != nil {
+		shadow := *trace
+		shadow.ConnectStart = nil
+		shadow.ConnectDone = nil
+		resolveCtx = context.WithValue(resolveCtx, nettrace.TraceKey{}, &shadow)
+	}
+
+	addrs, err := d.resolver().resolveAddrList(resolveCtx, "dial", network, address, d.LocalAddr)
+	if err != nil {
+		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: nil, Err: err}
+	}
+
+	sd := &sysDialer{
+		Dialer:  *d,
+		network: network,
+		address: address,
+	}
+
+	var primaries, fallbacks addrList
+	if d.dualStack() && network == "tcp" {
+		primaries, fallbacks = addrs.partition(isIPv4)
+	} else {
+		primaries = addrs
+	}
+
+	var c Conn
+	if len(fallbacks) > 0 {
+		c, err = sd.dialParallel(ctx, primaries, fallbacks)
+	} else {
+		c, err = sd.dialSerial(ctx, primaries)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if tc, ok := c.(*TCPConn); ok && d.KeepAlive >= 0 {
+		setKeepAlive(tc.fd, true)
+		ka := d.KeepAlive
+		if d.KeepAlive == 0 {
+			ka = defaultTCPKeepAlive
+		}
+		setKeepAlivePeriod(tc.fd, ka)
+		testHookSetKeepAlive(ka)
+	}
+	return c, nil
+}
+```
+
+DialContext用于创建指定网络协议(例如tcp，udp)以及指定地址的连接，例如：
+
+```
+// Examples:
+//	Dial("tcp", "golang.org:http")
+//	Dial("tcp", "192.0.2.1:http")
+//	Dial("tcp", "198.51.100.1:80")
+//	Dial("udp", "[2001:db8::1]:domain")
+//	Dial("udp", "[fe80::1%lo0]:53")
+//	Dial("tcp", ":80")
+```
+
+分为三个阶段，如下：
+
+* 1、resolveAddrList
+
+```go
+// resolveAddrList resolves addr using hint and returns a list of
+// addresses. The result contains at least one address when error is
+// nil.
+func (r *Resolver) resolveAddrList(ctx context.Context, op, network, addr string, hint Addr) (addrList, error) {
+	afnet, _, err := parseNetwork(ctx, network, true)
+	if err != nil {
+		return nil, err
+	}
+	if op == "dial" && addr == "" {
+		return nil, errMissingAddress
+	}
+	switch afnet {
+	case "unix", "unixgram", "unixpacket":
+		addr, err := ResolveUnixAddr(afnet, addr)
+		if err != nil {
+			return nil, err
+		}
+		if op == "dial" && hint != nil && addr.Network() != hint.Network() {
+			return nil, &AddrError{Err: "mismatched local address type", Addr: hint.String()}
+		}
+		return addrList{addr}, nil
+	}
+	addrs, err := r.internetAddrList(ctx, afnet, addr)
+	if err != nil || op != "dial" || hint == nil {
+		return addrs, err
+	}
+	var (
+		tcp      *TCPAddr
+		udp      *UDPAddr
+		ip       *IPAddr
+		wildcard bool
+	)
+	switch hint := hint.(type) {
+	case *TCPAddr:
+		tcp = hint
+		wildcard = tcp.isWildcard()
+	case *UDPAddr:
+		udp = hint
+		wildcard = udp.isWildcard()
+	case *IPAddr:
+		ip = hint
+		wildcard = ip.isWildcard()
+	}
+	naddrs := addrs[:0]
+	for _, addr := range addrs {
+		if addr.Network() != hint.Network() {
+			return nil, &AddrError{Err: "mismatched local address type", Addr: hint.String()}
+		}
+		switch addr := addr.(type) {
+		case *TCPAddr:
+			if !wildcard && !addr.isWildcard() && !addr.IP.matchAddrFamily(tcp.IP) {
+				continue
+			}
+			naddrs = append(naddrs, addr)
+		case *UDPAddr:
+			if !wildcard && !addr.isWildcard() && !addr.IP.matchAddrFamily(udp.IP) {
+				continue
+			}
+			naddrs = append(naddrs, addr)
+		case *IPAddr:
+			if !wildcard && !addr.isWildcard() && !addr.IP.matchAddrFamily(ip.IP) {
+				continue
+			}
+			naddrs = append(naddrs, addr)
+		}
+	}
+	if len(naddrs) == 0 {
+		return nil, &AddrError{Err: errNoSuitableAddress.Error(), Addr: hint.String()}
+	}
+	return naddrs, nil
+}
+
+// An addrList represents a list of network endpoint addresses.
+type addrList []Addr
+
+// Addr represents a network end point address.
+//
+// The two methods Network and String conventionally return strings
+// that can be passed as the arguments to Dial, but the exact form
+// and meaning of the strings is up to the implementation.
+type Addr interface {
+	Network() string // name of the network (for example, "tcp", "udp")
+	String() string  // string form of address (for example, "192.0.2.1:25", "[2001:db8::1]:80")
+}
+```
+
+根据本地地址网路类型以及地址族分拆目标地址，返回地址列表
+
+* 2、dialSerial
+
+```go
+// isIPv4 reports whether addr contains an IPv4 address.
+func isIPv4(addr Addr) bool {
+	switch addr := addr.(type) {
+	case *TCPAddr:
+		return addr.IP.To4() != nil
+	case *UDPAddr:
+		return addr.IP.To4() != nil
+	case *IPAddr:
+		return addr.IP.To4() != nil
+	}
+	return false
+}
+
+// partition divides an address list into two categories, using a
+// strategy function to assign a boolean label to each address.
+// The first address, and any with a matching label, are returned as
+// primaries, while addresses with the opposite label are returned
+// as fallbacks. For non-empty inputs, primaries is guaranteed to be
+// non-empty.
+func (addrs addrList) partition(strategy func(Addr) bool) (primaries, fallbacks addrList) {
+	var primaryLabel bool
+	for i, addr := range addrs {
+		label := strategy(addr)
+		if i == 0 || label == primaryLabel {
+			primaryLabel = label
+			primaries = append(primaries, addr)
+		} else {
+			fallbacks = append(fallbacks, addr)
+		}
+	}
+	return
+}
+
+...
+sd := &sysDialer{
+    Dialer:  *d,
+    network: network,
+    address: address,
+}
+
+...
+// dialSerial connects to a list of addresses in sequence, returning
+// either the first successful connection, or the first error.
+func (sd *sysDialer) dialSerial(ctx context.Context, ras addrList) (Conn, error) {
+	var firstErr error // The error from the first address is most relevant.
+
+	for i, ra := range ras {
+		select {
+		case <-ctx.Done():
+			return nil, &OpError{Op: "dial", Net: sd.network, Source: sd.LocalAddr, Addr: ra, Err: mapErr(ctx.Err())}
+		default:
+		}
+
+		deadline, _ := ctx.Deadline()
+		partialDeadline, err := partialDeadline(time.Now(), deadline, len(ras)-i)
+		if err != nil {
+			// Ran out of time.
+			if firstErr == nil {
+				firstErr = &OpError{Op: "dial", Net: sd.network, Source: sd.LocalAddr, Addr: ra, Err: err}
+			}
+			break
+		}
+		dialCtx := ctx
+		if partialDeadline.Before(deadline) {
+			var cancel context.CancelFunc
+			dialCtx, cancel = context.WithDeadline(ctx, partialDeadline)
+			defer cancel()
+		}
+
+		c, err := sd.dialSingle(dialCtx, ra)
+		if err == nil {
+			return c, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	if firstErr == nil {
+		firstErr = &OpError{Op: "dial", Net: sd.network, Source: nil, Addr: nil, Err: errMissingAddress}
+	}
+	return nil, firstErr
+}
+
+// dialSingle attempts to establish and returns a single connection to
+// the destination address.
+func (sd *sysDialer) dialSingle(ctx context.Context, ra Addr) (c Conn, err error) {
+	trace, _ := ctx.Value(nettrace.TraceKey{}).(*nettrace.Trace)
+	if trace != nil {
+		raStr := ra.String()
+		if trace.ConnectStart != nil {
+			trace.ConnectStart(sd.network, raStr)
+		}
+		if trace.ConnectDone != nil {
+			defer func() { trace.ConnectDone(sd.network, raStr, err) }()
+		}
+	}
+	la := sd.LocalAddr
+	switch ra := ra.(type) {
+	case *TCPAddr:
+		la, _ := la.(*TCPAddr)
+		c, err = sd.dialTCP(ctx, la, ra)
+	case *UDPAddr:
+		la, _ := la.(*UDPAddr)
+		c, err = sd.dialUDP(ctx, la, ra)
+	case *IPAddr:
+		la, _ := la.(*IPAddr)
+		c, err = sd.dialIP(ctx, la, ra)
+	case *UnixAddr:
+		la, _ := la.(*UnixAddr)
+		c, err = sd.dialUnix(ctx, la, ra)
+	default:
+		return nil, &OpError{Op: "dial", Net: sd.network, Source: la, Addr: ra, Err: &AddrError{Err: "unexpected address type", Addr: sd.address}}
+	}
+	if err != nil {
+		return nil, &OpError{Op: "dial", Net: sd.network, Source: la, Addr: ra, Err: err} // c is non-nil interface containing nil pointer
+	}
+	return c, nil
+}
+
+func (sd *sysDialer) dialTCP(ctx context.Context, laddr, raddr *TCPAddr) (*TCPConn, error) {
+	if testHookDialTCP != nil {
+		return testHookDialTCP(ctx, sd.network, laddr, raddr)
+	}
+	return sd.doDialTCP(ctx, laddr, raddr)
+}
+
+// net/tcpsock_posix.go
+func (sd *sysDialer) doDialTCP(ctx context.Context, laddr, raddr *TCPAddr) (*TCPConn, error) {
+	fd, err := internetSocket(ctx, sd.network, laddr, raddr, syscall.SOCK_STREAM, 0, "dial", sd.Dialer.Control)
+
+	// TCP has a rarely used mechanism called a 'simultaneous connection' in
+	// which Dial("tcp", addr1, addr2) run on the machine at addr1 can
+	// connect to a simultaneous Dial("tcp", addr2, addr1) run on the machine
+	// at addr2, without either machine executing Listen. If laddr == nil,
+	// it means we want the kernel to pick an appropriate originating local
+	// address. Some Linux kernels cycle blindly through a fixed range of
+	// local ports, regardless of destination port. If a kernel happens to
+	// pick local port 50001 as the source for a Dial("tcp", "", "localhost:50001"),
+	// then the Dial will succeed, having simultaneously connected to itself.
+	// This can only happen when we are letting the kernel pick a port (laddr == nil)
+	// and when there is no listener for the destination address.
+	// It's hard to argue this is anything other than a kernel bug. If we
+	// see this happen, rather than expose the buggy effect to users, we
+	// close the fd and try again. If it happens twice more, we relent and
+	// use the result. See also:
+	//	https://golang.org/issue/2690
+	//	https://stackoverflow.com/questions/4949858/
+	//
+	// The opposite can also happen: if we ask the kernel to pick an appropriate
+	// originating local address, sometimes it picks one that is already in use.
+	// So if the error is EADDRNOTAVAIL, we have to try again too, just for
+	// a different reason.
+	//
+	// The kernel socket code is no doubt enjoying watching us squirm.
+	for i := 0; i < 2 && (laddr == nil || laddr.Port == 0) && (selfConnect(fd, err) || spuriousENOTAVAIL(err)); i++ {
+		if err == nil {
+			fd.Close()
+		}
+		fd, err = internetSocket(ctx, sd.network, laddr, raddr, syscall.SOCK_STREAM, 0, "dial", sd.Dialer.Control)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	return newTCPConn(fd), nil
+}
+
+func internetSocket(ctx context.Context, net string, laddr, raddr sockaddr, sotype, proto int, mode string, ctrlFn func(string, string, syscall.RawConn) error) (fd *netFD, err error) {
+	if (runtime.GOOS == "aix" || runtime.GOOS == "windows" || runtime.GOOS == "openbsd" || runtime.GOOS == "nacl") && mode == "dial" && raddr.isWildcard() {
+		raddr = raddr.toLocal(net)
+	}
+	family, ipv6only := favoriteAddrFamily(net, laddr, raddr, mode)
+	return socket(ctx, net, family, sotype, proto, ipv6only, laddr, raddr, ctrlFn)
+}
+
+// socket returns a network file descriptor that is ready for
+// asynchronous I/O using the network poller.
+func socket(ctx context.Context, net string, family, sotype, proto int, ipv6only bool, laddr, raddr sockaddr, ctrlFn func(string, string, syscall.RawConn) error) (fd *netFD, err error) {
+	s, err := sysSocket(family, sotype, proto)
+	if err != nil {
+		return nil, err
+	}
+	if err = setDefaultSockopts(s, family, sotype, ipv6only); err != nil {
+		poll.CloseFunc(s)
+		return nil, err
+	}
+	if fd, err = newFD(s, family, sotype, net); err != nil {
+		poll.CloseFunc(s)
+		return nil, err
+	}
+
+	// This function makes a network file descriptor for the
+	// following applications:
+	//
+	// - An endpoint holder that opens a passive stream
+	//   connection, known as a stream listener
+	//
+	// - An endpoint holder that opens a destination-unspecific
+	//   datagram connection, known as a datagram listener
+	//
+	// - An endpoint holder that opens an active stream or a
+	//   destination-specific datagram connection, known as a
+	//   dialer
+	//
+	// - An endpoint holder that opens the other connection, such
+	//   as talking to the protocol stack inside the kernel
+	//
+	// For stream and datagram listeners, they will only require
+	// named sockets, so we can assume that it's just a request
+	// from stream or datagram listeners when laddr is not nil but
+	// raddr is nil. Otherwise we assume it's just for dialers or
+	// the other connection holders.
+
+	if laddr != nil && raddr == nil {
+		switch sotype {
+		case syscall.SOCK_STREAM, syscall.SOCK_SEQPACKET:
+			if err := fd.listenStream(laddr, listenerBacklog(), ctrlFn); err != nil {
+				fd.Close()
+				return nil, err
+			}
+			return fd, nil
+		case syscall.SOCK_DGRAM:
+			if err := fd.listenDatagram(laddr, ctrlFn); err != nil {
+				fd.Close()
+				return nil, err
+			}
+			return fd, nil
+		}
+	}
+	if err := fd.dial(ctx, laddr, raddr, ctrlFn); err != nil {
+		fd.Close()
+		return nil, err
+	}
+	return fd, nil
+}
+
+func newFD(sysfd, family, sotype int, net string) (*netFD, error) {
+	ret := &netFD{
+		pfd: poll.FD{
+			Sysfd:         sysfd,
+			IsStream:      sotype == syscall.SOCK_STREAM,
+			ZeroReadIsEOF: sotype != syscall.SOCK_DGRAM && sotype != syscall.SOCK_RAW,
+		},
+		family: family,
+		sotype: sotype,
+		net:    net,
+	}
+	return ret, nil
+}
+
+// Network file descriptor.
+type netFD struct {
+	pfd poll.FD
+
+	// immutable until Close
+	family      int
+	sotype      int
+	isConnected bool // handshake completed or use of association with peer
+	net         string
+	laddr       Addr
+	raddr       Addr
+}
+
+func newTCPConn(fd *netFD) *TCPConn {
+	c := &TCPConn{conn{fd}}
+	setNoDelay(c.fd, true)
+	return c
+}
+
+// TCPConn is an implementation of the Conn interface for TCP network
+// connections.
+type TCPConn struct {
+	conn
+}
+
+type conn struct {
+	fd *netFD
+}
+```
+
+对resolveAddrList返回的地址依次尝试创建连接，返回第一个创建成功的连接，否则返回第一个错误
+
+* 3、setKeepAlive
+
+创建完连接后，检查该连接是否为TCP连接，如果是TCP连接，则设置KeepAlive时间，如下(net/sockopt_posix.go)：
+
+```go
+...
+if tc, ok := c.(*TCPConn); ok && d.KeepAlive >= 0 {
+    setKeepAlive(tc.fd, true)
+    ka := d.KeepAlive
+    if d.KeepAlive == 0 {
+        ka = defaultTCPKeepAlive
+    }
+    setKeepAlivePeriod(tc.fd, ka)
+    testHookSetKeepAlive(ka)
+}
+
+...
+func setKeepAlive(fd *netFD, keepalive bool) error {
+	err := fd.pfd.SetsockoptInt(syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, boolint(keepalive))
+	runtime.KeepAlive(fd)
+	return wrapSyscallError("setsockopt", err)
+}
+
+...
+// net/tcpsockopt_darwin.go
+func setKeepAlivePeriod(fd *netFD, d time.Duration) error {
+	// The kernel expects seconds so round to next highest second.
+	d += (time.Second - time.Nanosecond)
+	secs := int(d.Seconds())
+	if err := fd.pfd.SetsockoptInt(syscall.IPPROTO_TCP, sysTCP_KEEPINTVL, secs); err != nil {
+		return wrapSyscallError("setsockopt", err)
+	}
+	err := fd.pfd.SetsockoptInt(syscall.IPPROTO_TCP, syscall.TCP_KEEPALIVE, secs)
+	runtime.KeepAlive(fd)
+	return wrapSyscallError("setsockopt", err)
+}
+
+// defaultTCPKeepAlive is a default constant value for TCPKeepAlive times
+// See golang.org/issue/31510
+const (
+	defaultTCPKeepAlive = 15 * time.Second
+)
+```
+
+Transport.IdleConnTimeout与net.Dialer.KeepAlive有什么关系，哪一个是所谓的HTTP keep-alives？？？
+
+回到Transport
 
 
 

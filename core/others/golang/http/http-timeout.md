@@ -653,9 +653,562 @@ http.persistConn在从空闲连接池中被捞出来复用时，会设置为非�
 
 ## net.Dialer.Timeout
 
+net.Dialer.Timeout在创建连接时会触发，如下：
 
+```go
+// DialContext connects to the address on the named network using
+// the provided context.
+//
+// The provided Context must be non-nil. If the context expires before
+// the connection is complete, an error is returned. Once successfully
+// connected, any expiration of the context will not affect the
+// connection.
+//
+// When using TCP, and the host in the address parameter resolves to multiple
+// network addresses, any dial timeout (from d.Timeout or ctx) is spread
+// over each consecutive dial, such that each is given an appropriate
+// fraction of the time to connect.
+// For example, if a host has 4 IP addresses and the timeout is 1 minute,
+// the connect to each single address will be given 15 seconds to complete
+// before trying the next one.
+//
+// See func Dial for a description of the network and address
+// parameters.
+func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn, error) {
+	if ctx == nil {
+		panic("nil context")
+	}
+	deadline := d.deadline(ctx, time.Now())
+	if !deadline.IsZero() {
+		if d, ok := ctx.Deadline(); !ok || deadline.Before(d) {
+			subCtx, cancel := context.WithDeadline(ctx, deadline)
+			defer cancel()
+			ctx = subCtx
+		}
+	}
+	if oldCancel := d.Cancel; oldCancel != nil {
+		subCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		go func() {
+			select {
+			case <-oldCancel:
+				cancel()
+			case <-subCtx.Done():
+			}
+		}()
+		ctx = subCtx
+	}
+
+	// Shadow the nettrace (if any) during resolve so Connect events don't fire for DNS lookups.
+	resolveCtx := ctx
+	if trace, _ := ctx.Value(nettrace.TraceKey{}).(*nettrace.Trace); trace != nil {
+		shadow := *trace
+		shadow.ConnectStart = nil
+		shadow.ConnectDone = nil
+		resolveCtx = context.WithValue(resolveCtx, nettrace.TraceKey{}, &shadow)
+	}
+
+	addrs, err := d.resolver().resolveAddrList(resolveCtx, "dial", network, address, d.LocalAddr)
+	if err != nil {
+		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: nil, Err: err}
+	}
+
+	sd := &sysDialer{
+		Dialer:  *d,
+		network: network,
+		address: address,
+	}
+
+	var primaries, fallbacks addrList
+	if d.dualStack() && network == "tcp" {
+		primaries, fallbacks = addrs.partition(isIPv4)
+	} else {
+		primaries = addrs
+	}
+
+	var c Conn
+	if len(fallbacks) > 0 {
+		c, err = sd.dialParallel(ctx, primaries, fallbacks)
+	} else {
+		c, err = sd.dialSerial(ctx, primaries)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if tc, ok := c.(*TCPConn); ok && d.KeepAlive >= 0 {
+		setKeepAlive(tc.fd, true)
+		ka := d.KeepAlive
+		if d.KeepAlive == 0 {
+			ka = defaultTCPKeepAlive
+		}
+		setKeepAlivePeriod(tc.fd, ka)
+		testHookSetKeepAlive(ka)
+	}
+	return c, nil
+}
+
+// deadline returns the earliest of:
+//   - now+Timeout
+//   - d.Deadline
+//   - the context's deadline
+// Or zero, if none of Timeout, Deadline, or context's deadline is set.
+func (d *Dialer) deadline(ctx context.Context, now time.Time) (earliest time.Time) {
+	if d.Timeout != 0 { // including negative, for historical reasons
+		earliest = now.Add(d.Timeout)
+	}
+	if d, ok := ctx.Deadline(); ok {
+		earliest = minNonzeroTime(earliest, d)
+	}
+	return minNonzeroTime(earliest, d.Deadline)
+}
+
+// dialSerial connects to a list of addresses in sequence, returning
+// either the first successful connection, or the first error.
+func (sd *sysDialer) dialSerial(ctx context.Context, ras addrList) (Conn, error) {
+	var firstErr error // The error from the first address is most relevant.
+
+	for i, ra := range ras {
+		select {
+		case <-ctx.Done():
+			return nil, &OpError{Op: "dial", Net: sd.network, Source: sd.LocalAddr, Addr: ra, Err: mapErr(ctx.Err())}
+		default:
+		}
+
+		deadline, _ := ctx.Deadline()
+		partialDeadline, err := partialDeadline(time.Now(), deadline, len(ras)-i)
+		if err != nil {
+			// Ran out of time.
+			if firstErr == nil {
+				firstErr = &OpError{Op: "dial", Net: sd.network, Source: sd.LocalAddr, Addr: ra, Err: err}
+			}
+			break
+		}
+		dialCtx := ctx
+		if partialDeadline.Before(deadline) {
+			var cancel context.CancelFunc
+			dialCtx, cancel = context.WithDeadline(ctx, partialDeadline)
+			defer cancel()
+		}
+
+		c, err := sd.dialSingle(dialCtx, ra)
+		if err == nil {
+			return c, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	if firstErr == nil {
+		firstErr = &OpError{Op: "dial", Net: sd.network, Source: nil, Addr: nil, Err: errMissingAddress}
+	}
+	return nil, firstErr
+}
+
+// dialSingle attempts to establish and returns a single connection to
+// the destination address.
+func (sd *sysDialer) dialSingle(ctx context.Context, ra Addr) (c Conn, err error) {
+	trace, _ := ctx.Value(nettrace.TraceKey{}).(*nettrace.Trace)
+	if trace != nil {
+		raStr := ra.String()
+		if trace.ConnectStart != nil {
+			trace.ConnectStart(sd.network, raStr)
+		}
+		if trace.ConnectDone != nil {
+			defer func() { trace.ConnectDone(sd.network, raStr, err) }()
+		}
+	}
+	la := sd.LocalAddr
+	switch ra := ra.(type) {
+	case *TCPAddr:
+		la, _ := la.(*TCPAddr)
+		c, err = sd.dialTCP(ctx, la, ra)
+	case *UDPAddr:
+		la, _ := la.(*UDPAddr)
+		c, err = sd.dialUDP(ctx, la, ra)
+	case *IPAddr:
+		la, _ := la.(*IPAddr)
+		c, err = sd.dialIP(ctx, la, ra)
+	case *UnixAddr:
+		la, _ := la.(*UnixAddr)
+		c, err = sd.dialUnix(ctx, la, ra)
+	default:
+		return nil, &OpError{Op: "dial", Net: sd.network, Source: la, Addr: ra, Err: &AddrError{Err: "unexpected address type", Addr: sd.address}}
+	}
+	if err != nil {
+		return nil, &OpError{Op: "dial", Net: sd.network, Source: la, Addr: ra, Err: err} // c is non-nil interface containing nil pointer
+	}
+	return c, nil
+}
+
+func (sd *sysDialer) dialTCP(ctx context.Context, laddr, raddr *TCPAddr) (*TCPConn, error) {
+	if testHookDialTCP != nil {
+		return testHookDialTCP(ctx, sd.network, laddr, raddr)
+	}
+	return sd.doDialTCP(ctx, laddr, raddr)
+}
+
+func (sd *sysDialer) doDialTCP(ctx context.Context, laddr, raddr *TCPAddr) (*TCPConn, error) {
+	fd, err := internetSocket(ctx, sd.network, laddr, raddr, syscall.SOCK_STREAM, 0, "dial", sd.Dialer.Control)
+
+	// TCP has a rarely used mechanism called a 'simultaneous connection' in
+	// which Dial("tcp", addr1, addr2) run on the machine at addr1 can
+	// connect to a simultaneous Dial("tcp", addr2, addr1) run on the machine
+	// at addr2, without either machine executing Listen. If laddr == nil,
+	// it means we want the kernel to pick an appropriate originating local
+	// address. Some Linux kernels cycle blindly through a fixed range of
+	// local ports, regardless of destination port. If a kernel happens to
+	// pick local port 50001 as the source for a Dial("tcp", "", "localhost:50001"),
+	// then the Dial will succeed, having simultaneously connected to itself.
+	// This can only happen when we are letting the kernel pick a port (laddr == nil)
+	// and when there is no listener for the destination address.
+	// It's hard to argue this is anything other than a kernel bug. If we
+	// see this happen, rather than expose the buggy effect to users, we
+	// close the fd and try again. If it happens twice more, we relent and
+	// use the result. See also:
+	//	https://golang.org/issue/2690
+	//	https://stackoverflow.com/questions/4949858/
+	//
+	// The opposite can also happen: if we ask the kernel to pick an appropriate
+	// originating local address, sometimes it picks one that is already in use.
+	// So if the error is EADDRNOTAVAIL, we have to try again too, just for
+	// a different reason.
+	//
+	// The kernel socket code is no doubt enjoying watching us squirm.
+	for i := 0; i < 2 && (laddr == nil || laddr.Port == 0) && (selfConnect(fd, err) || spuriousENOTAVAIL(err)); i++ {
+		if err == nil {
+			fd.Close()
+		}
+		fd, err = internetSocket(ctx, sd.network, laddr, raddr, syscall.SOCK_STREAM, 0, "dial", sd.Dialer.Control)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	return newTCPConn(fd), nil
+}
+
+func internetSocket(ctx context.Context, net string, laddr, raddr sockaddr, sotype, proto int, mode string, ctrlFn func(string, string, syscall.RawConn) error) (fd *netFD, err error) {
+	if (runtime.GOOS == "aix" || runtime.GOOS == "windows" || runtime.GOOS == "openbsd" || runtime.GOOS == "nacl") && mode == "dial" && raddr.isWildcard() {
+		raddr = raddr.toLocal(net)
+	}
+	family, ipv6only := favoriteAddrFamily(net, laddr, raddr, mode)
+	return socket(ctx, net, family, sotype, proto, ipv6only, laddr, raddr, ctrlFn)
+}
+
+// socket returns a network file descriptor that is ready for
+// asynchronous I/O using the network poller.
+func socket(ctx context.Context, net string, family, sotype, proto int, ipv6only bool, laddr, raddr sockaddr, ctrlFn func(string, string, syscall.RawConn) error) (fd *netFD, err error) {
+	s, err := sysSocket(family, sotype, proto)
+	if err != nil {
+		return nil, err
+	}
+	if err = setDefaultSockopts(s, family, sotype, ipv6only); err != nil {
+		poll.CloseFunc(s)
+		return nil, err
+	}
+	if fd, err = newFD(s, family, sotype, net); err != nil {
+		poll.CloseFunc(s)
+		return nil, err
+	}
+
+	// This function makes a network file descriptor for the
+	// following applications:
+	//
+	// - An endpoint holder that opens a passive stream
+	//   connection, known as a stream listener
+	//
+	// - An endpoint holder that opens a destination-unspecific
+	//   datagram connection, known as a datagram listener
+	//
+	// - An endpoint holder that opens an active stream or a
+	//   destination-specific datagram connection, known as a
+	//   dialer
+	//
+	// - An endpoint holder that opens the other connection, such
+	//   as talking to the protocol stack inside the kernel
+	//
+	// For stream and datagram listeners, they will only require
+	// named sockets, so we can assume that it's just a request
+	// from stream or datagram listeners when laddr is not nil but
+	// raddr is nil. Otherwise we assume it's just for dialers or
+	// the other connection holders.
+
+	if laddr != nil && raddr == nil {
+		switch sotype {
+		case syscall.SOCK_STREAM, syscall.SOCK_SEQPACKET:
+			if err := fd.listenStream(laddr, listenerBacklog(), ctrlFn); err != nil {
+				fd.Close()
+				return nil, err
+			}
+			return fd, nil
+		case syscall.SOCK_DGRAM:
+			if err := fd.listenDatagram(laddr, ctrlFn); err != nil {
+				fd.Close()
+				return nil, err
+			}
+			return fd, nil
+		}
+	}
+	if err := fd.dial(ctx, laddr, raddr, ctrlFn); err != nil {
+		fd.Close()
+		return nil, err
+	}
+	return fd, nil
+}
+
+...
+func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa syscall.Sockaddr, ret error) {
+	// Do not need to call fd.writeLock here,
+	// because fd is not yet accessible to user,
+	// so no concurrent operations are possible.
+	switch err := connectFunc(fd.pfd.Sysfd, ra); err {
+	case syscall.EINPROGRESS, syscall.EALREADY, syscall.EINTR:
+	case nil, syscall.EISCONN:
+		select {
+		case <-ctx.Done():
+			return nil, mapErr(ctx.Err())
+		default:
+		}
+		if err := fd.pfd.Init(fd.net, true); err != nil {
+			return nil, err
+		}
+		runtime.KeepAlive(fd)
+		return nil, nil
+	case syscall.EINVAL:
+		// On Solaris and illumos we can see EINVAL if the socket has
+		// already been accepted and closed by the server.  Treat this
+		// as a successful connection--writes to the socket will see
+		// EOF.  For details and a test case in C see
+		// https://golang.org/issue/6828.
+		if runtime.GOOS == "solaris" || runtime.GOOS == "illumos" {
+			return nil, nil
+		}
+		fallthrough
+	default:
+		return nil, os.NewSyscallError("connect", err)
+	}
+	if err := fd.pfd.Init(fd.net, true); err != nil {
+		return nil, err
+	}
+	if deadline, _ := ctx.Deadline(); !deadline.IsZero() {
+		fd.pfd.SetWriteDeadline(deadline)
+		defer fd.pfd.SetWriteDeadline(noDeadline)
+	}
+
+	// Start the "interrupter" goroutine, if this context might be canceled.
+	// (The background context cannot)
+	//
+	// The interrupter goroutine waits for the context to be done and
+	// interrupts the dial (by altering the fd's write deadline, which
+	// wakes up waitWrite).
+	if ctx != context.Background() {
+		// Wait for the interrupter goroutine to exit before returning
+		// from connect.
+		done := make(chan struct{})
+		interruptRes := make(chan error)
+		defer func() {
+			close(done)
+			if ctxErr := <-interruptRes; ctxErr != nil && ret == nil {
+				// The interrupter goroutine called SetWriteDeadline,
+				// but the connect code below had returned from
+				// waitWrite already and did a successful connect (ret
+				// == nil). Because we've now poisoned the connection
+				// by making it unwritable, don't return a successful
+				// dial. This was issue 16523.
+				ret = mapErr(ctxErr)
+				fd.Close() // prevent a leak
+			}
+		}()
+		go func() {
+			select {
+			case <-ctx.Done():
+				// Force the runtime's poller to immediately give up
+				// waiting for writability, unblocking waitWrite
+				// below.
+				fd.pfd.SetWriteDeadline(aLongTimeAgo)
+				testHookCanceledDial()
+				interruptRes <- ctx.Err()
+			case <-done:
+				interruptRes <- nil
+			}
+		}()
+	}
+
+	for {
+		// Performing multiple connect system calls on a
+		// non-blocking socket under Unix variants does not
+		// necessarily result in earlier errors being
+		// returned. Instead, once runtime-integrated network
+		// poller tells us that the socket is ready, get the
+		// SO_ERROR socket option to see if the connection
+		// succeeded or failed. See issue 7474 for further
+		// details.
+		if err := fd.pfd.WaitWrite(); err != nil {
+			select {
+			case <-ctx.Done():
+				return nil, mapErr(ctx.Err())
+			default:
+			}
+			return nil, err
+		}
+		nerr, err := getsockoptIntFunc(fd.pfd.Sysfd, syscall.SOL_SOCKET, syscall.SO_ERROR)
+		if err != nil {
+			return nil, os.NewSyscallError("getsockopt", err)
+		}
+		switch err := syscall.Errno(nerr); err {
+		case syscall.EINPROGRESS, syscall.EALREADY, syscall.EINTR:
+		case syscall.EISCONN:
+			return nil, nil
+		case syscall.Errno(0):
+			// The runtime poller can wake us up spuriously;
+			// see issues 14548 and 19289. Check that we are
+			// really connected; if not, wait again.
+			if rsa, err := syscall.Getpeername(fd.pfd.Sysfd); err == nil {
+				return rsa, nil
+			}
+		default:
+			return nil, os.NewSyscallError("connect", err)
+		}
+		runtime.KeepAlive(fd)
+	}
+}
+```
+
+如上所示，创建连接的超时deadline由取值于如下几个参数中最早的一个：
+
+```go
+// deadline returns the earliest of:
+     //   - now+Timeout
+     //   - d.Deadline
+     //   - the context's deadline
+     // Or zero, if none of Timeout, Deadline, or context's deadline is set.
+```
+
+另外，如果说目标地址是多个地址，则会将deadline平均设置成每个地址的连接建立超时时间，最后由context.WithTimeout + ctx.Done() 触发，如下：
+
+```go
+// When using TCP, and the host in the address parameter resolves to multiple
+// network addresses, any dial timeout (from d.Timeout or ctx) is spread
+// over each consecutive dial, such that each is given an appropriate
+// fraction of the time to connect.
+// For example, if a host has 4 IP addresses and the timeout is 1 minute,
+// the connect to each single address will be given 15 seconds to complete
+// before trying the next one.
+```
+
+也即net.Dialer.Timeout影响底层连接建立的超时时间
 
 ## net.Dialer.KeepAlive
 
+最后，我们分析一下`net.Dialer.KeepAlive`作用，如下：
 
+```go
+func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn, error) {
+    ...
+	var c Conn
+	if len(fallbacks) > 0 {
+		c, err = sd.dialParallel(ctx, primaries, fallbacks)
+	} else {
+		c, err = sd.dialSerial(ctx, primaries)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if tc, ok := c.(*TCPConn); ok && d.KeepAlive >= 0 {
+		setKeepAlive(tc.fd, true)
+		ka := d.KeepAlive
+		if d.KeepAlive == 0 {
+			ka = defaultTCPKeepAlive
+		}
+		setKeepAlivePeriod(tc.fd, ka)
+		testHookSetKeepAlive(ka)
+	}
+	return c, nil
+}
+
+func setKeepAlive(fd *netFD, keepalive bool) error {
+	err := fd.pfd.SetsockoptInt(syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, boolint(keepalive))
+	runtime.KeepAlive(fd)
+	return wrapSyscallError("setsockopt", err)
+}
+
+func setKeepAlivePeriod(fd *netFD, d time.Duration) error {
+	// The kernel expects seconds so round to next highest second.
+	d += (time.Second - time.Nanosecond)
+	secs := int(d.Seconds())
+	if err := fd.pfd.SetsockoptInt(syscall.IPPROTO_TCP, syscall.TCP_KEEPINTVL, secs); err != nil {
+		return wrapSyscallError("setsockopt", err)
+	}
+	err := fd.pfd.SetsockoptInt(syscall.IPPROTO_TCP, syscall.TCP_KEEPIDLE, secs)
+	runtime.KeepAlive(fd)
+	return wrapSyscallError("setsockopt", err)
+}
+```
+
+net.Dialer.KeepAlive用于设置TCP的keepalive参数(syscall.TCP_KEEPINTVL以及syscall.TCP_KEEPIDLE)，这里先介绍一下TCP keepalive
+
+### [TCP keepalive](https://tldp.org/HOWTO/TCP-Keepalive-HOWTO/overview.html)
+
+>> In order to understand what TCP keepalive (which we will just call keepalive) does, you need do nothing more than read the name: keep TCP alive. This means that you will be able to check your connected socket (also known as TCP sockets), and determine whether the connection is still up and running or if it has broken.
+   
+>> The keepalive concept is very simple: when you set up a TCP connection, you associate a set of timers. Some of these timers deal with the keepalive procedure. When the keepalive timer reaches zero, you send your peer a keepalive probe packet with no data in it and the ACK flag turned on. You can do this because of the TCP/IP specifications, as a sort of duplicate ACK, and the remote endpoint will have no arguments, as TCP is a stream-oriented protocol. On the other hand, you will receive a reply from the remote host (which doesn't need to support keepalive at all, just TCP/IP), with no data and the ACK set.
+
+TCP keepalive用于检查TCP sockets是否存活。它会在TCP socket空闲(没有数据包发送or接收)一段时间后，向对端发出不包含数据(zero-length)的探测包(keepalive probe packet)，并在没有收到回应的情况下按照固定间隔重试若干次，如果一直没有回应，则认为对端已经死了，TCP sockets失效，最终关闭连接
+
+TCP keepalive是无侵入的，应用程序感知不到它的存在(由内核完成)
+
+默认情况下TCP keepalive是关闭的，需要应用程序使用setsockopt开启TCP sockets的keepalive功能。另外，linux提供了如下三个keepalive参数供用户使用：
+
+* tcp_keepalive_time: the interval between the last data packet sent (simple ACKs are not considered data) and the first keepalive probe; after the connection is marked to need keepalive, this counter is not used any further
+* tcp_keepalive_intvl: the interval between subsequential keepalive probes, regardless of what the connection has exchanged in the meantime
+* tcp_keepalive_probes: the number of unacknowledged probes to send before considering the connection dead and notifying the application layer
+   
+操作示例如下：
+
+```bash
+# The first two parameters are expressed in seconds, and the last is the pure number. This means that the keepalive routines wait for two hours (7200 secs) before sending the first keepalive probe, and then resend it every 75 seconds. If no ACK response is received for nine consecutive times, the connection is marked as broken.
+# cat /proc/sys/net/ipv4/tcp_keepalive_time
+7200
+
+# cat /proc/sys/net/ipv4/tcp_keepalive_intvl
+75
+
+# cat /proc/sys/net/ipv4/tcp_keepalive_probes
+9
+
+# Modifying this value is straightforward: you need to write new values into the files. Suppose you decide to configure the host so that keepalive starts after ten minutes of channel inactivity, and then send probes in intervals of one minute. Because of the high instability of our network trunk and the low value of the interval, suppose you also want to increase the number of probes to 20.
+# To be sure that all succeeds, recheck the files and confirm these new values are showing in place of the old ones.
+# echo 600 > /proc/sys/net/ipv4/tcp_keepalive_time
+
+# echo 60 > /proc/sys/net/ipv4/tcp_keepalive_intvl
+
+# echo 20 > /proc/sys/net/ipv4/tcp_keepalive_probes
+```
+
+### [HTTP keep-alive](https://en.wikipedia.org/wiki/HTTP_persistent_connection)
+
+>> HTTP persistent connection, also called HTTP keep-alive, or HTTP connection reuse, is the idea of using a single TCP connection to send and receive multiple HTTP requests/responses, as opposed to opening a new connection for every single request/response pair. The newer HTTP/2 protocol uses the same idea and takes it further to allow multiple concurrent requests/responses to be multiplexed over a single connection.
+
+HTTP keep-alive，也即HTTP长连接，表示在同一个TCP socket上发送多个HTTP请求和回应；对应的HTTP短连接则表示在一次HTTP请求回应后，立刻关闭TCP socket
+
+支持情况：
+
+* HTTP 1.0默认不开启keep-alive，需要在请求报头中添加："Connection: keep-alive"开启该特性，另外回应报文中也会添加该报头
+* HTTP 1.1默认开启keep-alive，需要在请求报头中添加："Connection: close"关闭该特性
+
+### TCP keepalive vs HTTP keep-alive(区别)
+
+* TCP keepalive：用于探测TCP sockets是否存活
+* HTTP keep-alive：用于复用TCP sockets
+* HTTP连接池：用于管理HTTP keep-alive sockets，供HTTP请求使用
+
+## Refs
+
+* [Notes on TCP keepalive in Go](https://thenotexpert.com/golang-tcp-keepalive/)
+* [Using TCP keepalive with Go](https://felixge.de/2014/08/26/tcp-keepalive-with-golang.html)
+* [TCP keepalive overview](https://tldp.org/HOWTO/TCP-Keepalive-HOWTO/overview.html)
+* [Using TCP keepalive under Linux](https://tldp.org/HOWTO/TCP-Keepalive-HOWTO/usingkeepalive.html)
 

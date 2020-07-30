@@ -3560,10 +3560,11 @@ http.Client
     
 ## 调用关键流程
     
-* step1 - http.NewRequest(method, url string, body io.Reader)
+* step1 - http.NewRequest(method, url string, body io.Reader) 创建请求
 
-* step2 - http.Client.Do(req *Request)
+* step2 - http.Client.Do(req *Request) 发送请求&接收应答
 
+```
 整个http.Client.Do逻辑分为两道，第一道执行send发送请求接收Response，关闭Req.Body；第二层对请求执行重定向等操作(若需要redirect)，并关闭Resp.Body
 
 http.Client.Do(req) => send(ireq *Request, rt RoundTripper, deadline time.Time)
@@ -3578,7 +3579,8 @@ http.Client.Do(req) => send(ireq *Request, rt RoundTripper, deadline time.Time)
       -> http.persistConn.readLoop() read http.Response(读取响应内容，并构建http.Response)
       -> http.persistConn.writeLoop() write http.Request(发送请求) 
   -> http.persistConn.roundTrip(treq) 发送请求，读取Response并返回
+```
   
-* step3 - http.Response.Body.Close()
+* step3 - http.Response.Body.Close() 关闭应答Body
 
 下一章我们分析http transport其中的几个timeout设置，这也是我们使用net/http库一般会关注和遇到的问题……

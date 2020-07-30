@@ -3538,15 +3538,47 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 }
 ```
 
+总结如下：
 
+## golang http transport结构体关键字段和关系
 
+http.Client
+  - Timeout：http client请求生命周期超时设置(包括连接建立，发请求，重定向，以及Response body读取等所有阶段)
+  - RoundTrip(http.Transport实现)
+    - MaxIdleConns：控制所有hosts的空闲连接最大数目(Zero means no limit.)
+    - MaxIdleConnsPerHost：控制某个host的空闲连接(keep-alives)最大数目(设置为0，则默认DefaultMaxIdleConnsPerHost=2)
+    - MaxConnsPerHost：控制某个host的所有连接，包括创建中，正在使用的，以及空闲的连接(including connections in the dialing, active, and idle states)。一旦超过限制，dial会阻塞(Zero means no limit)
+    - IdleConnTimeout：空闲连接(keep-alives)超时时间
+    - h2transport：HTTP/2协议对应的transport
+    - ForceAttemptHTTP2：当Dial, DialTLS, or DialContext func or TLSClientConfig提供时，默认情况下会禁止HTTP/2协议。当使用自定义的这些配置时，需要设置ForceAttemptHTTP2字段开启HTTP2
+    - DisableKeepAlives：禁止HTTP keep-alives，一个连接只用于一次请求(注意区分TCP keep-alives。HTTP keep-alives用于连接复用；TCP keep-alives用于连接保活)
+    - DialContext：指定底层TCP连接的创建函数
+    - idleConn(map[connectMethodKey][]*persistConn)：空闲连接池
+    - idleConnWait(map[connectMethodKey]wantConnQueue)：等待建立的连接池
+    - connsPerHost(map[connectMethodKey]int)：表示每个host(connectMethodKey)的目前连接个数
+    - connsPerHostWait(map[connectMethodKey]wantConnQueue)：表示每个host(connectMethodKey)等待建立的连接请求
+    
+## 调用关键流程
+    
+* step1 - http.NewRequest(method, url string, body io.Reader)
 
+* step2 - http.Client.Do(req *Request)
 
+整个http.Client.Do逻辑分为两道，第一道执行send发送请求接收Response，关闭Req.Body；第二层对请求执行重定向等操作(若需要redirect)，并关闭Resp.Body
 
+http.Client.Do(req) => send(ireq *Request, rt RoundTripper, deadline time.Time)
+  -> setRequestCancel(req, rt, deadline) 设置请求超时时间
+  -> http.Client.RoundTrip(req) 
 
+=> http.Client.RoundTrip(req) 
+  -> http.Transport.t.getConn(treq, cm) 获取连接(新创建的 or 复用空闲连接) 
+    -> http.Transport.queueForIdleConn(w *wantConn) 获取空闲连接
+    -> http.Transport.dialConnFor(w *wantConn) -> http.Transport.dialConn(ctx context.Context, cm connectMethod) 创建新连接
+      -> http.Transport.dial(ctx context.Context, network, addr string) -> http.Transport.DialContext
+      -> http.persistConn.readLoop() read http.Response(读取响应内容，并构建http.Response)
+      -> http.persistConn.writeLoop() write http.Request(发送请求) 
+  -> http.persistConn.roundTrip(treq) 发送请求，读取Response并返回
+  
+* step3 - http.Response.Body.Close()
 
-
-
-
-
-
+下一章我们分析http transport其中的几个timeout设置，这也是我们使用net/http库一般会关注和遇到的问题……

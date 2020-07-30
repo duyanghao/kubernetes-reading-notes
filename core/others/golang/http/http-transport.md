@@ -1,7 +1,11 @@
 http transport
 ==============
 
-## http transport usage demo
+本文通过源码的角度梳理golang http库使用，包括底层数据结构和大致流程
+
+我们直接从使用示例出发进行源码分析(源码分析最好带着问题出发，有目标的看代码，不要一股脑钻进去，最终事倍功半)：
+
+## 例子
 
 ```go
 package main
@@ -59,7 +63,7 @@ func main() {
 }
 ```
 
-## analysis
+## 源码分析
 
 先看看http.Client结构体，如下：
 

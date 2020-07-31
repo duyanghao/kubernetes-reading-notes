@@ -3,16 +3,880 @@ http transport timeout
 
 本章分析http transport中的几个timeout设置，这也是我们使用net/http库一般会关注和遇到的问题
 
-timeout设置如下：
+golang demo例子如下：
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/url"
+	"time"
+	"net"
+)
+
+func send_http_request(addr string, port int) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+				DualStack: true,
+			}).DialContext,
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+
+	// construct encoded endpoint
+	Url, err := url.Parse(fmt.Sprintf("http://%s:%d", addr, port))
+	if err != nil {
+		return err
+	}
+	Url.Path += "/index"
+	endpoint := Url.String()
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return err
+	}
+	// use httpClient to send request
+	rsp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	// close the connection to reuse it
+	defer rsp.Body.Close()
+	// check status code
+	if rsp.StatusCode != http.StatusOK {
+		return fmt.Errorf("get rsp error: %v", rsp)
+	}
+	return err
+}
+
+func main() {
+	send_http_request("xxx", 8080)
+}
+```
+
+这其中涉及的几个timeout设置如下：
 
 * http.Client.Timeout
 * http.Client.IdleConnTimeout
 * net.Dialer.Timeout
 * net.Dialer.KeepAlive
 
+下面我们依次从源码角度对这些Timeout配置作用进行分析
+
 ## http.Client.Timeout
 
+```
+http.Client.Do(req) => send(ireq *Request, rt RoundTripper, deadline time.Time)
+  -> setRequestCancel(req, rt, deadline) 设置请求超时时间
+  -> http.Client.RoundTrip(req)
+```
 
+从如上调用链出发，重点看setRequestCancel函数：
+  
+```go
+func (c *Client) do(req *Request) (retres *Response, reterr error) {
+	if testHookClientDoResult != nil {
+		defer func() { testHookClientDoResult(retres, reterr) }()
+	}
+	if req.URL == nil {
+		req.closeBody()
+		return nil, &url.Error{
+			Op:  urlErrorOp(req.Method),
+			Err: errors.New("http: nil Request.URL"),
+		}
+	}
+
+	var (
+		deadline      = c.deadline()
+		reqs          []*Request
+		resp          *Response
+		copyHeaders   = c.makeHeadersCopier(req)
+		reqBodyClosed = false // have we closed the current req.Body?
+
+		// Redirect behavior:
+		redirectMethod string
+		includeBody    bool
+	)
+	uerr := func(err error) error {
+		// the body may have been closed already by c.send()
+		if !reqBodyClosed {
+			req.closeBody()
+		}
+		var urlStr string
+		if resp != nil && resp.Request != nil {
+			urlStr = stripPassword(resp.Request.URL)
+		} else {
+			urlStr = stripPassword(req.URL)
+		}
+		return &url.Error{
+			Op:  urlErrorOp(reqs[0].Method),
+			URL: urlStr,
+			Err: err,
+		}
+	}
+	for {
+		// For all but the first request, create the next
+		// request hop and replace req.
+		if len(reqs) > 0 {
+			loc := resp.Header.Get("Location")
+			if loc == "" {
+				resp.closeBody()
+				return nil, uerr(fmt.Errorf("%d response missing Location header", resp.StatusCode))
+			}
+			u, err := req.URL.Parse(loc)
+			if err != nil {
+				resp.closeBody()
+				return nil, uerr(fmt.Errorf("failed to parse Location header %q: %v", loc, err))
+			}
+			host := ""
+			if req.Host != "" && req.Host != req.URL.Host {
+				// If the caller specified a custom Host header and the
+				// redirect location is relative, preserve the Host header
+				// through the redirect. See issue #22233.
+				if u, _ := url.Parse(loc); u != nil && !u.IsAbs() {
+					host = req.Host
+				}
+			}
+			ireq := reqs[0]
+			req = &Request{
+				Method:   redirectMethod,
+				Response: resp,
+				URL:      u,
+				Header:   make(Header),
+				Host:     host,
+				Cancel:   ireq.Cancel,
+				ctx:      ireq.ctx,
+			}
+			if includeBody && ireq.GetBody != nil {
+				req.Body, err = ireq.GetBody()
+				if err != nil {
+					resp.closeBody()
+					return nil, uerr(err)
+				}
+				req.ContentLength = ireq.ContentLength
+			}
+
+			// Copy original headers before setting the Referer,
+			// in case the user set Referer on their first request.
+			// If they really want to override, they can do it in
+			// their CheckRedirect func.
+			copyHeaders(req)
+
+			// Add the Referer header from the most recent
+			// request URL to the new one, if it's not https->http:
+			if ref := refererForURL(reqs[len(reqs)-1].URL, req.URL); ref != "" {
+				req.Header.Set("Referer", ref)
+			}
+			err = c.checkRedirect(req, reqs)
+
+			// Sentinel error to let users select the
+			// previous response, without closing its
+			// body. See Issue 10069.
+			if err == ErrUseLastResponse {
+				return resp, nil
+			}
+
+			// Close the previous response's body. But
+			// read at least some of the body so if it's
+			// small the underlying TCP connection will be
+			// re-used. No need to check for errors: if it
+			// fails, the Transport won't reuse it anyway.
+			const maxBodySlurpSize = 2 << 10
+			if resp.ContentLength == -1 || resp.ContentLength <= maxBodySlurpSize {
+				io.CopyN(ioutil.Discard, resp.Body, maxBodySlurpSize)
+			}
+			resp.Body.Close()
+
+			if err != nil {
+				// Special case for Go 1 compatibility: return both the response
+				// and an error if the CheckRedirect function failed.
+				// See https://golang.org/issue/3795
+				// The resp.Body has already been closed.
+				ue := uerr(err)
+				ue.(*url.Error).URL = loc
+				return resp, ue
+			}
+		}
+
+		reqs = append(reqs, req)
+		var err error
+		var didTimeout func() bool
+		if resp, didTimeout, err = c.send(req, deadline); err != nil {
+			// c.send() always closes req.Body
+			reqBodyClosed = true
+			if !deadline.IsZero() && didTimeout() {
+				err = &httpError{
+					// TODO: early in cycle: s/Client.Timeout exceeded/timeout or context cancellation/
+					err:     err.Error() + " (Client.Timeout exceeded while awaiting headers)",
+					timeout: true,
+				}
+			}
+			return nil, uerr(err)
+		}
+
+		var shouldRedirect bool
+		redirectMethod, shouldRedirect, includeBody = redirectBehavior(req.Method, resp, reqs[0])
+		if !shouldRedirect {
+			return resp, nil
+		}
+
+		req.closeBody()
+	}
+}
+
+func (c *Client) deadline() time.Time {
+	if c.Timeout > 0 {
+		return time.Now().Add(c.Timeout)
+	}
+	return time.Time{}
+}
+
+// didTimeout is non-nil only if err != nil.
+func (c *Client) send(req *Request, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
+	if c.Jar != nil {
+		for _, cookie := range c.Jar.Cookies(req.URL) {
+			req.AddCookie(cookie)
+		}
+	}
+	resp, didTimeout, err = send(req, c.transport(), deadline)
+	if err != nil {
+		return nil, didTimeout, err
+	}
+	if c.Jar != nil {
+		if rc := resp.Cookies(); len(rc) > 0 {
+			c.Jar.SetCookies(req.URL, rc)
+		}
+	}
+	return resp, nil, nil
+}
+
+// send issues an HTTP request.
+// Caller should close resp.Body when done reading from it.
+func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
+	req := ireq // req is either the original request, or a modified fork
+
+	if rt == nil {
+		req.closeBody()
+		return nil, alwaysFalse, errors.New("http: no Client.Transport or DefaultTransport")
+	}
+
+	if req.URL == nil {
+		req.closeBody()
+		return nil, alwaysFalse, errors.New("http: nil Request.URL")
+	}
+
+	if req.RequestURI != "" {
+		req.closeBody()
+		return nil, alwaysFalse, errors.New("http: Request.RequestURI can't be set in client requests.")
+	}
+
+	// forkReq forks req into a shallow clone of ireq the first
+	// time it's called.
+	forkReq := func() {
+		if ireq == req {
+			req = new(Request)
+			*req = *ireq // shallow clone
+		}
+	}
+
+	// Most the callers of send (Get, Post, et al) don't need
+	// Headers, leaving it uninitialized. We guarantee to the
+	// Transport that this has been initialized, though.
+	if req.Header == nil {
+		forkReq()
+		req.Header = make(Header)
+	}
+
+	if u := req.URL.User; u != nil && req.Header.Get("Authorization") == "" {
+		username := u.Username()
+		password, _ := u.Password()
+		forkReq()
+		req.Header = cloneOrMakeHeader(ireq.Header)
+		req.Header.Set("Authorization", "Basic "+basicAuth(username, password))
+	}
+
+	if !deadline.IsZero() {
+		forkReq()
+	}
+	stopTimer, didTimeout := setRequestCancel(req, rt, deadline)
+
+	resp, err = rt.RoundTrip(req)
+	if err != nil {
+		stopTimer()
+		if resp != nil {
+			log.Printf("RoundTripper returned a response & error; ignoring response")
+		}
+		if tlsErr, ok := err.(tls.RecordHeaderError); ok {
+			// If we get a bad TLS record header, check to see if the
+			// response looks like HTTP and give a more helpful error.
+			// See golang.org/issue/11111.
+			if string(tlsErr.RecordHeader[:]) == "HTTP/" {
+				err = errors.New("http: server gave HTTP response to HTTPS client")
+			}
+		}
+		return nil, didTimeout, err
+	}
+	if !deadline.IsZero() {
+		resp.Body = &cancelTimerBody{
+			stop:          stopTimer,
+			rc:            resp.Body,
+			reqDidTimeout: didTimeout,
+		}
+	}
+	return resp, nil, nil
+}
+
+// setRequestCancel sets the Cancel field of req, if deadline is
+// non-zero. The RoundTripper's type is used to determine whether the legacy
+// CancelRequest behavior should be used.
+//
+// As background, there are three ways to cancel a request:
+// First was Transport.CancelRequest. (deprecated)
+// Second was Request.Cancel (this mechanism).
+// Third was Request.Context.
+func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTimer func(), didTimeout func() bool) {
+	if deadline.IsZero() {
+		return nop, alwaysFalse
+	}
+
+	initialReqCancel := req.Cancel // the user's original Request.Cancel, if any
+
+	cancel := make(chan struct{})
+	req.Cancel = cancel
+
+	doCancel := func() {
+		// The newer way (the second way in the func comment):
+		close(cancel)
+
+		// The legacy compatibility way, used only
+		// for RoundTripper implementations written
+		// before Go 1.5 or Go 1.6.
+		type canceler interface {
+			CancelRequest(*Request)
+		}
+		switch v := rt.(type) {
+		case *Transport, *http2Transport:
+			// Do nothing. The net/http package's transports
+			// support the new Request.Cancel channel
+		case canceler:
+			v.CancelRequest(req)
+		}
+	}
+
+	stopTimerCh := make(chan struct{})
+	var once sync.Once
+	stopTimer = func() { once.Do(func() { close(stopTimerCh) }) }
+
+	timer := time.NewTimer(time.Until(deadline))
+	var timedOut atomicBool
+
+	go func() {
+		select {
+		case <-initialReqCancel:
+			doCancel()
+			timer.Stop()
+		case <-timer.C:
+			timedOut.setTrue()
+			doCancel()
+		case <-stopTimerCh:
+			timer.Stop()
+		}
+	}()
+
+	return stopTimer, timedOut.isSet
+}
+```
+
+这里setRequestCancel函数在http.Client.Timeout时间超时之后会调用doCancel函数：
+
+```go
+timer := time.NewTimer(time.Until(deadline))
+var timedOut atomicBool
+
+go func() {
+    select {
+    case <-initialReqCancel:
+        doCancel()
+        timer.Stop()
+    case <-timer.C:
+        timedOut.setTrue()
+        doCancel()
+    case <-stopTimerCh:
+        timer.Stop()
+    }
+}()
+```
+
+而doCancel会关闭req.Cancel管道，如下：
+
+```go
+cancel := make(chan struct{})
+req.Cancel = cancel
+
+doCancel := func() {
+    // The newer way (the second way in the func comment):
+    close(cancel)
+
+    // The legacy compatibility way, used only
+    // for RoundTripper implementations written
+    // before Go 1.5 or Go 1.6.
+    type canceler interface {
+        CancelRequest(*Request)
+    }
+    switch v := rt.(type) {
+    case *Transport, *http2Transport:
+        // Do nothing. The net/http package's transports
+        // support the new Request.Cancel channel
+    case canceler:
+        v.CancelRequest(req)
+    }
+}
+```
+
+下面看如何在超时时取消请求：
+
+```go
+// send issues an HTTP request.
+// Caller should close resp.Body when done reading from it.
+func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
+    ...
+	if !deadline.IsZero() {
+		forkReq()
+	}
+	stopTimer, didTimeout := setRequestCancel(req, rt, deadline)
+
+	resp, err = rt.RoundTrip(req)
+	if err != nil {
+		stopTimer()
+		if resp != nil {
+			log.Printf("RoundTripper returned a response & error; ignoring response")
+		}
+		if tlsErr, ok := err.(tls.RecordHeaderError); ok {
+			// If we get a bad TLS record header, check to see if the
+			// response looks like HTTP and give a more helpful error.
+			// See golang.org/issue/11111.
+			if string(tlsErr.RecordHeader[:]) == "HTTP/" {
+				err = errors.New("http: server gave HTTP response to HTTPS client")
+			}
+		}
+		return nil, didTimeout, err
+	}
+	if !deadline.IsZero() {
+		resp.Body = &cancelTimerBody{
+			stop:          stopTimer,
+			rc:            resp.Body,
+			reqDidTimeout: didTimeout,
+		}
+	}
+	return resp, nil, nil
+}
+
+func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
+    ...
+	if !pc.t.replaceReqCanceler(req.Request, pc.cancelRequest) {
+		pc.t.putOrCloseIdleConn(pc)
+		return nil, errRequestCanceled
+	}
+	defer func() {
+		if err != nil {
+			pc.t.setReqCanceler(req.Request, nil)
+		}
+	}()
+
+	const debugRoundTrip = false
+
+	// Write the request concurrently with waiting for a response,
+	// in case the server decides to reply before reading our full
+	// request body.
+	startBytesWritten := pc.nwrite
+	writeErrCh := make(chan error, 1)
+	pc.writech <- writeRequest{req, writeErrCh, continueCh}
+
+	resc := make(chan responseAndError)
+	pc.reqch <- requestAndChan{
+		req:        req.Request,
+		ch:         resc,
+		addedGzip:  requestedGzip,
+		continueCh: continueCh,
+		callerGone: gone,
+	}
+
+	var respHeaderTimer <-chan time.Time
+	cancelChan := req.Request.Cancel
+	ctxDoneChan := req.Context().Done()
+	for {
+		testHookWaitResLoop()
+		select {
+        ...
+		case <-pc.closech:
+			if debugRoundTrip {
+				req.logf("closech recv: %T %#v", pc.closed, pc.closed)
+			}
+			return nil, pc.mapRoundTripError(req, startBytesWritten, pc.closed)
+		case <-respHeaderTimer:
+			if debugRoundTrip {
+				req.logf("timeout waiting for response headers.")
+			}
+			pc.close(errTimeout)
+			return nil, errTimeout
+		case re := <-resc:
+			if (re.res == nil) == (re.err == nil) {
+				panic(fmt.Sprintf("internal error: exactly one of res or err should be set; nil=%v", re.res == nil))
+			}
+			if debugRoundTrip {
+				req.logf("resc recv: %p, %T/%#v", re.res, re.err, re.err)
+			}
+			if re.err != nil {
+				return nil, pc.mapRoundTripError(req, startBytesWritten, re.err)
+			}
+			return re.res, nil
+		case <-cancelChan:
+			pc.t.CancelRequest(req.Request)
+			cancelChan = nil
+		case <-ctxDoneChan:
+			pc.t.cancelRequest(req.Request, req.Context().Err())
+			cancelChan = nil
+			ctxDoneChan = nil
+		}
+	}
+}
+```
+
+看到这里`cancelChan := req.Request.Cancel`，当接收到close(req.Cancel)时，会执行：pc.t.CancelRequest(req.Request)，如下：
+
+```go
+type Transport struct {
+	idleMu       sync.Mutex
+	closeIdle    bool                                // user has requested to close all idle conns
+	idleConn     map[connectMethodKey][]*persistConn // most recently used at end
+	idleConnWait map[connectMethodKey]wantConnQueue  // waiting getConns
+	idleLRU      connLRU
+
+	reqMu       sync.Mutex
+	reqCanceler map[*Request]func(error)
+    ...
+}
+
+// replaceReqCanceler replaces an existing cancel function. If there is no cancel function
+// for the request, we don't set the function and return false.
+// Since CancelRequest will clear the canceler, we can use the return value to detect if
+// the request was canceled since the last setReqCancel call.
+func (t *Transport) replaceReqCanceler(r *Request, fn func(error)) bool {
+	t.reqMu.Lock()
+	defer t.reqMu.Unlock()
+	_, ok := t.reqCanceler[r]
+	if !ok {
+		return false
+	}
+	if fn != nil {
+		t.reqCanceler[r] = fn
+	} else {
+		delete(t.reqCanceler, r)
+	}
+	return true
+}
+
+// CancelRequest cancels an in-flight request by closing its connection.
+// CancelRequest should only be called after RoundTrip has returned.
+//
+// Deprecated: Use Request.WithContext to create a request with a
+// cancelable context instead. CancelRequest cannot cancel HTTP/2
+// requests.
+func (t *Transport) CancelRequest(req *Request) {
+	t.cancelRequest(req, errRequestCanceled)
+}
+
+// Cancel an in-flight request, recording the error value.
+func (t *Transport) cancelRequest(req *Request, err error) {
+	t.reqMu.Lock()
+	cancel := t.reqCanceler[req]
+	delete(t.reqCanceler, req)
+	t.reqMu.Unlock()
+	if cancel != nil {
+		cancel(err)
+	}
+}
+
+func (pc *persistConn) cancelRequest(err error) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	pc.canceledErr = err
+	pc.closeLocked(errRequestCanceled)
+}
+
+func (pc *persistConn) closeLocked(err error) {
+	if err == nil {
+		panic("nil error")
+	}
+	pc.broken = true
+	if pc.closed == nil {
+		pc.closed = err
+		pc.t.decConnsPerHost(pc.cacheKey)
+		// Close HTTP/1 (pc.alt == nil) connection.
+		// HTTP/2 closes its connection itself.
+		if pc.alt == nil {
+			if err != errCallerOwnsConn {
+				pc.conn.Close()
+			}
+			close(pc.closech)
+		}
+	}
+	pc.mutateHeaderFunc = nil
+}
+
+// decConnsPerHost decrements the per-host connection count for key,
+// which may in turn give a different waiting goroutine permission to dial.
+func (t *Transport) decConnsPerHost(key connectMethodKey) {
+	if t.MaxConnsPerHost <= 0 {
+		return
+	}
+
+	t.connsPerHostMu.Lock()
+	defer t.connsPerHostMu.Unlock()
+	n := t.connsPerHost[key]
+	if n == 0 {
+		// Shouldn't happen, but if it does, the counting is buggy and could
+		// easily lead to a silent deadlock, so report the problem loudly.
+		panic("net/http: internal error: connCount underflow")
+	}
+
+	// Can we hand this count to a goroutine still waiting to dial?
+	// (Some goroutines on the wait list may have timed out or
+	// gotten a connection another way. If they're all gone,
+	// we don't want to kick off any spurious dial operations.)
+	if q := t.connsPerHostWait[key]; q.len() > 0 {
+		done := false
+		for q.len() > 0 {
+			w := q.popFront()
+			if w.waiting() {
+				go t.dialConnFor(w)
+				done = true
+				break
+			}
+		}
+		if q.len() == 0 {
+			delete(t.connsPerHostWait, key)
+		} else {
+			// q is a value (like a slice), so we have to store
+			// the updated q back into the map.
+			t.connsPerHostWait[key] = q
+		}
+		if done {
+			return
+		}
+	}
+
+	// Otherwise, decrement the recorded count.
+	if n--; n == 0 {
+		delete(t.connsPerHost, key)
+	} else {
+		t.connsPerHost[key] = n
+	}
+}
+```
+
+replaceReqCanceler将http.Request对应的reqCanceler函数设置为：http.persistConn.reqCanceler。它会关闭底层连接，同时将http.persistConn从http.Transport.connsPerHostWait以及http.Transport.connsPerHost中剔除
+
+最后执行close(pc.closech)：
+
+```go
+func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
+	testHookEnterRoundTrip()
+	if !pc.t.replaceReqCanceler(req.Request, pc.cancelRequest) {
+		pc.t.putOrCloseIdleConn(pc)
+		return nil, errRequestCanceled
+	}
+	pc.mu.Lock()
+	pc.numExpectedResponses++
+	headerFn := pc.mutateHeaderFunc
+	pc.mu.Unlock()
+
+	if headerFn != nil {
+		headerFn(req.extraHeaders())
+	}
+
+	// Ask for a compressed version if the caller didn't set their
+	// own value for Accept-Encoding. We only attempt to
+	// uncompress the gzip stream if we were the layer that
+	// requested it.
+	requestedGzip := false
+	if !pc.t.DisableCompression &&
+		req.Header.Get("Accept-Encoding") == "" &&
+		req.Header.Get("Range") == "" &&
+		req.Method != "HEAD" {
+		// Request gzip only, not deflate. Deflate is ambiguous and
+		// not as universally supported anyway.
+		// See: https://zlib.net/zlib_faq.html#faq39
+		//
+		// Note that we don't request this for HEAD requests,
+		// due to a bug in nginx:
+		//   https://trac.nginx.org/nginx/ticket/358
+		//   https://golang.org/issue/5522
+		//
+		// We don't request gzip if the request is for a range, since
+		// auto-decoding a portion of a gzipped document will just fail
+		// anyway. See https://golang.org/issue/8923
+		requestedGzip = true
+		req.extraHeaders().Set("Accept-Encoding", "gzip")
+	}
+
+	var continueCh chan struct{}
+	if req.ProtoAtLeast(1, 1) && req.Body != nil && req.expectsContinue() {
+		continueCh = make(chan struct{}, 1)
+	}
+
+	if pc.t.DisableKeepAlives && !req.wantsClose() {
+		req.extraHeaders().Set("Connection", "close")
+	}
+
+	gone := make(chan struct{})
+	defer close(gone)
+
+	defer func() {
+		if err != nil {
+			pc.t.setReqCanceler(req.Request, nil)
+		}
+	}()
+
+	const debugRoundTrip = false
+
+	// Write the request concurrently with waiting for a response,
+	// in case the server decides to reply before reading our full
+	// request body.
+	startBytesWritten := pc.nwrite
+	writeErrCh := make(chan error, 1)
+	pc.writech <- writeRequest{req, writeErrCh, continueCh}
+
+	resc := make(chan responseAndError)
+	pc.reqch <- requestAndChan{
+		req:        req.Request,
+		ch:         resc,
+		addedGzip:  requestedGzip,
+		continueCh: continueCh,
+		callerGone: gone,
+	}
+
+	var respHeaderTimer <-chan time.Time
+	cancelChan := req.Request.Cancel
+	ctxDoneChan := req.Context().Done()
+	for {
+		testHookWaitResLoop()
+		select {
+		case err := <-writeErrCh:
+			if debugRoundTrip {
+				req.logf("writeErrCh resv: %T/%#v", err, err)
+			}
+			if err != nil {
+				pc.close(fmt.Errorf("write error: %v", err))
+				return nil, pc.mapRoundTripError(req, startBytesWritten, err)
+			}
+			if d := pc.t.ResponseHeaderTimeout; d > 0 {
+				if debugRoundTrip {
+					req.logf("starting timer for %v", d)
+				}
+				timer := time.NewTimer(d)
+				defer timer.Stop() // prevent leaks
+				respHeaderTimer = timer.C
+			}
+		case <-pc.closech:
+			if debugRoundTrip {
+				req.logf("closech recv: %T %#v", pc.closed, pc.closed)
+			}
+			return nil, pc.mapRoundTripError(req, startBytesWritten, pc.closed)
+		case <-respHeaderTimer:
+			if debugRoundTrip {
+				req.logf("timeout waiting for response headers.")
+			}
+			pc.close(errTimeout)
+			return nil, errTimeout
+		case re := <-resc:
+			if (re.res == nil) == (re.err == nil) {
+				panic(fmt.Sprintf("internal error: exactly one of res or err should be set; nil=%v", re.res == nil))
+			}
+			if debugRoundTrip {
+				req.logf("resc recv: %p, %T/%#v", re.res, re.err, re.err)
+			}
+			if re.err != nil {
+				return nil, pc.mapRoundTripError(req, startBytesWritten, re.err)
+			}
+			return re.res, nil
+		case <-cancelChan:
+			pc.t.CancelRequest(req.Request)
+			cancelChan = nil
+		case <-ctxDoneChan:
+			pc.t.cancelRequest(req.Request, req.Context().Err())
+			cancelChan = nil
+			ctxDoneChan = nil
+		}
+	}
+}
+
+// mapRoundTripError returns the appropriate error value for
+// persistConn.roundTrip.
+//
+// The provided err is the first error that (*persistConn).roundTrip
+// happened to receive from its select statement.
+//
+// The startBytesWritten value should be the value of pc.nwrite before the roundTrip
+// started writing the request.
+func (pc *persistConn) mapRoundTripError(req *transportRequest, startBytesWritten int64, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	// If the request was canceled, that's better than network
+	// failures that were likely the result of tearing down the
+	// connection.
+	if cerr := pc.canceled(); cerr != nil {
+		return cerr
+	}
+
+	// See if an error was set explicitly.
+	req.mu.Lock()
+	reqErr := req.err
+	req.mu.Unlock()
+	if reqErr != nil {
+		return reqErr
+	}
+
+	if err == errServerClosedIdle {
+		// Don't decorate
+		return err
+	}
+
+	if _, ok := err.(transportReadFromServerError); ok {
+		// Don't decorate
+		return err
+	}
+	if pc.isBroken() {
+		<-pc.writeLoopDone
+		if pc.nwrite == startBytesWritten {
+			return nothingWrittenError{err}
+		}
+		return fmt.Errorf("net/http: HTTP/1.x transport connection broken: %v", err)
+	}
+	return err
+}
+```
+
+在persistConn.roundTrip中，如果接收到pc.closech信号，则直接返回错误：`return nil, pc.mapRoundTripError(req, startBytesWritten, pc.closed)`
+
+**至此可以总结如下：http.Client.Timeout涵盖了HTTP请求从连接建立，请求发送，接收回应，重定向，以及读取http.Response.Body的整个生命周期的超时时间**
+
+```
+// Timeout specifies a time limit for requests made by this
+// Client. The timeout includes connection time, any
+// redirects, and reading the response body. The timer remains
+// running after Get, Head, Post, or Do return and will
+// interrupt reading of the Response.Body.
+```
 
 ## http.Client.IdleConnTimeout
 
@@ -1204,6 +2068,13 @@ HTTP keep-alive，也即HTTP长连接，表示在同一个TCP socket上发送多
 * TCP keepalive：用于探测TCP sockets是否存活
 * HTTP keep-alive：用于复用TCP sockets
 * HTTP连接池：用于管理HTTP keep-alive sockets，供HTTP请求使用
+
+## 总结
+
+* http.Client.Timeout：http.Client.Timeout涵盖了HTTP请求从连接建立，请求发送，接收回应，重定向，以及读取http.Response.Body的整个生命周期的超时时间
+* http.Client.IdleConnTimeout：HTTP keep-alives超时时间(http.persistConn在使用完毕放入空闲连接池时，会重置http.Client.IdleConnTimeout的HTTP keep-alives超时时间，如果在这段时间内还没有被复用，则会触发超时，执行关闭逻辑；http.persistConn在从空闲连接池中被捞出来复用时，会设置为非空闲状态，不会触发实际的超时操作)
+* net.Dialer.Timeout：底层连接建立的超时时间
+* net.Dialer.KeepAlive：设置TCP的keepalive参数(syscall.TCP_KEEPINTVL以及syscall.TCP_KEEPIDLE)
 
 ## Refs
 

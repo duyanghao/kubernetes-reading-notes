@@ -26,3 +26,5 @@ Kubernetes reading notes based on v1.17.4
 * [K8s&云原生技术开放日（深圳站）- harbor企业级方案设计与落地实践](https://cloud.tencent.com/developer/salon/salon-1151)
 
   直播PPT见[这里](shares/harbor-in-practice.pptx)
+  
+![](images/duyanghao.png)

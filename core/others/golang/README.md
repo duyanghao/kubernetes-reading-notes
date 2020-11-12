@@ -8,5 +8,5 @@ Golang
 * [golang runtime](golang-runtime.md)
 * [golang 同步互斥](golang-sync.md)
 * [golang gc](golang-gc.md)
-* [golang mod](golang-mod.md)
+* [golang mod](golang-module.md)
 * [golang test](golang-test.md)

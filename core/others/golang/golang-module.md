@@ -174,6 +174,75 @@ require (
 
 这里，如果A1最开始依赖的模块是C1.3而非C1.2，那么C1.3将会在构建图中保留下来(因为C1.3并没有依赖D模块)
 
+## go mod&sum格式
+
+go.mod以及go.sum成对出现在项目根目录中，go.mod负责记录需求列表(用于构建依赖模块)，而go.sum用于记录安全性以及完整性校验，下面依次介绍两种文件格式：
+
+1. go.mod
+
+   * module：代表go模块名，也即被其它模块引用的名称，位于文件第一行
+   * require：最小需求列表(依赖模块及其版本信息)
+   * replace：通过replace将一个模块的地址转换为其它地址，用于解决某些依赖模块地址发生改变的场景。同时import命令可以无需改变(无侵入)
+   * exclude：明确排除一些依赖包中不想导入或者有问题的版本
+
+   ```bash
+   module tkestack.io/tke
+   
+   go 1.12
+   
+   replace (
+           // wait https://github.com/chartmuseum/storage/pull/34 to be merged
+           github.com/chartmuseum/storage => github.com/choujimmy/storage v0.5.1-0.20191225102245-210f7683d0a6
+           github.com/deislabs/oras => github.com/deislabs/oras v0.8.0
+           // wait https://github.com/dexidp/dex/pull/1607 to be merged
+           github.com/dexidp/dex => github.com/choujimmy/dex v0.0.0-20191225100859-b1cb4b898bb7
+           k8s.io/client-go => k8s.io/client-go v0.17.0
+   )
+   
+   require (
+           github.com/AlekSi/pointer v1.1.0
+           github.com/Azure/go-autorest v13.3.1+incompatible // indirect
+           github.com/Masterminds/semver v1.4.2 // indirect
+           github.com/NYTimes/gziphandler v1.1.1 // indirect
+           github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5 // indirect
+           github.com/aws/aws-sdk-go v1.25.7
+           github.com/bitly/go-simplejson v0.5.0
+           github.com/blang/semver v3.5.1+incompatible
+           github.com/casbin/casbin/v2 v2.1.2
+           github.com/chartmuseum/storage v0.5.0
+           k8s.io/client-go v12.0.0+incompatible
+           ...
+   )
+   ```
+
+2. go.sum
+
+   ```
+   <模块> <版本>[/go.mod] <哈希>
+   ```
+
+   * 带有/go.mod代表该版本模块的go.mod文件hash值
+   * 不带/go.mod代表该版本模块源代码的hash值
+
+   ```bash
+   cloud.google.com/go v0.26.0/go.mod h1:aQUYkXzVsufM+DwF1aE+0xfcU+56JwCaLick0ClmMTw=
+   cloud.google.com/go v0.34.0/go.mod h1:aQUYkXzVsufM+DwF1aE+0xfcU+56JwCaLick0ClmMTw=
+   cloud.google.com/go v0.38.0 h1:ROfEUZz+Gh5pa62DJWXSaonyu3StP6EA6lPEXPI6mCo=
+   cloud.google.com/go v0.38.0/go.mod h1:990N+gfupTy94rShfmMCWGDn0LpTmnzTp2qbd1dvSRU=
+   cloud.google.com/go v0.41.0 h1:NFvqUTDnSNYPX5oReekmB+D+90jrJIcVImxQ3qrBVgM=
+   cloud.google.com/go v0.41.0/go.mod h1:OauMR7DV8fzvZIl2qg6rkaIhD/vmgk4iwEw/h6ercmg=
+   contrib.go.opencensus.io/exporter/ocagent v0.4.12/go.mod h1:450APlNTSR6FrvC3CTRqYosuDstRB9un7SOx2k/9ckA=
+   github.com/AlekSi/pointer v1.1.0 h1:SSDMPcXD9jSl8FPy9cRzoRaMJtm9g9ggGTxecRUbQoI=
+   github.com/AlekSi/pointer v1.1.0/go.mod h1:y7BvfRI3wXPWKXEBhU71nbnIEEZX0QTSB2Bj48UJIZE=
+   github.com/Azure/azure-sdk-for-go v16.2.1+incompatible/go.mod h1:9XXNKU+eRnpl9moKnB4QOLf1HestfXbmab5FXxiDBjc=
+   github.com/Azure/azure-sdk-for-go v31.1.0+incompatible h1:5SzgnfAvUBdBwNTN23WLfZoCt/rGhLvd7QdCAaFXgY4=
+   github.com/Azure/azure-sdk-for-go v31.1.0+incompatible/go.mod h1:9XXNKU+eRnpl9moKnB4QOLf1HestfXbmab5FXxiDBjc=
+   github.com/Azure/azure-sdk-for-go v35.0.0+incompatible h1:PkmdmQUmeSdQQ5258f4SyCf2Zcz0w67qztEg37cOR7U=
+   github.com/Azure/azure-sdk-for-go v35.0.0+incompatible/go.mod h1:9XXNKU+eRnpl9moKnB4QOLf1HestfXbmab5FXxiDBjc=
+   ```
+
+   go.sum文件可以不存在，当go.sum文件不存在时默认会到远程校验数据库进行校验(通过GOSUMDB设置地址)，当然也可以设置为不校验(GONOSUMDB)
+
 ## 总结
 
 * 对单个模块的修改可能会连带影响其它模块
@@ -182,12 +251,28 @@ require (
 * 最小构建算法中的'最小'代表：最小修改&最小需求列表&依赖模块的最小版本
 * 升级某个模块不会引起其它模块的降级或者删除
 * 降级某个模块会在构建图中将这个模块的高版本删除，同时回溯删除依赖这些高版本的模块，直到查找到不依赖这些高版本的最新模块版本为止，同时会保留其它不需要降级的包
+* go.mod文件出现indirect标记的情况有如下两种：
+  * A1的某个模块没有使用go module(也即该模块没有go.mod文件)，那么必须将该模块的间接依赖记录在A1的需求列表中
+  * A1对某个间接依赖模块有特殊的版本要求，必须显示指明版本信息(例如上述的D1.4和E1.3)，以便go可以正确构建依赖模块
 
-## 常用命令
+## 最佳实践
 
+* 尽量不要手动修改go.mod文件，通过go命令来操作go.mod文件
+* 尽量遵守semantic version(语义化版本)发布和管理模块
+* 通过go build编译项目时，如果在go.mod文件中指定了直接依赖模块版本，则根据最小版本选择算法会下载对应版本；否则go build会默认自动下载直接依赖模块的最新semantic version，若没有semantic version则自动生成标签：`(v0.0.0)-(提交UTC时间戳)-(commit id前12位)`作为版本标识，例如：`github.com/docker/libtrust v0.0.0-20160708172513-aabc10ec26b7`
+* 利用go mod tidy进行自动整理操作。该模块会清理需求列表：删除不需要的需求项，添加需要的需求项
+* 利用go get升级或者降级某个依赖模块；go get -u升级所有依赖模块(直接以及间接)
+* 本地调试：如果本地有依赖模块还未发布，则可以利用如下方法进行调试：
+  * replace：将依赖模块修改成本地依赖包地址，这样就可以在本地修改依赖包的同时进行编译调试了(需要注意go.mod文件内容发生修改，注意不要提交)：`replace k8s.io/client-go => ~/go/src/k8s.io/client-go v0.17.0-dirty-fix`
+  * vendor：默认情况下go build会忽略vendor目录；当添加-mod=vendor选项，go build会优先查找vendor目录下的依赖模块。因此可以将本地开发的依赖包放置在vendor目录，并将vendor通过.gitignore文件设置在版本控制之外，这样可以满足本地调试的同时不影响版本提交
+* 当需要列举本项目所有依赖模块时(包括间接依赖)使用：`go list -m all`；而列举某个依赖模块的所有版本使用：`go list -m -versions xxx`，例如：`go list -m -versions k8s.io/client-go`
+* 当一些依赖存在问题时，可以通过`go clean -modcache`清理已下载的依赖文件
+* GO111MODULE值含义如下(建议强制开启)：
+  * off：强制关闭go module，使用GOPATH
+  * on：强制开启go module(建议)
+  * auto：如果当前模块在$GOPATH/src中，则不使用go module；如果不存在$GOPATH/src，且存在go.mod文件则使用go module
 
-
-
+* 设置GOPROXY为`GOPROXY=https://goproxy.cn,direct`，代表先从代理服务器https://goproxy.cn下载依赖，如果失败(such as 404)则直接从原地址(such as github)下载
 
 ## Refs
 

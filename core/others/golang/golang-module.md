@@ -13,7 +13,7 @@ Golang module概述
 * [gopkg.in](https://labix.org/gopkg.in)(2014.03)：通过import路径中添加版本号来标示不同版本，而实际代码存放于github中，go通过redirect获取代码。例如(import gopkg.in/yaml.v1，实际代码地址为：https://github.com/go-yaml/yaml)
 * vendor(2015.06)；Go 1.5版本引入vendor(类似godep)，存放于项目根目录，编译时优先使用vendor目录，之后再去GOPATH，GOROOT目录查找(解决GOPATH无法管控依赖变更和丢失的问题)
 * [dep](https://github.com/golang/dep)(2016.08)：dep期望统一Golang依赖管理，虽然提供了兼容其它依赖管理工具的功能，但是本质上还是利用GOPATH和vendor解决依赖管理
-* [go module](https://research.swtch.com/vgo-principles)(2018.08)：Go 1.11发布的官方依赖管理解决方案，并最终统一了Go依赖管理(by Russ Cox)。go module以semantic version(语义版本控制)和Minimal Version Selection, MVS(最小版本选择)为核心，相比dep更具稳定性；同时也解决了vendor代码库依赖过于庞大，造成存储浪费的问题
+* [go module](https://research.swtch.com/vgo-principles)(2018.08)：Go 1.11发布的官方依赖管理解决方案，并最终统一了Go依赖管理(by Russ Cox)。go module以semantic version(语义版本化)和Minimal Version Selection, MVS(最小版本选择)为核心，相比dep更具稳定性；同时也解决了vendor代码库依赖过于庞大，造成存储浪费的问题
 
 通过如上历史，我们可以看出：go依赖管理的发展历史，其实就是go去google的历史(google内部没有强烈的版本管理需求)，也是典型的社区驱动开发的例子
 
@@ -36,23 +36,24 @@ golang使用semantic version来标识package的版本。具体来说：
 >> A [versioned Go command](https://research.swtch.com/vgo-intro) must decide which module versions to use in each build. I call this list of modules and versions for use in a given build the *build list*. For stable development, today's build list must also be tomorrow's build list. But then developers must also be allowed to change the build list: to upgrade all modules, to upgrade one module, or to downgrade one module.
 
 >> The version selection problem therefore is to define the meaning of, and to give algorithms implementing, these four operations on build lists:
-> 1.Construct the current build list.
-> 2.Upgrade all modules to their latest versions.
-> 3.Upgrade one module to a specific newer version.
-> 4.Downgrade one module to a specific older version.
+>>
+>> 1.Construct the current build list.
+>> 2.Upgrade all modules to their latest versions.
+>> 3.Upgrade one module to a specific newer version.
+>> 4.Downgrade one module to a specific older version.
 
 这里将一次构建(go build)中所依赖模块及其版本列表称为build list，对于一个稳定发展的项目，build list应该尽可能保持不变，同时也允许开发人员修改build list，比如升级或者降级依赖。而依赖管理因此也可以归纳为如下四个操作：
 
 * 构建项目当前build list
 * 升级所有依赖模块到它们的最新版本
 * 升级某个依赖模块到指定版本
-* 将某个依赖模块降级到固定版本
+* 将某个依赖模块降级到指定版本
 
 在Minimal version selection之前，Go的选择算法很简单，且提供了 2 种不同的版本选择算法，但都不正确：
 
-第 1 种算法是 `go get` 的默认行为：若你本地有一个版本，则使用此版本，或者下载使用最新的版本。这种模式使用的版本太老：若你已安装了 B 1.1，并执行 `go get` 下载，`go get` 不会更新到 B 1.2，从而可能因为 B 1.1 太老而导致构建失败或有 bug。
+第 1 种算法是 `go get` 的默认行为：若你本地有一个版本，则使用此版本，否则下载使用最新的版本。这种模式将导致使用的版本太老：若你已安装了B 1.1，并执行 `go get` 下载，`go get` 不会更新到B 1.2，从而导致因为B 1.1 太老构建失败或有bug
 
-第 2 种算法是 `go get -u` 的行为：下载并使用所有模块的最新版本。这种模式可能会因为版本都太新而失败：若你运行 `go get -u` 来下载 A，会正确地更新到 B 1.2。同时也会更新到 C 1.3 和 E 1.3，但这可能不是 A 想要的，因为这些版本可能未经测试，所以可能难以正常工作
+第 2 种算法是 `go get -u` 的行为：下载并使用所有模块的最新版本。这种模式可能会因为版本太新而失败：若你运行 `go get -u` 来下载A依赖模块，会正确地更新到B 1.2。同时也会更新到C 1.3 和E 1.3，但这可能不是 A 想要的，因为这些版本可能未经测试，所以可能难以正常工作
 
 这 2 种算法的构建是低保真构建（Low-Fidelity Builds）：虽然都想复现模块 A 的作者所使用的构建，但这些构建都因某些不明确的原因而变得有些偏差。在详细介绍最小版本选择算法后，我们将一探究竟为何最小版本选择算法可以产生高保真的构建：
 

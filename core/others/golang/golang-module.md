@@ -37,10 +37,13 @@ golang使用semantic version来标识package的版本。具体来说：
 
 >> The version selection problem therefore is to define the meaning of, and to give algorithms implementing, these four operations on build lists:
 >>
->> 1.Construct the current build list.
->> 2.Upgrade all modules to their latest versions.
->> 3.Upgrade one module to a specific newer version.
->> 4.Downgrade one module to a specific older version.
+>> 1. Construct the current build list.
+>>
+>> 2. Upgrade all modules to their latest versions.
+>>
+>> 3. Upgrade one module to a specific newer version.
+>>
+>> 4. Downgrade one module to a specific older version.
 
 这里将一次构建(go build)中所依赖模块及其版本列表称为build list，对于一个稳定发展的项目，build list应该尽可能保持不变，同时也允许开发人员修改build list，比如升级或者降级依赖。而依赖管理因此也可以归纳为如下四个操作：
 
@@ -53,19 +56,23 @@ golang使用semantic version来标识package的版本。具体来说：
 
 第 1 种算法是 `go get` 的默认行为：若你本地有一个版本，则使用此版本，否则下载使用最新的版本。这种模式将导致使用的版本太老：若你已安装了B 1.1，并执行 `go get` 下载，`go get` 不会更新到B 1.2，从而导致因为B 1.1 太老构建失败或有bug
 
-第 2 种算法是 `go get -u` 的行为：下载并使用所有模块的最新版本。这种模式可能会因为版本太新而失败：若你运行 `go get -u` 来下载A依赖模块，会正确地更新到B 1.2。同时也会更新到C 1.3 和E 1.3，但这可能不是 A 想要的，因为这些版本可能未经测试，所以可能难以正常工作
+第 2 种算法是 `go get -u` 的行为：下载并使用所有模块的最新版本。这种模式可能会因为版本太新而失败：若你运行 `go get -u` 来下载A依赖模块，会正确地更新到B 1.2。同时也会更新到C 1.3 和E 1.3，但这可能不是 A 想要的，因为这些版本可能未经测试，无法正常工作
 
-这 2 种算法的构建是低保真构建（Low-Fidelity Builds）：虽然都想复现模块 A 的作者所使用的构建，但这些构建都因某些不明确的原因而变得有些偏差。在详细介绍最小版本选择算法后，我们将一探究竟为何最小版本选择算法可以产生高保真的构建：
+这 2 种算法的构建是低保真构建（Low-Fidelity Builds）：虽然都想复现模块 A 的作者所使用的构建，但这些构建都因某些不明确的原因而变得有些偏差。在详细介绍最小版本选择算法后，我们将明白为什么最小版本选择算法可以产生高保真的构建：
 
 >> Minimal version selection assumes that each module declares its own dependency requirements: a list of minimum versions of other modules. Modules are assumed to follow the import compatibility rule—packages in any newer version should work as well as older ones—so a dependency requirement gives only a minimum version, never a maximum version or a list of incompatible later versions.
 
 >> Then the definitions of the four operations are:
-> 1.To construct the build list for a given target: start the list with the target itself, and then append each requirement's own build list. If a module appears in the list multiple times, keep only the newest version.
-> 2.To upgrade all modules to their latest versions: construct the build list, but read each requirement as if it requested the latest module version.
-> 3.To upgrade one module to a specific newer version: construct the non-upgraded build list and then append the new module's build list. If a module appears in the list multiple times, keep only the newest version.
-> 4.To downgrade one module to a specific older version: rewind the required version of each top-level requirement until that requirement's build list no longer refers to newer versions of the downgraded module.
+>>
+>> 1. To construct the build list for a given target: start the list with the target itself, and then append each requirement's own build list. If a module appears in the list multiple times, keep only the newest version.
+>>
+>> 2. To upgrade all modules to their latest versions: construct the build list, but read each requirement as if it requested the latest module version.
+>>
+>> 3. To upgrade one module to a specific newer version: construct the non-upgraded build list and then append the new module's build list. If a module appears in the list multiple times, keep only the newest version.
+>>
+>> 4. To downgrade one module to a specific older version: rewind the required version of each top-level requirement until that requirement's build list no longer refers to newer versions of the downgraded module.
 
-Minimal version selection也即最小版本选择，如果光看下面的操作可能会很迷惑(或者矛盾)：明明是选择最新的版本(keep only the newest version)，为什么叫最小版本选择？
+Minimal version selection也即最小版本选择，如果光看上述的引用可能会很迷惑(或者矛盾)：明明是选择最新的版本(keep only the newest version)，为什么叫最小版本选择？
 
 我对最小版本选择算法中'最小'的理解如下：
 

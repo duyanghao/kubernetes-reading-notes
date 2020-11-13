@@ -272,15 +272,15 @@ go.mod以及go.sum一般会成对出现在项目根目录中。其中，go.mod�
 * 利用go get升级或者降级某个依赖模块；go get -u升级所有依赖模块(直接以及间接)
 * 本地调试：如果本地有依赖模块还未发布，则可以利用如下方法进行调试：
   * replace：将依赖模块修改成本地依赖包地址，这样就可以在本地修改依赖包的同时进行编译调试了(需要注意go.mod文件内容发生修改，注意不要提交)：`replace k8s.io/client-go => ~/go/src/k8s.io/client-go v0.17.0-dirty-fix`
-  * vendor：默认情况下go build会忽略vendor目录；当添加-mod=vendor选项，go build会优先查找vendor目录下的依赖模块。因此可以将本地开发的依赖包放置在vendor目录，并将vendor通过.gitignore文件设置在版本控制之外，这样可以满足本地调试的同时不影响版本提交
+  * vendor：默认情况下go build会忽略vendor目录；当添加-mod=vendor选项时，go build会优先查找vendor目录下的依赖模块。因此可以将本地开发的依赖包放置在vendor目录，并将vendor通过.gitignore文件设置在版本控制之外，这样既可以满足本地调试，同时也不影响版本提交
 * 当需要列举本项目所有依赖模块时(包括间接依赖)使用：`go list -m all`；而列举某个依赖模块的所有版本使用：`go list -m -versions xxx`，例如：`go list -m -versions k8s.io/client-go`
 * 当一些依赖存在问题时，可以通过`go clean -modcache`清理已下载的依赖文件
 * GO111MODULE值含义如下(建议强制开启)：
   * off：强制关闭go module，使用GOPATH
   * on：强制开启go module(建议)
-  * auto：如果当前模块在$GOPATH/src中，则不使用go module；如果不存在$GOPATH/src，且存在go.mod文件则使用go module
+  * auto：如果当前模块在$GOPATH/src中，则不使用go module；如果该模块不存在$GOPATH/src下，且拥有go.mod文件则使用go module
 
-* 设置GOPROXY为`GOPROXY=https://goproxy.cn,direct`，代表先从代理服务器https://goproxy.cn下载依赖，如果失败(such as 404)则直接从原地址(such as github)下载
+* 设置GOPROXY为：`GOPROXY=https://goproxy.cn,direct`，代表先从代理服务器`https://goproxy.cn`下载依赖，如果失败(such as 404)则直接从原地址(such as github)下载
 
 ## Refs
 

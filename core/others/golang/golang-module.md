@@ -5,7 +5,7 @@ Golang module概述
 
 >> In the world of software management there exists a dreaded place called “dependency hell.” The bigger your system grows and the more packages you integrate into your software, the more likely you are to find yourself, one day, in this pit of despair.
 
-依赖管理是一个语言必须要解决的问题。golang依赖管理发展历史可以归纳如下：
+依赖管理是一个语言必须要解决的问题，而且随着项目依赖量以及复杂程度不断增加会显得更加重要。golang依赖管理发展历史可以归纳如下：
 
 * goinstall(2010.02)：将依赖的代码库下载到本地，并通过import引用这些库
 * go get(2011.12)：go get代替goinstall

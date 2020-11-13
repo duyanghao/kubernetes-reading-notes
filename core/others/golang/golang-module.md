@@ -107,7 +107,7 @@ Minimal version selection也即最小版本选择，如果光看上述的引用�
 
 ![img](https://research.swtch.com/version-select-3.png)
 
-这里面添加了新的模块：E1.3，G1.1，F1.1以及C1.3。新rough list会将新引入的依赖模块和旧的rough模块(黄色模块)进行合并，并从中选取最大版本，最终构建final list(上图红线标识模块)。为了得到上述结果，需添加一些东西到 A 的需求列表中，因为按照正常的构建流程，依赖包不应该包括D1.4和E1.3，而是D1.3和E1.2。这里面就会涉及[Algorithm R. Compute a Minimal Requirement List](https://research.swtch.com/vgo-mvs#algorithm_r)，该算法核心是创建一个能重复构建模块依赖的最小需求列表，也即只保留必须的依赖模块信息(比如直接依赖以及特殊依赖)，并存放于go.mod文件中。比如上述例子中A1的go.mod文件会构建如下：
+这里面添加了新的依赖模块：E1.3，G1.1，F1.1以及C1.3。新rough build list会将新引入的依赖模块和旧的rough build list模块(黄色部分)进行合并，并从中选取最大版本，最终构建final build list(上图红线标识模块)。为了得到上述结果，需要添加一些依赖模块到A的需求列表中，因为按照正常的构建流程，依赖包不应该包括D1.4和E1.3，而是D1.3和E1.2。这里面就会涉及[Algorithm R. Compute a Minimal Requirement List](https://research.swtch.com/vgo-mvs#algorithm_r)，该算法核心是创建一个能重复构建模块依赖的最小需求列表，也即只保留必须的依赖模块信息(比如直接依赖以及特殊依赖)，并存放于go.mod文件中。比如上述例子中A1的go.mod文件会构建如下：
 
 ```bash
 module A1

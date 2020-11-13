@@ -114,9 +114,9 @@ module A1
 go 1.14
 require (
 	B1.2
-  C1.3
-  D1.4 // indirect
-  E1.3 // indirect
+	C1.3
+	D1.4 // indirect
+	E1.3 // indirect
 )
 ```
 
@@ -148,8 +148,8 @@ module A1
 go 1.14
 require (
 	B1.2
-  C1.3
-  D1.4 // indirect
+	C1.3
+	D1.4 // indirect
 )
 ```
 
@@ -174,9 +174,9 @@ module A1
 go 1.14
 require (
 	B1.1
-  C1.1
-  D1.2 // indirect
-  E1.2 // indirect
+	C1.1
+	D1.2 // indirect
+	E1.2 // indirect
 )
 ```
 

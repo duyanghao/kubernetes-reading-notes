@@ -5,23 +5,23 @@ Golang module概述
 
 >> In the world of software management there exists a dreaded place called “dependency hell.” The bigger your system grows and the more packages you integrate into your software, the more likely you are to find yourself, one day, in this pit of despair.
 
-依赖管理是一个语言必须要解决的问题，而且随着项目依赖量以及复杂程度不断增加会显得更加重要。golang依赖管理发展历史可以归纳如下：
+依赖管理是一个语言必须要解决的问题，而且随着项目依赖的模块量以及复杂程度不断增加会显得更加重要。Go依赖管理发展历史可以归纳如下：
 
 * goinstall(2010.02)：将依赖的代码库下载到本地，并通过import引用这些库
 * go get(2011.12)：go get代替goinstall
 * godep(2013.09)：godep提供了一个依赖文件，记录所有依赖具体的版本和路径，编译时将依赖下载到workspace中，然后切换到指定版本，并设置GOPATH访问(解决go get没有版本管理的缺陷)
-* [gopkg.in](https://labix.org/gopkg.in)(2014.03)：通过import路径中添加版本号来标示不同版本，而实际代码存放于github中，go通过redirect获取代码。例如(import gopkg.in/yaml.v1，实际代码地址为：https://github.com/go-yaml/yaml)
+* [gopkg.in](https://labix.org/gopkg.in)(2014.03)：通过import路径中添加版本号来标示不同版本，而实际代码存放于github中，go通过redirect获取代码。例如(`import gopkg.in/yaml.v1`，实际代码地址为：`https://github.com/go-yaml/yaml`)
 * vendor(2015.06)；Go 1.5版本引入vendor(类似godep)，存放于项目根目录，编译时优先使用vendor目录，之后再去GOPATH，GOROOT目录查找(解决GOPATH无法管控依赖变更和丢失的问题)
 * [dep](https://github.com/golang/dep)(2016.08)：dep期望统一Golang依赖管理，虽然提供了兼容其它依赖管理工具的功能，但是本质上还是利用GOPATH和vendor解决依赖管理
-* [go module](https://research.swtch.com/vgo-principles)(2018.08)：Go 1.11发布的官方依赖管理解决方案，并最终统一了Go依赖管理(by Russ Cox)。go module以semantic version(语义版本化)和Minimal Version Selection, MVS(最小版本选择)为核心，相比dep更具稳定性；同时也解决了vendor代码库依赖过于庞大，造成存储浪费的问题
+* [Go Modules](https://research.swtch.com/vgo-principles)(2018.08)：Go 1.11发布的官方依赖管理解决方案，并最终统一了Go依赖管理(by Russ Cox)。Go Modules以semantic version(语义版本化)和Minimal Version Selection, MVS(最小版本选择)为核心，相比dep更具稳定性；同时也解决了vendor代码库依赖过于庞大，造成存储浪费的问题
 
 通过如上历史，我们可以看出：go依赖管理的发展历史，其实就是go去google的历史(google内部没有强烈的版本管理需求)，也是典型的社区驱动开发的例子
 
-接下来，我将详细探讨go module的两大核心概念：semantic version(语义化版本)和Minimal Version Selection, MVS(最小版本选择)
+接下来，我将详细探讨Go Modules的两大核心概念：semantic version(语义化版本)和Minimal Version Selection, MVS(最小版本选择)
 
 ## [semantic version](https://semver.org/)
 
-golang使用semantic version来标识package的版本。具体来说：
+Go使用semantic version来标识package的版本。具体来说：
 
 * MAJOR version when you make incompatible API changes(不兼容的修改)
 * MINOR version when you add functionality in a backwards compatible manner(特性添加，版本兼容)
@@ -81,7 +81,7 @@ Minimal version selection也即最小版本选择，如果光看上述的引用�
 
 * 最小的模块版本。这里比较的对象是该模块的最新版本：如果项目需要依赖的模块版本是v1.2，而该模块实际最新的版本是v1.3，那么最小版本选择算法会选取v1.2版本而非v1.3(为了尽可能提高构建的稳定性和重复性)。也即'最小版本'表示项目所需要依赖模块的最小版本号(v1.2)，而不是该模块实际的最小版本号(v1.1)，也并非该模块实际的最大版本号(v1.3)
 
-这里，我们举例子依次对golang module最小版本选择的算法细节进行阐述：
+这里，我们举例子依次对Go Modules最小版本选择的算法细节进行阐述：
 
 ### [Algorithm 1: Construct Build List](https://research.swtch.com/vgo-mvs#algorithm_1)
 
@@ -124,7 +124,7 @@ require (
 
 另外，这里也可以总结出现indirect标记的两种情况：
 
-* A1的某个依赖模块没有使用go module(也即该模块没有go.mod文件)，那么必须将该模块的间接依赖记录在A1的需求列表中
+* A1的某个依赖模块没有使用Go Modules(也即该模块没有go.mod文件)，那么必须将该模块的间接依赖记录在A1的需求列表中
 * A1对某个间接依赖模块有特殊的版本要求，必须显示指明版本信息(例如上述的D1.4和E1.3)，以便go可以正确构建依赖模块
 
 ### [Algorithm 3. Upgrade One Module](https://research.swtch.com/vgo-mvs#algorithm_3)
@@ -254,13 +254,13 @@ go.mod以及go.sum一般会成对出现在项目根目录中。其中，go.mod�
 ## 总结
 
 * 对单个模块的修改可能会连带影响其它模块
-* go module构建列表受当前模块构建状态影响
+* Go Modules构建列表受当前模块构建状态影响
 * go build会查找直接依赖模块最新版本进行构建(例如这里的B1.2以及C1.3)
 * 最小构建算法中的'最小'代表：最小修改&最小需求列表&依赖模块的最小版本
 * 升级某个模块不会引起其它模块的降级或者删除
 * 降级某个模块会在构建图中将这个模块的高版本删除，同时回溯删除依赖这些高版本的模块，直到查找到不依赖这些高版本的最新模块版本为止，同时会保留其它不需要降级的模块
 * go.mod文件出现indirect标记的情况有如下两种：
-  * A1的某个模块没有使用go module(也即该模块没有go.mod文件)，那么必须将该模块的间接依赖记录在A1的需求列表中
+  * A1的某个模块没有使用Go Modules(也即该模块没有go.mod文件)，那么必须将该模块的间接依赖记录在A1的需求列表中
   * A1对某个间接依赖模块有特殊的版本要求，必须显示指明版本信息(例如上述的D1.4和E1.3)，以便go可以正确构建依赖模块
 
 ## 最佳实践
@@ -276,9 +276,9 @@ go.mod以及go.sum一般会成对出现在项目根目录中。其中，go.mod�
 * 当需要列举本项目所有依赖模块时(包括间接依赖)使用：`go list -m all`；而列举某个依赖模块的所有版本使用：`go list -m -versions xxx`，例如：`go list -m -versions k8s.io/client-go`
 * 当一些依赖存在问题时，可以通过`go clean -modcache`清理已下载的依赖文件
 * GO111MODULE值含义如下(建议强制开启)：
-  * off：强制关闭go module，使用GOPATH
-  * on：强制开启go module(建议)
-  * auto：如果当前模块在$GOPATH/src中，则不使用go module；如果该模块不存在$GOPATH/src下，且拥有go.mod文件则使用go module
+  * off：强制关闭Go Modules，使用GOPATH
+  * on：强制开启Go Modules(建议)
+  * auto：如果当前模块在$GOPATH/src中，则不使用Go Modules；如果该模块不存在$GOPATH/src下，且拥有go.mod文件则使用Go Modules
 
 * 设置GOPROXY为：`GOPROXY=https://goproxy.cn,direct`，代表先从代理服务器`https://goproxy.cn`下载依赖，如果失败(such as 404)则直接从原地址(such as github)下载
 

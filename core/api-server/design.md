@@ -2299,7 +2299,7 @@ func createHandler(r rest.NamedCreater, scope *RequestScope, admit admission.Int
 				options,
 			)
 		}
-    // 5、执行 create 操作
+		// 5、执行 create 操作
 		result, err := finishRequest(timeout, func() (runtime.Object, error) {
 			if scope.FieldManager != nil {
 				liveObj, err := scope.Creater.New(scope.Kind)

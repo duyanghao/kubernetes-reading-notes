@@ -898,5 +898,198 @@ InstallLegacyAPI的主要功能是将 core API 注册到路由中，是 apiserve
 
 ### AggregatorServer创建
 
+`AggregatorServer` 主要用于自定义的聚合控制器的，使 CRD 能够自动注册到集群中
+
+主要逻辑为：
+
+- 1、调用 `aggregatorConfig.Complete().NewWithDelegate` 创建 aggregatorServer；
+- 2、初始化 `crdRegistrationController` 和 `autoRegistrationController`，`crdRegistrationController` 负责注册 CRD，`autoRegistrationController` 负责将 CRD 对应的 APIServices 自动注册到 apiserver 中，CRD 创建后可通过 `$ kubectl get apiservices` 查看是否注册到 apiservices 中；
+- 3、将 `autoRegistrationController` 和 `crdRegistrationController` 加入到 PostStartHook 中；
+
+```go
+// k8s.io/kubernetes/cmd/kube-apiserver/app/aggregator.go:129
+func createAggregatorServer(aggregatorConfig *aggregatorapiserver.Config, delegateAPIServer genericapiserver.DelegationTarget, apiExtensionInformers apiextensionsinformers.SharedInformerFactory) (*aggregatorapiserver.APIAggregator, error) {
+	// 1、初始化 aggregatorServer
+	aggregatorServer, err := aggregatorConfig.Complete().NewWithDelegate(delegateAPIServer)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2、初始化 crd controller  
+	// create controllers for auto-registration
+	apiRegistrationClient, err := apiregistrationclient.NewForConfig(aggregatorConfig.GenericConfig.LoopbackClientConfig)
+	if err != nil {
+		return nil, err
+	}
+	autoRegistrationController := autoregister.NewAutoRegisterController(aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(), apiRegistrationClient)
+	apiServices := apiServicesToRegister(delegateAPIServer, autoRegistrationController)
+	crdRegistrationController := crdregistration.NewCRDRegistrationController(
+		apiExtensionInformers.Apiextensions().V1().CustomResourceDefinitions(),
+		autoRegistrationController)
+
+	// 3、将crdRegistrationController以及autoRegistrationController添加到PostStartHook    
+	err = aggregatorServer.GenericAPIServer.AddPostStartHook("kube-apiserver-autoregistration", func(context genericapiserver.PostStartHookContext) error {
+		go crdRegistrationController.Run(5, context.StopCh)
+		go func() {
+			// let the CRD controller process the initial set of CRDs before starting the autoregistration controller.
+			// this prevents the autoregistration controller's initial sync from deleting APIServices for CRDs that still exist.
+			// we only need to do this if CRDs are enabled on this server.  We can't use discovery because we are the source for discovery.
+			if aggregatorConfig.GenericConfig.MergedResourceConfig.AnyVersionForGroupEnabled("apiextensions.k8s.io") {
+				crdRegistrationController.WaitForInitialSync()
+			}
+			autoRegistrationController.Run(5, context.StopCh)
+		}()
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	err = aggregatorServer.GenericAPIServer.AddBootSequenceHealthChecks(
+		makeAPIServiceAvailableHealthCheck(
+			"autoregister-completion",
+			apiServices,
+			aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(),
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return aggregatorServer, nil
+}
+```
+
+`aggregatorConfig.Complete().NewWithDelegate` 是初始化 aggregatorServer 的方法，主要逻辑为：
+
+- 1、调用 `c.GenericConfig.New` 初始化 GenericAPIServer，其内部的主要功能在上文已经分析过；
+- 2、调用 `apiservicerest.NewRESTStorage` 为 APIServices 资源创建 RESTStorage，RESTStorage 的目的是将每种资源的访问路径及其后端存储的操作对应起来；
+- 3、调用 `s.GenericAPIServer.InstallAPIGroup` 为 APIGroup 注册路由信息； 
+- 4、初始化 apiserviceRegistrationController：负责 APIServices 中资源的注册与删除以及availableConditionController：维护 APIServices 的可用状态，包括其引用 Service 是否可用等
+
+```go
+// k8s.io/kubernetes/vendor/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go:159
+// NewWithDelegate returns a new instance of APIAggregator from the given config.
+func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.DelegationTarget) (*APIAggregator, error) {
+	// Prevent generic API server to install OpenAPI handler. Aggregator server
+	// has its own customized OpenAPI handler.
+	openAPIConfig := c.GenericConfig.OpenAPIConfig
+	c.GenericConfig.OpenAPIConfig = nil
+
+	// 1、初始化 genericServer  
+	genericServer, err := c.GenericConfig.New("kube-aggregator", delegationTarget)
+	if err != nil {
+		return nil, err
+	}
+
+	apiregistrationClient, err := clientset.NewForConfig(c.GenericConfig.LoopbackClientConfig)
+	if err != nil {
+		return nil, err
+	}
+	informerFactory := informers.NewSharedInformerFactory(
+		apiregistrationClient,
+		5*time.Minute, // this is effectively used as a refresh interval right now.  Might want to do something nicer later on.
+	)
+
+	s := &APIAggregator{
+		GenericAPIServer:         genericServer,
+		delegateHandler:          delegationTarget.UnprotectedHandler(),
+		proxyClientCert:          c.ExtraConfig.ProxyClientCert,
+		proxyClientKey:           c.ExtraConfig.ProxyClientKey,
+		proxyTransport:           c.ExtraConfig.ProxyTransport,
+		proxyHandlers:            map[string]*proxyHandler{},
+		handledGroups:            sets.String{},
+		lister:                   informerFactory.Apiregistration().V1().APIServices().Lister(),
+		APIRegistrationInformers: informerFactory,
+		serviceResolver:          c.ExtraConfig.ServiceResolver,
+		openAPIConfig:            openAPIConfig,
+		egressSelector:           c.GenericConfig.EgressSelector,
+	}
+
+	// 2、为 API 注册路由  
+	apiGroupInfo := apiservicerest.NewRESTStorage(c.GenericConfig.MergedResourceConfig, c.GenericConfig.RESTOptionsGetter)
+	if err := s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo); err != nil {
+		return nil, err
+	}
+
+	...
+	apisHandler := &apisHandler{
+		codecs:         aggregatorscheme.Codecs,
+		lister:         s.lister,
+		discoveryGroup: discoveryGroup(enabledVersions),
+	}
+	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", apisHandler)
+	s.GenericAPIServer.Handler.NonGoRestfulMux.UnlistedHandle("/apis/", apisHandler)
+
+	// 3、初始化 apiserviceRegistrationController、availableController
+	apiserviceRegistrationController := NewAPIServiceRegistrationController(informerFactory.Apiregistration().V1().APIServices(), s)
+	availableController, err := statuscontrollers.NewAvailableConditionController(
+		informerFactory.Apiregistration().V1().APIServices(),
+		c.GenericConfig.SharedInformerFactory.Core().V1().Services(),
+		c.GenericConfig.SharedInformerFactory.Core().V1().Endpoints(),
+		apiregistrationClient.ApiregistrationV1(),
+		c.ExtraConfig.ProxyTransport,
+		c.ExtraConfig.ProxyClientCert,
+		c.ExtraConfig.ProxyClientKey,
+		s.serviceResolver,
+		c.GenericConfig.EgressSelector,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// 4、添加 PostStartHook
+	s.GenericAPIServer.AddPostStartHookOrDie("start-kube-aggregator-informers", func(context genericapiserver.PostStartHookContext) error {
+		informerFactory.Start(context.StopCh)
+		c.GenericConfig.SharedInformerFactory.Start(context.StopCh)
+		return nil
+	})
+	s.GenericAPIServer.AddPostStartHookOrDie("apiservice-registration-controller", func(context genericapiserver.PostStartHookContext) error {
+		go apiserviceRegistrationController.Run(context.StopCh)
+		return nil
+	})
+	s.GenericAPIServer.AddPostStartHookOrDie("apiservice-status-available-controller", func(context genericapiserver.PostStartHookContext) error {
+		// if we end up blocking for long periods of time, we may need to increase threadiness.
+		go availableController.Run(5, context.StopCh)
+		return nil
+	})
+
+	return s, nil
+}
+```
+
+以上是对 AggregatorServer 初始化流程的分析，可以看出，在创建 APIExtensionsServer、KubeAPIServer 以及 AggregatorServer 时，其模式都是类似的，首先调用 `c.GenericConfig.New` 按照`go-restful`的模式初始化 Container，然后为 server 中需要注册的资源创建 RESTStorage，最后将 resource 的 APIGroup 信息注册到路由中
+
+至此，CreateServerChain 中流程已经分析完，其中的调用链如下所示：
+
+```
+                    |--> CreateNodeDialer
+                    |
+                    |--> CreateKubeAPIServerConfig
+                    |
+CreateServerChain --|--> createAPIExtensionsConfig
+                    |
+                    |                                                                       |--> c.GenericConfig.New
+                    |--> createAPIExtensionsServer --> apiextensionsConfig.Complete().New --|
+                    |                                                                       |--> s.GenericAPIServer.InstallAPIGroup
+                    |
+                    |                                                                 |--> c.GenericConfig.New
+                    |                                                                 |
+                    |--> CreateKubeAPIServer --> kubeAPIServerConfig.Complete().New --|--> m.InstallLegacyAPI --> legacyRESTStorageProvider.NewLegacyRESTStorage --> m.GenericAPIServer.InstallLegacyAPIGroup
+                    |                                                                 |
+                    |                                                                 |--> m.InstallAPIs --> restStorageBuilder.NewRESTStorage --> m.GenericAPIServer.InstallAPIGroups
+                    |
+                    |
+                    |--> createAggregatorConfig
+                    |
+                    |                                                                             |--> c.GenericConfig.New
+                    |                                                                             |
+                    |--> createAggregatorServer --> aggregatorConfig.Complete().NewWithDelegate --|--> apiservicerest.NewRESTStorage
+                                                                                                  |
+                                                                                                  |--> s.GenericAPIServer.InstallAPIGroup
+```
+
+
+
 
 

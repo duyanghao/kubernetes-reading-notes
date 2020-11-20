@@ -19,7 +19,7 @@ kube-apiserver包含三个APIServer：
 
 AggregatorServer 和 APIExtensionsServer 对应两种主要扩展 APIServer 资源的方式，也即分别是 AA 和 CRD
 
-###AggregatorServer
+### AggregatorServer
 
 其中，Aggregator 通过 APIServices 对象关联到某个 Service 来进行请求的转发，其关联的 Service 类型进一步决定了请求转发形式。Aggregator 包括一个 `GenericAPIServer` 和维护自身状态的 Controller。其中 `GenericAPIServer` 主要处理 `apiregistration.k8s.io` 组下的 APIService 资源请求，controller包括：
 
@@ -108,7 +108,7 @@ type DelegationTarget interface {
 }
 ```
 
-###CreateServerChain
+### CreateServerChain
 
 `CreateServerChain` 是完成 server 初始化的方法，里面包含 `APIExtensionsServer`、`KubeAPIServer`、`AggregatorServer` 初始化的所有流程，最终返回 `aggregatorapiserver.APIAggregator` 实例，初始化流程主要有：http filter chain 的配置、API Group 的注册、http path 与 handler 的关联以及 handler 后端存储 etcd 的配置。其主要逻辑为：
 
@@ -185,14 +185,14 @@ func CreateKubeAPIServerConfig(
 	[]admission.PluginInitializer,
 	error,
 ) {
-  // 1、构建 genericConfig
+    // 1、构建 genericConfig
 	genericConfig, versionedInformers, insecureServingInfo, serviceResolver, pluginInitializers, admissionPostStartHook, storageFactory, err := buildGenericConfig(s.ServerRunOptions, proxyTransport)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-
-  ...
-  // 2、初始化所支持的 capabilities
+	
+    ... 
+    // 2、初始化所支持的 capabilities
 	capabilities.Initialize(capabilities.Capabilities{
 		AllowPrivileged: s.AllowPrivileged,
 		// TODO(vmarmol): Implement support for HostNetworkSources.
@@ -208,14 +208,14 @@ func CreateKubeAPIServerConfig(
 		metrics.SetShowHidden()
 	}
   
-  // 3、获取 service ip range 以及 api server service IP
+    // 3、获取 service ip range 以及 api server service IP
 	serviceIPRange, apiServerServiceIP, err := master.ServiceIPRange(s.PrimaryServiceClusterIPRange)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
 
-  ...
-  // 4、构建 master.Config 对象
+    ...
+    // 4、构建 master.Config 对象
 	config := &master.Config{
 		GenericConfig: genericConfig,
 		ExtraConfig: master.ExtraConfig{
@@ -247,7 +247,7 @@ func CreateKubeAPIServerConfig(
 		},
 	}
 
-  ...
+    ...
 
 	return config, insecureServingInfo, serviceResolver, pluginInitializers, nil
 }
@@ -270,11 +270,11 @@ func buildGenericConfig(
 	storageFactory *serverstorage.DefaultStorageFactory,
 	lastErr error,
 ) {
-  // 1、为 genericConfig 设置默认值
+    // 1、为 genericConfig 设置默认值
 	genericConfig = genericapiserver.NewConfig(legacyscheme.Codecs)
 	genericConfig.MergedResourceConfig = master.DefaultAPIResourceConfigSource()
 
-  ...
+    ...
 
 	genericConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(generatedopenapi.GetOpenAPIDefinitions, openapinamer.NewDefinitionNamer(legacyscheme.Scheme, extensionsapiserver.Scheme, aggregatorscheme.Scheme))
 	genericConfig.OpenAPIConfig.Info.Title = "Kubernetes"
@@ -293,7 +293,7 @@ func buildGenericConfig(
 		lastErr = err
 		return
 	}
-  // 初始化 storageFactory
+    // 初始化 storageFactory
 	storageFactory, lastErr = completedStorageFactoryConfig.New()
 	if lastErr != nil {
 		return
@@ -301,12 +301,12 @@ func buildGenericConfig(
 	if genericConfig.EgressSelector != nil {
 		storageFactory.StorageConfig.Transport.EgressLookup = genericConfig.EgressSelector.Lookup
 	}
-  // 2、初始化 RESTOptionsGetter，后期根据其获取操作 Etcd 的句柄，同时添加 etcd 的健康检查方法
+    // 2、初始化 RESTOptionsGetter，后期根据其获取操作 Etcd 的句柄，同时添加 etcd 的健康检查方法
 	if lastErr = s.Etcd.ApplyWithStorageFactoryTo(storageFactory, genericConfig); lastErr != nil {
 		return
 	}
 
-  // 3、设置使用 protobufs 用来内部交互，并且禁用压缩功能
+    // 3、设置使用 protobufs 用来内部交互，并且禁用压缩功能
 	// Use protobufs for self-communication.
 	// Since not every generic apiserver has to support protobufs, we
 	// cannot default to it in generic apiserver and need to explicitly
@@ -316,7 +316,7 @@ func buildGenericConfig(
 	// on a fast local network
 	genericConfig.LoopbackClientConfig.DisableCompression = true
 
-  // 4、创建 clientset
+    // 4、创建 clientset
 	kubeClientConfig := genericConfig.LoopbackClientConfig
 	clientgoExternalClient, err := clientgoclientset.NewForConfig(kubeClientConfig)
 	if err != nil {
@@ -325,15 +325,15 @@ func buildGenericConfig(
 	}
 	versionedInformers = clientgoinformers.NewSharedInformerFactory(clientgoExternalClient, 10*time.Minute)
 
-  // 5、创建认证实例，支持多种认证方式：请求 Header 认证、Auth 文件认证、CA 证书认证、Bearer token 认证、
-  // ServiceAccount 认证、BootstrapToken 认证、WebhookToken 认证等
+    // 5、创建认证实例，支持多种认证方式：请求 Header 认证、Auth 文件认证、CA 证书认证、Bearer token 认证、
+    // ServiceAccount 认证、BootstrapToken 认证、WebhookToken 认证等
 	genericConfig.Authentication.Authenticator, genericConfig.OpenAPIConfig.SecurityDefinitions, err = BuildAuthenticator(s, genericConfig.EgressSelector, clientgoExternalClient, versionedInformers)
 	if err != nil {
 		lastErr = fmt.Errorf("invalid authentication config: %v", err)
 		return
 	}
 
-  // 6、创建鉴权实例，包含：Node、RBAC、Webhook、ABAC、AlwaysAllow、AlwaysDeny
+    // 6、创建鉴权实例，包含：Node、RBAC、Webhook、ABAC、AlwaysAllow、AlwaysDeny
 	genericConfig.Authorization.Authorizer, genericConfig.RuleResolver, err = BuildAuthorizer(s, genericConfig.EgressSelector, versionedInformers)
 	if err != nil {
 		lastErr = fmt.Errorf("invalid authorization config: %v", err)
@@ -352,7 +352,7 @@ func buildGenericConfig(
 
 	authInfoResolverWrapper := webhook.NewDefaultAuthenticationInfoResolverWrapper(proxyTransport, genericConfig.EgressSelector, genericConfig.LoopbackClientConfig)
 
-  // 7、审计插件的初始化
+    // 7、审计插件的初始化
 	lastErr = s.Audit.ApplyTo(
 		genericConfig,
 		genericConfig.LoopbackClientConfig,
@@ -367,7 +367,7 @@ func buildGenericConfig(
 		return
 	}
 
-  // 8、准入插件的初始化
+    // 8、准入插件的初始化
 	pluginInitializers, admissionPostStartHook, err = admissionConfig.New(proxyTransport, genericConfig.EgressSelector, serviceResolver)
 	if err != nil {
 		lastErr = fmt.Errorf("failed to create admission plugin initializer: %v", err)
@@ -439,7 +439,7 @@ func createAPIExtensionsServer(apiextensionsConfig *apiextensionsapiserver.Confi
 // k8s.io/kubernetes/vendor/k8s.io/apiextensions-apiserver/pkg/apiserver/apiserver.go:129
 // New returns a new instance of CustomResourceDefinitions from the given config.
 func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*CustomResourceDefinitions, error) {
-  // 1、初始化 genericServer
+    // 1、初始化 genericServer
 	genericServer, err := c.GenericConfig.New("apiextensions-apiserver", delegationTarget)
 	if err != nil {
 		return nil, err
@@ -448,8 +448,7 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 	s := &CustomResourceDefinitions{
 		GenericAPIServer: genericServer,
 	}
-
-  // 2、初始化 APIGroup Info，APIGroup 指该 server 需要暴露的 API
+	// 2、初始化 APIGroup Info，APIGroup 指该 server 需要暴露的 API
 	apiResourceConfig := c.GenericConfig.MergedResourceConfig
 	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(apiextensions.GroupName, Scheme, metav1.ParameterCodec, Codecs)
 	if apiResourceConfig.VersionEnabled(v1beta1.SchemeGroupVersion) {
@@ -470,13 +469,13 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 
 		apiGroupInfo.VersionedResourcesStorageMap[v1.SchemeGroupVersion.Version] = storage
 	}
-
-  // 3、注册 APIGroup
+	
+    // 3、注册 APIGroup
 	if err := s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo); err != nil {
 		return nil, err
 	}
 
-  // 4、初始化需要使用的 controller
+    // 4、初始化需要使用的 controller
 	crdClient, err := clientset.NewForConfig(s.GenericAPIServer.LoopbackClientConfig)
 	if err != nil {
 		// it's really bad that this is leaking here, but until we can fix the test (which I'm pretty sure isn't even testing what it wants to test),
@@ -484,8 +483,8 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		return nil, fmt.Errorf("failed to create clientset: %v", err)
 	}
 	s.Informers = externalinformers.NewSharedInformerFactory(crdClient, 5*time.Minute)
-
-  ...
+	
+    ...
 	establishingController := establish.NewEstablishingController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
 	crdHandler, err := NewCustomResourceDefinitionHandler(
 		versionDiscoveryHandler,
@@ -520,8 +519,8 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		crdHandler,
 	)
 	openapiController := openapicontroller.NewController(s.Informers.Apiextensions().V1().CustomResourceDefinitions())
-
-  // 5、将 informer 以及 controller 添加到 PostStartHook 中
+	
+    // 5、将 informer 以及 controller 添加到 PostStartHook 中
 	s.GenericAPIServer.AddPostStartHookOrDie("start-apiextensions-informers", func(context genericapiserver.PostStartHookContext) error {
 		s.Informers.Start(context.StopCh)
 		return nil
@@ -559,8 +558,8 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 // New creates a new server which logically combines the handling chain with the passed server.
 // name is used to differentiate for logging. The handler chain in particular can be difficult as it starts delgating.
 // delegationTarget may not be nil.
-func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*GenericAPIServer, error) {
-  ...
+func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*GenericAPIServer, error) {   
+    ...
 	handlerChainBuilder := func(handler http.Handler) http.Handler {
 		return c.BuildHandlerChainFunc(handler, c.Config)
 	}
@@ -606,11 +605,11 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 		livezClock:          clock.RealClock{},
 	}
 
-  ...
+    ...
 	s.listedPathProvider = routes.ListedPathProviders{s.listedPathProvider, delegationTarget}
 
 	installAPI(s, c.Config)
-  ...
+    ...
 
 	return s, nil
 }
@@ -751,13 +750,13 @@ func CreateKubeAPIServer(kubeAPIServerConfig *master.Config, delegateAPIServer g
 // Certain config fields must be specified, including:
 //   KubeletClientConfig
 func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*Master, error) {
-  // 1、初始化 GenericAPIServer
+    // 1、初始化 GenericAPIServer
 	s, err := c.GenericConfig.New("kube-apiserver", delegationTarget)
 	if err != nil {
 		return nil, err
 	}
 
-  // 2、注册 logs 相关的路由
+    // 2、注册 logs 相关的路由
 	if c.ExtraConfig.EnableLogsSupport {
 		routes.Logs{}.Install(s.Handler.GoRestfulContainer)
 	}
@@ -767,7 +766,7 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		ClusterAuthenticationInfo: c.ExtraConfig.ClusterAuthenticationInfo,
 	}
 
-  // 3、安装 LegacyAPI
+    // 3、安装 LegacyAPI
 	// install legacy rest storage
 	if c.ExtraConfig.APIResourceConfigSource.VersionEnabled(apiv1.SchemeGroupVersion) {
 		legacyRESTStorageProvider := corerest.LegacyRESTStorageProvider{
@@ -819,7 +818,7 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		admissionregistrationrest.RESTStorageProvider{},
 		eventsrest.RESTStorageProvider{TTL: c.ExtraConfig.EventTTL},
 	}
-  // 4、安装 APIs
+    // 4、安装 APIs
 	if err := m.InstallAPIs(c.ExtraConfig.APIResourceConfigSource, c.GenericConfig.RESTOptionsGetter, restStorageProviders...); err != nil {
 		return nil, err
 	}

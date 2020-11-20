@@ -1788,6 +1788,7 @@ func Create(c storagebackend.Config) (storage.Interface, DestroyFunc, error) {
 在 `newETCD3Storage` 中，首先通过调用 `newETCD3Client` 创建 etcd 的 client，client 的创建最终是通过 etcd 官方提供的客户端工具 [clientv3](https://github.com/etcd-io/etcd/tree/master/clientv3) 进行创建的
 
 ```go
+// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/etcd3.go:209
 func newETCD3Storage(c storagebackend.Config) (storage.Interface, DestroyFunc, error) {
 	stopCompactor, err := startCompactorOnce(c.Transport, c.CompactionInterval)
 	if err != nil {
@@ -1819,3 +1820,527 @@ func newETCD3Storage(c storagebackend.Config) (storage.Interface, DestroyFunc, e
 ```
 
 至此对于 pod resource 中 store 的构建基本分析完成，不同 resource 对应一个 REST 对象，其中又引用了 `genericregistry.Store` 对象，最终是对 `genericregistry.Store` 的初始化。在分析完 store 的初始化后还有一个重要的步骤就是路由的注册，路由注册主要的流程是为 resource 根据不同 verbs 构建 http path 以及将 path 与对应 handler 进行绑定
+
+### 路由注册
+
+上文 RESTStorage 的构建对应的是 `InstallLegacyAPI` 中的 `legacyRESTStorageProvider.NewLegacyRESTStorage` 方法，下面继续分析 `InstallLegacyAPI` 中的 `m.GenericAPIServer.InstallLegacyAPIGroup` 方法的实现
+
+```go
+// k8s.io/kubernetes/pkg/master/master.go:487
+// InstallLegacyAPI will install the legacy APIs for the restStorageProviders if they are enabled.
+func (m *Master) InstallLegacyAPI(c *completedConfig, restOptionsGetter generic.RESTOptionsGetter, legacyRESTStorageProvider corerest.LegacyRESTStorageProvider) error {
+	legacyRESTStorage, apiGroupInfo, err := legacyRESTStorageProvider.NewLegacyRESTStorage(restOptionsGetter)
+	if err != nil {
+		return fmt.Errorf("error building core storage: %v", err)
+	}
+
+	controllerName := "bootstrap-controller"
+	coreClient := corev1client.NewForConfigOrDie(c.GenericConfig.LoopbackClientConfig)
+	bootstrapController := c.NewBootstrapController(legacyRESTStorage, coreClient, coreClient, coreClient, coreClient.RESTClient())
+	m.GenericAPIServer.AddPostStartHookOrDie(controllerName, bootstrapController.PostStartHook)
+	m.GenericAPIServer.AddPreShutdownHookOrDie(controllerName, bootstrapController.PreShutdownHook)
+
+	if err := m.GenericAPIServer.InstallLegacyAPIGroup(genericapiserver.DefaultLegacyAPIPrefix, &apiGroupInfo); err != nil {
+		return fmt.Errorf("error in registering group versions: %v", err)
+	}
+	return nil
+}
+```
+
+`m.GenericAPIServer.InstallLegacyAPIGroup` 的调用链非常深，最终是为 Group 下每一个 API resources 注册 handler 及路由信息，其调用链为：`m.GenericAPIServer.InstallLegacyAPIGroup --> s.installAPIResources --> apiGroupVersion.InstallREST --> installer.Install --> a.registerResourceHandlers`。其中几个方法的作用如下所示：
+
+- `s.installAPIResources`：为每一个 API resource 调用 `apiGroupVersion.InstallREST` 添加路由；
+- `apiGroupVersion.InstallREST`：将 `restful.WebServic` 对象添加到 container 中；
+- `installer.Install`：返回最终的 `restful.WebService` 对象
+
+```go
+func (s *GenericAPIServer) InstallLegacyAPIGroup(apiPrefix string, apiGroupInfo *APIGroupInfo) error {
+	if !s.legacyAPIGroupPrefixes.Has(apiPrefix) {
+		return fmt.Errorf("%q is not in the allowed legacy API prefixes: %v", apiPrefix, s.legacyAPIGroupPrefixes.List())
+	}
+
+	openAPIModels, err := s.getOpenAPIModels(apiPrefix, apiGroupInfo)
+	if err != nil {
+		return fmt.Errorf("unable to get openapi models: %v", err)
+	}
+
+	if err := s.installAPIResources(apiPrefix, apiGroupInfo, openAPIModels); err != nil {
+		return err
+	}
+
+	// Install the version handler.
+	// Add a handler at /<apiPrefix> to enumerate the supported api versions.
+	s.Handler.GoRestfulContainer.Add(discovery.NewLegacyRootAPIHandler(s.discoveryAddresses, s.Serializer, apiPrefix).WebService())
+
+	return nil
+}
+
+// installAPIResources is a private method for installing the REST storage backing each api groupversionresource
+func (s *GenericAPIServer) installAPIResources(apiPrefix string, apiGroupInfo *APIGroupInfo, openAPIModels openapiproto.Models) error {
+	for _, groupVersion := range apiGroupInfo.PrioritizedVersions {
+		if len(apiGroupInfo.VersionedResourcesStorageMap[groupVersion.Version]) == 0 {
+			klog.Warningf("Skipping API %v because it has no resources.", groupVersion)
+			continue
+		}
+
+		apiGroupVersion := s.getAPIGroupVersion(apiGroupInfo, groupVersion, apiPrefix)
+		if apiGroupInfo.OptionsExternalVersion != nil {
+			apiGroupVersion.OptionsExternalVersion = apiGroupInfo.OptionsExternalVersion
+		}
+		apiGroupVersion.OpenAPIModels = openAPIModels
+		apiGroupVersion.MaxRequestBodyBytes = s.maxRequestBodyBytes
+
+		if err := apiGroupVersion.InstallREST(s.Handler.GoRestfulContainer); err != nil {
+			return fmt.Errorf("unable to setup API %v: %v", apiGroupInfo, err)
+		}
+	}
+
+	return nil
+}
+
+// InstallREST registers the REST handlers (storage, watch, proxy and redirect) into a restful Container.
+// It is expected that the provided path root prefix will serve all operations. Root MUST NOT end
+// in a slash.
+func (g *APIGroupVersion) InstallREST(container *restful.Container) error {
+	prefix := path.Join(g.Root, g.GroupVersion.Group, g.GroupVersion.Version)
+	installer := &APIInstaller{
+		group:             g,
+		prefix:            prefix,
+		minRequestTimeout: g.MinRequestTimeout,
+	}
+
+	apiResources, ws, registrationErrors := installer.Install()
+	versionDiscoveryHandler := discovery.NewAPIVersionHandler(g.Serializer, g.GroupVersion, staticLister{apiResources})
+	versionDiscoveryHandler.AddToWebService(ws)
+	container.Add(ws)
+	return utilerrors.NewAggregate(registrationErrors)
+}
+
+// Install handlers for API resources.
+func (a *APIInstaller) Install() ([]metav1.APIResource, *restful.WebService, []error) {
+	var apiResources []metav1.APIResource
+	var errors []error
+	ws := a.newWebService()
+
+	// Register the paths in a deterministic (sorted) order to get a deterministic swagger spec.
+	paths := make([]string, len(a.group.Storage))
+	var i int = 0
+	for path := range a.group.Storage {
+		paths[i] = path
+		i++
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		apiResource, err := a.registerResourceHandlers(path, a.group.Storage[path], ws)
+		if err != nil {
+			errors = append(errors, fmt.Errorf("error in registering resource: %s, %v", path, err))
+		}
+		if apiResource != nil {
+			apiResources = append(apiResources, *apiResource)
+		}
+	}
+	return apiResources, ws, errors
+}
+```
+
+registerResourceHandlers方法实现了 `rest.Storage` 到 `restful.Route` 的转换，其首先会判断 API Resource 所支持的 REST 接口，然后为 REST 接口添加对应的 handler，最后将其注册到路由中
+
+```go
+func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storage, ws *restful.WebService) (*metav1.APIResource, error) {
+	...
+
+  // 1、判断该 resource 实现了哪些 REST 操作接口，以此来判断其支持的 verbs 以便为其添加路由
+	// what verbs are supported by the storage, used to know what verbs we support per path
+	creater, isCreater := storage.(rest.Creater)
+	namedCreater, isNamedCreater := storage.(rest.NamedCreater)
+	lister, isLister := storage.(rest.Lister)
+	getter, isGetter := storage.(rest.Getter)
+	getterWithOptions, isGetterWithOptions := storage.(rest.GetterWithOptions)
+	gracefulDeleter, isGracefulDeleter := storage.(rest.GracefulDeleter)
+	collectionDeleter, isCollectionDeleter := storage.(rest.CollectionDeleter)
+	updater, isUpdater := storage.(rest.Updater)
+	patcher, isPatcher := storage.(rest.Patcher)
+	watcher, isWatcher := storage.(rest.Watcher)
+	connecter, isConnecter := storage.(rest.Connecter)
+	storageMeta, isMetadata := storage.(rest.StorageMetadata)
+	storageVersionProvider, isStorageVersionProvider := storage.(rest.StorageVersionProvider)
+
+	...
+  // 2、为 resource 添加对应的 actions(+根据是否支持 namespace)
+	// Get the list of actions for the given scope.
+	switch {
+	case !namespaceScoped:
+		// Handle non-namespace scoped resources like nodes.
+		resourcePath := resource
+		resourceParams := params
+		itemPath := resourcePath + "/{name}"
+		nameParams := append(params, nameParam)
+		proxyParams := append(nameParams, pathParam)
+		suffix := ""
+		if isSubresource {
+			suffix = "/" + subresource
+			itemPath = itemPath + suffix
+			resourcePath = itemPath
+			resourceParams = nameParams
+		}
+		apiResource.Name = path
+		apiResource.Namespaced = false
+		apiResource.Kind = resourceKind
+		namer := handlers.ContextBasedNaming{
+			SelfLinker:         a.group.Linker,
+			ClusterScoped:      true,
+			SelfLinkPathPrefix: gpath.Join(a.prefix, resource) + "/",
+			SelfLinkPathSuffix: suffix,
+		}
+
+		// Handler for standard REST verbs (GET, PUT, POST and DELETE).
+		// Add actions at the resource path: /api/apiVersion/resource
+		actions = appendIf(actions, action{"LIST", resourcePath, resourceParams, namer, false}, isLister)
+		actions = appendIf(actions, action{"POST", resourcePath, resourceParams, namer, false}, isCreater)
+		actions = appendIf(actions, action{"DELETECOLLECTION", resourcePath, resourceParams, namer, false}, isCollectionDeleter)
+		// DEPRECATED in 1.11
+		actions = appendIf(actions, action{"WATCHLIST", "watch/" + resourcePath, resourceParams, namer, false}, allowWatchList)
+
+		// Add actions at the item path: /api/apiVersion/resource/{name}
+		actions = appendIf(actions, action{"GET", itemPath, nameParams, namer, false}, isGetter)
+		if getSubpath {
+			actions = appendIf(actions, action{"GET", itemPath + "/{path:*}", proxyParams, namer, false}, isGetter)
+		}
+		actions = appendIf(actions, action{"PUT", itemPath, nameParams, namer, false}, isUpdater)
+		actions = appendIf(actions, action{"PATCH", itemPath, nameParams, namer, false}, isPatcher)
+		actions = appendIf(actions, action{"DELETE", itemPath, nameParams, namer, false}, isGracefulDeleter)
+		// DEPRECATED in 1.11
+		actions = appendIf(actions, action{"WATCH", "watch/" + itemPath, nameParams, namer, false}, isWatcher)
+		actions = appendIf(actions, action{"CONNECT", itemPath, nameParams, namer, false}, isConnecter)
+		actions = appendIf(actions, action{"CONNECT", itemPath + "/{path:*}", proxyParams, namer, false}, isConnecter && connectSubpath)
+	default:
+		namespaceParamName := "namespaces"
+		// Handler for standard REST verbs (GET, PUT, POST and DELETE).
+		namespaceParam := ws.PathParameter("namespace", "object name and auth scope, such as for teams and projects").DataType("string")
+		namespacedPath := namespaceParamName + "/{namespace}/" + resource
+		namespaceParams := []*restful.Parameter{namespaceParam}
+
+		resourcePath := namespacedPath
+		resourceParams := namespaceParams
+		itemPath := namespacedPath + "/{name}"
+		nameParams := append(namespaceParams, nameParam)
+		proxyParams := append(nameParams, pathParam)
+		itemPathSuffix := ""
+		if isSubresource {
+			itemPathSuffix = "/" + subresource
+			itemPath = itemPath + itemPathSuffix
+			resourcePath = itemPath
+			resourceParams = nameParams
+		}
+		apiResource.Name = path
+		apiResource.Namespaced = true
+		apiResource.Kind = resourceKind
+		namer := handlers.ContextBasedNaming{
+			SelfLinker:         a.group.Linker,
+			ClusterScoped:      false,
+			SelfLinkPathPrefix: gpath.Join(a.prefix, namespaceParamName) + "/",
+			SelfLinkPathSuffix: itemPathSuffix,
+		}
+
+		actions = appendIf(actions, action{"LIST", resourcePath, resourceParams, namer, false}, isLister)
+		actions = appendIf(actions, action{"POST", resourcePath, resourceParams, namer, false}, isCreater)
+		actions = appendIf(actions, action{"DELETECOLLECTION", resourcePath, resourceParams, namer, false}, isCollectionDeleter)
+		// DEPRECATED in 1.11
+		actions = appendIf(actions, action{"WATCHLIST", "watch/" + resourcePath, resourceParams, namer, false}, allowWatchList)
+
+		actions = appendIf(actions, action{"GET", itemPath, nameParams, namer, false}, isGetter)
+		if getSubpath {
+			actions = appendIf(actions, action{"GET", itemPath + "/{path:*}", proxyParams, namer, false}, isGetter)
+		}
+		actions = appendIf(actions, action{"PUT", itemPath, nameParams, namer, false}, isUpdater)
+		actions = appendIf(actions, action{"PATCH", itemPath, nameParams, namer, false}, isPatcher)
+		actions = appendIf(actions, action{"DELETE", itemPath, nameParams, namer, false}, isGracefulDeleter)
+		// DEPRECATED in 1.11
+		actions = appendIf(actions, action{"WATCH", "watch/" + itemPath, nameParams, namer, false}, isWatcher)
+		actions = appendIf(actions, action{"CONNECT", itemPath, nameParams, namer, false}, isConnecter)
+		actions = appendIf(actions, action{"CONNECT", itemPath + "/{path:*}", proxyParams, namer, false}, isConnecter && connectSubpath)
+
+		// list or post across namespace.
+		// For ex: LIST all pods in all namespaces by sending a LIST request at /api/apiVersion/pods.
+		// TODO: more strongly type whether a resource allows these actions on "all namespaces" (bulk delete)
+		if !isSubresource {
+			actions = appendIf(actions, action{"LIST", resource, params, namer, true}, isLister)
+			// DEPRECATED in 1.11
+			actions = appendIf(actions, action{"WATCHLIST", "watch/" + resource, params, namer, true}, allowWatchList)
+		}
+	}
+
+	// Create Routes for the actions.
+	// TODO: Add status documentation using Returns()
+	// Errors (see api/errors/errors.go as well as go-restful router):
+	// http.StatusNotFound, http.StatusMethodNotAllowed,
+	// http.StatusUnsupportedMediaType, http.StatusNotAcceptable,
+	// http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden,
+	// http.StatusRequestTimeout, http.StatusConflict, http.StatusPreconditionFailed,
+	// http.StatusUnprocessableEntity, http.StatusInternalServerError,
+	// http.StatusServiceUnavailable
+	// and api error codes
+	// Note that if we specify a versioned Status object here, we may need to
+	// create one for the tests, also
+	// Success:
+	// http.StatusOK, http.StatusCreated, http.StatusAccepted, http.StatusNoContent
+	//
+	// test/integration/auth_test.go is currently the most comprehensive status code test
+
+	for _, s := range a.group.Serializer.SupportedMediaTypes() {
+		if len(s.MediaTypeSubType) == 0 || len(s.MediaTypeType) == 0 {
+			return nil, fmt.Errorf("all serializers in the group Serializer must have MediaTypeType and MediaTypeSubType set: %s", s.MediaType)
+		}
+	}
+	mediaTypes, streamMediaTypes := negotiation.MediaTypesForSerializer(a.group.Serializer)
+	allMediaTypes := append(mediaTypes, streamMediaTypes...)
+	ws.Produces(allMediaTypes...)
+
+	// 3、根据 action 创建对应的 route  
+	kubeVerbs := map[string]struct{}{}
+	reqScope := handlers.RequestScope{
+		Serializer:      a.group.Serializer,
+		ParameterCodec:  a.group.ParameterCodec,
+		Creater:         a.group.Creater,
+		Convertor:       a.group.Convertor,
+		Defaulter:       a.group.Defaulter,
+		Typer:           a.group.Typer,
+		UnsafeConvertor: a.group.UnsafeConvertor,
+		Authorizer:      a.group.Authorizer,
+
+		EquivalentResourceMapper: a.group.EquivalentResourceRegistry,
+
+		// TODO: Check for the interface on storage
+		TableConvertor: tableProvider,
+
+		// TODO: This seems wrong for cross-group subresources. It makes an assumption that a subresource and its parent are in the same group version. Revisit this.
+		Resource:    a.group.GroupVersion.WithResource(resource),
+		Subresource: subresource,
+		Kind:        fqKindToRegister,
+
+		HubGroupVersion: schema.GroupVersion{Group: fqKindToRegister.Group, Version: runtime.APIVersionInternal},
+
+		MetaGroupVersion: metav1.SchemeGroupVersion,
+
+		MaxRequestBodyBytes: a.group.MaxRequestBodyBytes,
+	}
+	...
+	// 4、从 rest.Storage 到 restful.Route 映射
+	// 为每个操作添加对应的 handler
+	for _, action := range actions {
+		...
+		switch action.Verb {
+		case "GET": // Get a resource.
+  	case "LIST": // List all resources of a kind.
+		case "PUT": // Update a resource.
+		case "PATCH": // Partially update a resource
+		case "POST": // Create a resource.
+			var handler restful.RouteFunction
+			// 5、初始化 handler
+			if isNamedCreater {
+				handler = restfulCreateNamedResource(namedCreater, reqScope, admit)
+			} else {
+				handler = restfulCreateResource(creater, reqScope, admit)
+			}
+			handler = metrics.InstrumentRouteFunc(action.Verb, group, version, resource, subresource, requestScope, metrics.APIServerComponent, handler)
+			article := GetArticleForNoun(kind, " ")
+			doc := "create" + article + kind
+			if isSubresource {
+				doc = "create " + subresource + " of" + article + kind
+			}
+			// 6、route 与 handler 进行绑定    
+			route := ws.POST(action.Path).To(handler).
+				Doc(doc).
+				Param(ws.QueryParameter("pretty", "If 'true', then the output is pretty printed.")).
+				Operation("create"+namespaced+kind+strings.Title(subresource)+operationSuffix).
+				Produces(append(storageMeta.ProducesMIMETypes(action.Verb), mediaTypes...)...).
+				Returns(http.StatusOK, "OK", producedObject).
+				// TODO: in some cases, the API may return a v1.Status instead of the versioned object
+				// but currently go-restful can't handle multiple different objects being returned.
+				Returns(http.StatusCreated, "Created", producedObject).
+				Returns(http.StatusAccepted, "Accepted", producedObject).
+				Reads(defaultVersionedObject).
+				Writes(producedObject)
+			if err := AddObjectParams(ws, route, versionedCreateOptions); err != nil {
+				return nil, err
+			}
+			addParams(route, action.Params)
+			// 7、添加到路由中    
+			routes = append(routes, route)
+		case "DELETE": // Delete a resource.
+		...
+		default:
+			return nil, fmt.Errorf("unrecognized action verb: %s", action.Verb)
+		}
+		for _, route := range routes {
+			route.Metadata(ROUTE_META_GVK, metav1.GroupVersionKind{
+				Group:   reqScope.Kind.Group,
+				Version: reqScope.Kind.Version,
+				Kind:    reqScope.Kind.Kind,
+			})
+			route.Metadata(ROUTE_META_ACTION, strings.ToLower(action.Verb))
+			ws.Route(route)
+		}
+		// Note: update GetAuthorizerAttributes() when adding a custom handler.
+	}
+
+	apiResource.Verbs = make([]string, 0, len(kubeVerbs))
+	for kubeVerb := range kubeVerbs {
+		apiResource.Verbs = append(apiResource.Verbs, kubeVerb)
+	}
+	sort.Strings(apiResource.Verbs)
+
+	if shortNamesProvider, ok := storage.(rest.ShortNamesProvider); ok {
+		apiResource.ShortNames = shortNamesProvider.ShortNames()
+	}
+	if categoriesProvider, ok := storage.(rest.CategoriesProvider); ok {
+		apiResource.Categories = categoriesProvider.Categories()
+	}
+	if gvkProvider, ok := storage.(rest.GroupVersionKindProvider); ok {
+		gvk := gvkProvider.GroupVersionKind(a.group.GroupVersion)
+		apiResource.Group = gvk.Group
+		apiResource.Version = gvk.Version
+		apiResource.Kind = gvk.Kind
+	}
+
+	// Record the existence of the GVR and the corresponding GVK
+	a.group.EquivalentResourceRegistry.RegisterKindFor(reqScope.Resource, reqScope.Subresource, fqKindToRegister)
+
+	return &apiResource, nil
+}
+```
+
+`restfulCreateNamedResource` 是 POST 操作对应的 handler，最终会调用 `createHandler` 方法完成：
+
+```go
+func restfulCreateNamedResource(r rest.NamedCreater, scope handlers.RequestScope, admit admission.Interface) restful.RouteFunction {
+	return func(req *restful.Request, res *restful.Response) {
+		handlers.CreateNamedResource(r, &scope, admit)(res.ResponseWriter, req.Request)
+	}
+}
+
+// CreateNamedResource returns a function that will handle a resource creation with name.
+func CreateNamedResource(r rest.NamedCreater, scope *RequestScope, admission admission.Interface) http.HandlerFunc {
+	return createHandler(r, scope, admission, true)
+}
+```
+
+`createHandler` 是将数据写入到后端存储的方法，对于资源的操作都有相关的权限控制，在 `createHandler` 中首先会执行 `decoder` 和 `admission` 操作，然后调用 `create` 方法完成 resource 的创建，在 `create` 方法中会进行 `validate` 以及最终将数据保存到后端存储中。`admit` 操作即执行 kube-apiserver 中的 admission-plugins，admission-plugins 在 `CreateKubeAPIServerConfig` 中被初始化为了 admissionChain，其初始化的调用链为 `CreateKubeAPIServerConfig --> buildGenericConfig --> s.Admission.ApplyTo --> a.GenericAdmission.ApplyTo --> a.Plugins.NewFromPlugins`，最终在 `a.Plugins.NewFromPlugins` 中将所有已启用的 plugins 封装为 admissionChain，此处要执行的 admit 操作即执行 admission-plugins 中的 admit 操作。
+
+`createHandler` 中调用的 create 方法是` genericregistry.Store` 对象的方法，在每个 resource 初始化 RESTStorage 都会引入 `genericregistry.Store` 对象。
+
+`createHandler` 中所有的操作就是本文开头提到的请求流程，如下所示：
+
+```
+v1beta1 ⇒ internal ⇒    |    ⇒       |    ⇒  v1  ⇒ json/yaml ⇒ etcd
+                     admission    validation
+```
+
+```go
+// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints/handlers/create.go:47
+func createHandler(r rest.NamedCreater, scope *RequestScope, admit admission.Interface, includeName bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		...
+		gv := scope.Kind.GroupVersion()
+		// 1、得到合适的SerializerInfo    
+		s, err := negotiation.NegotiateInputSerializer(req, false, scope.Serializer)
+		if err != nil {
+			scope.err(err, w, req)
+			return
+		}
+		// 2、找到合适的 decoder
+		decoder := scope.Serializer.DecoderToVersion(s.Serializer, scope.HubGroupVersion)
+
+		body, err := limitedReadBody(req, scope.MaxRequestBodyBytes)
+		if err != nil {
+			scope.err(err, w, req)
+			return
+		}
+
+		...
+
+		defaultGVK := scope.Kind
+		original := r.New()
+		trace.Step("About to convert to expected version")
+		// 3、decoder 解码    
+		obj, gvk, err := decoder.Decode(body, &defaultGVK, original)
+		if err != nil {
+			err = transformDecodeError(scope.Typer, err, original, gvk, body)
+			scope.err(err, w, req)
+			return
+		}
+		if gvk.GroupVersion() != gv {
+			err = errors.NewBadRequest(fmt.Sprintf("the API version in the data (%s) does not match the expected API version (%v)", gvk.GroupVersion().String(), gv.String()))
+			scope.err(err, w, req)
+			return
+		}
+		trace.Step("Conversion done")
+
+		ae := request.AuditEventFrom(ctx)
+		admit = admission.WithAudit(admit, ae)
+		audit.LogRequestObject(ae, obj, scope.Resource, scope.Subresource, scope.Serializer)
+
+		userInfo, _ := request.UserFrom(ctx)
+
+		// On create, get name from new object if unset
+		if len(name) == 0 {
+			_, name, _ = scope.Namer.ObjectName(obj)
+		}
+
+		// 4、执行 admit 操作，即执行 kube-apiserver 启动时加载的 admission-plugins    
+		trace.Step("About to store object in database")
+		admissionAttributes := admission.NewAttributesRecord(obj, nil, scope.Kind, namespace, name, scope.Resource, scope.Subresource, admission.Create, options, dryrun.IsDryRun(options.DryRun), userInfo)
+		requestFunc := func() (runtime.Object, error) {
+			return r.Create(
+				ctx,
+				name,
+				obj,
+				rest.AdmissionToValidateObjectFunc(admit, admissionAttributes, scope),
+				options,
+			)
+		}
+    // 5、执行 create 操作
+		result, err := finishRequest(timeout, func() (runtime.Object, error) {
+			if scope.FieldManager != nil {
+				liveObj, err := scope.Creater.New(scope.Kind)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create new object (Create for %v): %v", scope.Kind, err)
+				}
+				obj, err = scope.FieldManager.Update(liveObj, obj, managerOrUserAgent(options.FieldManager, req.UserAgent()))
+				if err != nil {
+					return nil, fmt.Errorf("failed to update object (Create for %v) managed fields: %v", scope.Kind, err)
+				}
+			}
+			if mutatingAdmission, ok := admit.(admission.MutationInterface); ok && mutatingAdmission.Handles(admission.Create) {
+				if err := mutatingAdmission.Admit(ctx, admissionAttributes, scope); err != nil {
+					return nil, err
+				}
+			}
+			result, err := requestFunc()
+			// If the object wasn't committed to storage because it's serialized size was too large,
+			// it is safe to remove managedFields (which can be large) and try again.
+			if isTooLargeError(err) {
+				if accessor, accessorErr := meta.Accessor(obj); accessorErr == nil {
+					accessor.SetManagedFields(nil)
+					result, err = requestFunc()
+				}
+			}
+			return result, err
+		})
+		if err != nil {
+			scope.err(err, w, req)
+			return
+		}
+		trace.Step("Object stored in database")
+
+		code := http.StatusCreated
+		status, ok := result.(*metav1.Status)
+		if ok && err == nil && status.Code == 0 {
+			status.Code = int32(code)
+		}
+
+		transformResponseObject(ctx, scope, trace, req, w, code, outputMediaType, result)
+	}
+}
+```
+

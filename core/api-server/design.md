@@ -15,14 +15,15 @@ Table of Contents
   * [AggregatorServer创建](#aggregatorserver创建)
 * [server.PrepareRun](#serverpreparerun)
 * [prepared.Run](#preparedrun)
-* [storageFactory 的构建](#storagefactory的构建)
+* [storageFactory构建](#storagefactory构建)
   * [NewLegacyRESTStorage](#newlegacyreststorage)
   * [podstore.NewStorage](#podstorenewstorage)
   * [store.CompleteWithOptions](#storecompletewithoptions)
   * [newETCD3Storage](#newetcd3storage)
   * [路由注册](#路由注册)
-  * [调用链分析](#调用链分析)
+* [调用链分析](#调用链分析)
          
+
 kube-apiserver作为整个Kubernetes集群操作etcd的唯一入口，负责Kubernetes各资源的认证&鉴权，校验以及CRUD等操作。Kubernetes提供RESTful APIs，供其它组件调用，本文将对kube-apiserver整体架构进行源码分析(后续分章节展开各部分细节)
 
 ## 概念梳理
@@ -1293,7 +1294,7 @@ func (s preparedGenericAPIServer) NonBlockingRun(stopCh <-chan struct{}) error {
 
 以上就是 server 的初始化以及启动流程过程的分析，上文已经提到各 server 初始化过程中最重要的就是 API Resource RESTStorage 的初始化以及路由的注册，由于该过程比较复杂，下文会单独进行讲述
 
-## storageFactory 的构建
+## storageFactory构建
 
 上文已经提到过，apiserver 最终实现的 handler 对应的后端数据是以 **Store** 的结构保存的，这里以 `/api` 开头的路由举例，通过`NewLegacyRESTStorage`方法创建各个资源的**RESTStorage**。RESTStorage 是一个结构体，具体的定义在`k8s.io/apiserver/pkg/registry/generic/registry/store.go`下，结构体内主要包含`NewFunc`返回特定资源信息、`NewListFunc`返回特定资源列表、`CreateStrategy`特定资源创建时的策略、`UpdateStrategy`更新时的策略以及`DeleteStrategy`删除时的策略等重要方法。在`NewLegacyRESTStorage`内部，可以看到创建了多种资源的 RESTStorage
 
@@ -2381,7 +2382,7 @@ func createHandler(r rest.NamedCreater, scope *RequestScope, admit admission.Int
 }
 ```
 
-### 调用链分析
+## 调用链分析
 
 回过头来看InstallLegacyAPI整个调用链：InstallLegacyAPI => NewLegacyRESTStorage => InstallLegacyAPIGroup => installAPIResources => getAPIGroupVersion => InstallREST => installer.Install
 

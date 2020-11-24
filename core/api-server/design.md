@@ -1,7 +1,28 @@
 kube-apiserver
 ==============
 
-[TOC]
+Table of Contents
+=================
+
+* [kube-apiserver](#kube-apiserver)
+  * [概念梳理](#\xE6\xA6\x82\xE5\xBF\xB5\xE6\xA2\xB3\xE7\x90\x86)
+     * [AggregatorServer](#aggregatorserver)
+     * [KubeAPIServer](#kubeapiserver)
+     * [APIExtensionServer](#apiextensionserver)
+  * [启动流程](#\xE5\x90\xAF\xE5\x8A\xA8\xE6\xB5\x81\xE7\xA8\x8B)
+     * [CreateServerChain](#createserverchain)
+     * [APIExtensionsServer创建](#apiextensionsserver\xE5\x88\x9B\xE5\xBB\xBA)
+     * [KubeAPIServer创建](#kubeapiserver\xE5\x88\x9B\xE5\xBB\xBA)
+     * [AggregatorServer创建](#aggregatorserver\xE5\x88\x9B\xE5\xBB\xBA)
+  * [server.PrepareRun](#serverpreparerun)
+  * [prepared.Run](#preparedrun)
+  * [storageFactory 的构建](#storagefactory-\xE7\x9A\x84\xE6\x9E\x84\xE5\xBB\xBA)
+     * [NewLegacyRESTStorage](#newlegacyreststorage)
+     * [podstore.NewStorage](#podstorenewstorage)
+     * [store.CompleteWithOptions](#storecompletewithoptions)
+     * [newETCD3Storage](#newetcd3storage)
+     * [路由注册](#\xE8\xB7\xAF\xE7\x94\xB1\xE6\xB3\xA8\xE5\x86\x8C)
+     * [调用链分析](#\xE8\xB0\x83\xE7\x94\xA8\xE9\x93\xBE\xE5\x88\x86\xE6\x9E\x90)
 
 kube-apiserver作为整个Kubernetes集群操作etcd的唯一入口，负责Kubernetes各资源的认证&鉴权，校验以及CRUD等操作。Kubernetes提供RESTful APIs，供其它组件调用，本文将对kube-apiserver整体架构进行源码分析(后续分章节展开各部分细节)
 

@@ -1,6 +1,8 @@
 kube-apiserver
 ==============
 
+[TOC]
+
 kube-apiserver作为整个Kubernetes集群操作etcd的唯一入口，负责Kubernetes各资源的认证&鉴权，校验以及CRUD等操作。Kubernetes提供RESTful APIs，供其它组件调用，本文将对kube-apiserver整体架构进行源码分析(后续分章节展开各部分细节)
 
 ## 概念梳理

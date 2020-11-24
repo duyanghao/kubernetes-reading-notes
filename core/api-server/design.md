@@ -1854,6 +1854,7 @@ func (m *Master) InstallLegacyAPI(c *completedConfig, restOptionsGetter generic.
 - `installer.Install`：返回最终的 `restful.WebService` 对象
 
 ```go
+// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/genericapiserver.go:428
 func (s *GenericAPIServer) InstallLegacyAPIGroup(apiPrefix string, apiGroupInfo *APIGroupInfo) error {
 	if !s.legacyAPIGroupPrefixes.Has(apiPrefix) {
 		return fmt.Errorf("%q is not in the allowed legacy API prefixes: %v", apiPrefix, s.legacyAPIGroupPrefixes.List())
@@ -1898,6 +1899,18 @@ func (s *GenericAPIServer) installAPIResources(apiPrefix string, apiGroupInfo *A
 	return nil
 }
 
+func (s *GenericAPIServer) getAPIGroupVersion(apiGroupInfo *APIGroupInfo, groupVersion schema.GroupVersion, apiPrefix string) *genericapi.APIGroupVersion {
+	storage := make(map[string]rest.Storage)
+	for k, v := range apiGroupInfo.VersionedResourcesStorageMap[groupVersion.Version] {
+		storage[strings.ToLower(k)] = v
+	}
+	version := s.newAPIGroupVersion(apiGroupInfo, groupVersion)
+	version.Root = apiPrefix
+	version.Storage = storage
+	return version
+}
+
+// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints/groupversion.go:94
 // InstallREST registers the REST handlers (storage, watch, proxy and redirect) into a restful Container.
 // It is expected that the provided path root prefix will serve all operations. Root MUST NOT end
 // in a slash.
@@ -1916,6 +1929,7 @@ func (g *APIGroupVersion) InstallREST(container *restful.Container) error {
 	return utilerrors.NewAggregate(registrationErrors)
 }
 
+// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints/installer.go:92
 // Install handlers for API resources.
 func (a *APIInstaller) Install() ([]metav1.APIResource, *restful.WebService, []error) {
 	var apiResources []metav1.APIResource
@@ -1946,10 +1960,11 @@ func (a *APIInstaller) Install() ([]metav1.APIResource, *restful.WebService, []e
 registerResourceHandlers方法实现了 `rest.Storage` 到 `restful.Route` 的转换，其首先会判断 API Resource 所支持的 REST 接口，然后为 REST 接口添加对应的 handler，最后将其注册到路由中
 
 ```go
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/installer.go:181
 func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storage, ws *restful.WebService) (*metav1.APIResource, error) {
 	...
 
-  // 1、判断该 resource 实现了哪些 REST 操作接口，以此来判断其支持的 verbs 以便为其添加路由
+	// 1、判断该 resource 实现了哪些 REST 操作接口，以此来判断其支持的 verbs 以便为其添加路由
 	// what verbs are supported by the storage, used to know what verbs we support per path
 	creater, isCreater := storage.(rest.Creater)
 	namedCreater, isNamedCreater := storage.(rest.NamedCreater)
@@ -1966,7 +1981,7 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 	storageVersionProvider, isStorageVersionProvider := storage.(rest.StorageVersionProvider)
 
 	...
-  // 2、为 resource 添加对应的 actions(+根据是否支持 namespace)
+	// 2、为 resource 添加对应的 actions(+根据是否支持 namespace)
 	// Get the list of actions for the given scope.
 	switch {
 	case !namespaceScoped:
@@ -2343,4 +2358,365 @@ func createHandler(r rest.NamedCreater, scope *RequestScope, admit admission.Int
 	}
 }
 ```
+
+### 调用链分析
+
+回过头来看InstallLegacyAPI整个调用链：InstallLegacyAPI => NewLegacyRESTStorage => InstallLegacyAPIGroup => installAPIResources => getAPIGroupVersion => InstallREST => installer.Install
+
+可以看到NewLegacyRESTStorage返回了apiGroupInfo，apiGroupInfo.VersionedResourcesStorageMap["v1"] = restStorageMap，而restStorageMap为rest.Storage Map，如下：
+
+```go
+	nodeStorage, err := nodestore.NewStorage(restOptionsGetter, c.KubeletClientConfig, c.ProxyTransport)
+	if err != nil {
+		return LegacyRESTStorage{}, genericapiserver.APIGroupInfo{}, err
+	}
+
+	podStorage, err := podstore.NewStorage(
+		restOptionsGetter,
+		nodeStorage.KubeletConnectionInfo,
+		c.ProxyTransport,
+		podDisruptionClient,
+	)
+	...
+	restStorageMap := map[string]rest.Storage{
+		"pods":             podStorage.Pod,
+		"pods/attach":      podStorage.Attach,
+		"pods/status":      podStorage.Status,
+		"pods/log":         podStorage.Log,
+		"pods/exec":        podStorage.Exec,
+		"pods/portforward": podStorage.PortForward,
+		"pods/proxy":       podStorage.Proxy,
+		"pods/binding":     podStorage.Binding,
+		"bindings":         podStorage.LegacyBinding,
+
+		"podTemplates": podTemplateStorage,
+
+		"replicationControllers":        controllerStorage.Controller,
+		"replicationControllers/status": controllerStorage.Status,
+
+		"services":        serviceRest,
+		"services/proxy":  serviceRestProxy,
+		"services/status": serviceStatusStorage,
+
+		"endpoints": endpointsStorage,
+
+		"nodes":        nodeStorage.Node,
+		"nodes/status": nodeStorage.Status,
+		"nodes/proxy":  nodeStorage.Proxy,
+
+		"events": eventStorage,
+
+		"limitRanges":                   limitRangeStorage,
+		"resourceQuotas":                resourceQuotaStorage,
+		"resourceQuotas/status":         resourceQuotaStatusStorage,
+		"namespaces":                    namespaceStorage,
+		"namespaces/status":             namespaceStatusStorage,
+		"namespaces/finalize":           namespaceFinalizeStorage,
+		"secrets":                       secretStorage,
+		"serviceAccounts":               serviceAccountStorage,
+		"persistentVolumes":             persistentVolumeStorage,
+		"persistentVolumes/status":      persistentVolumeStatusStorage,
+		"persistentVolumeClaims":        persistentVolumeClaimStorage,
+		"persistentVolumeClaims/status": persistentVolumeClaimStatusStorage,
+		"configMaps":                    configMapStorage,
+
+		"componentStatuses": componentstatus.NewStorage(componentStatusStorage{c.StorageFactory}.serversToValidate),
+	}
+```
+
+在installAPIResources中，会遍历apiGroupInfo.PrioritizedVersions，然后生成apiGroupVersion，接着后掉用apiGroupVersion.InstallREST执行具体某个group版本的Install操作(installer.Install())：
+
+```go
+// Install handlers for API resources.
+func (a *APIInstaller) Install() ([]metav1.APIResource, *restful.WebService, []error) {
+	var apiResources []metav1.APIResource
+	var errors []error
+	ws := a.newWebService()
+
+	// Register the paths in a deterministic (sorted) order to get a deterministic swagger spec.
+	paths := make([]string, len(a.group.Storage))
+	var i int = 0
+	for path := range a.group.Storage {
+		paths[i] = path
+		i++
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		apiResource, err := a.registerResourceHandlers(path, a.group.Storage[path], ws)
+		if err != nil {
+			errors = append(errors, fmt.Errorf("error in registering resource: %s, %v", path, err))
+		}
+		if apiResource != nil {
+			apiResources = append(apiResources, *apiResource)
+		}
+	}
+	return apiResources, ws, errors
+}
+```
+
+在Install函数中，会构建paths slice，然后将a.group.Storage中的key添加到该slice中。而APIInstaller.group.Storage是APIGroupVersion.Storage，并在getAPIGroupVersion函数中构建：
+
+```go
+func (s *GenericAPIServer) getAPIGroupVersion(apiGroupInfo *APIGroupInfo, groupVersion schema.GroupVersion, apiPrefix string) *genericapi.APIGroupVersion {
+	storage := make(map[string]rest.Storage)
+	for k, v := range apiGroupInfo.VersionedResourcesStorageMap[groupVersion.Version] {
+		storage[strings.ToLower(k)] = v
+	}
+	version := s.newAPIGroupVersion(apiGroupInfo, groupVersion)
+	version.Root = apiPrefix
+	version.Storage = storage
+	return version
+}
+```
+
+可以看到storage(map[string]rest.Storage)是由apiGroupInfo.VersionedResourcesStorageMap[v1]构建的：
+
+```go
+	restStorageMap := map[string]rest.Storage{
+		"pods":             podStorage.Pod,
+		"pods/attach":      podStorage.Attach,
+		"pods/status":      podStorage.Status,
+		"pods/log":         podStorage.Log,
+		"pods/exec":        podStorage.Exec,
+		"pods/portforward": podStorage.PortForward,
+		"pods/proxy":       podStorage.Proxy,
+		"pods/binding":     podStorage.Binding,
+		"bindings":         podStorage.LegacyBinding,
+
+		"podTemplates": podTemplateStorage,
+
+		"replicationControllers":        controllerStorage.Controller,
+		"replicationControllers/status": controllerStorage.Status,
+
+		"services":        serviceRest,
+		"services/proxy":  serviceRestProxy,
+		"services/status": serviceStatusStorage,
+
+		"endpoints": endpointsStorage,
+
+		"nodes":        nodeStorage.Node,
+		"nodes/status": nodeStorage.Status,
+		"nodes/proxy":  nodeStorage.Proxy,
+
+		"events": eventStorage,
+
+		"limitRanges":                   limitRangeStorage,
+		"resourceQuotas":                resourceQuotaStorage,
+		"resourceQuotas/status":         resourceQuotaStatusStorage,
+		"namespaces":                    namespaceStorage,
+		"namespaces/status":             namespaceStatusStorage,
+		"namespaces/finalize":           namespaceFinalizeStorage,
+		"secrets":                       secretStorage,
+		"serviceAccounts":               serviceAccountStorage,
+		"persistentVolumes":             persistentVolumeStorage,
+		"persistentVolumes/status":      persistentVolumeStatusStorage,
+		"persistentVolumeClaims":        persistentVolumeClaimStorage,
+		"persistentVolumeClaims/status": persistentVolumeClaimStatusStorage,
+		"configMaps":                    configMapStorage,
+
+		"componentStatuses": componentstatus.NewStorage(componentStatusStorage{c.StorageFactory}.serversToValidate),
+	}
+	...
+	apiGroupInfo.VersionedResourcesStorageMap["v1"] = restStorageMap
+```
+
+这里最终构建的storage除了key为小写外，其它和restStorageMap一样。因此最终paths如下：
+
+```
+paths[0] -> pods
+paths[1] -> pods/attach
+...
+paths[x] -> componentStatuses
+```
+
+而传递给APIInstaller.registerResourceHandlers函数的也即是资源和资源对应的rest.Storage，例如’pods‘如下：
+
+```go
+apiResource, err := a.registerResourceHandlers("pods", podStorage.Pod, ws)
+```
+
+而最终落地到APIInstaller.registerResourceHandlers，该函数会根据资源rest.Storage是否实现了相关接口来判断该资源对HTTP Methods到支持情况，比如对HTTP GET Method的判断如下：
+
+```go
+getter, isGetter := storage.(rest.Getter)
+```
+
+显然，如果实现了该接口，则认为该资源支持HTTP GET操作，并会根据是否支持namespace来构造相应的action，而action包括Path(路径)以及Verb(行为)：
+
+```go
+// Struct capturing information about an action ("GET", "POST", "WATCH", "PROXY", etc).
+type action struct {
+	Verb          string               // Verb identifying the action ("GET", "POST", "WATCH", "PROXY", etc).
+	Path          string               // The path of the action
+	Params        []*restful.Parameter // List of parameters associated with the action.
+	Namer         handlers.ScopeNamer
+	AllNamespaces bool // true iff the action is namespaced but works on aggregate result for all namespaces
+}
+```
+
+比如pods的GET操作，如下：
+
+```go
+actions = appendIf(actions, action{"GET", "/api/apiVersion/namespaces/{namespace}/pods/{name}", nameParams, namer, false}, isGetter)
+```
+
+在构建完actions列表后，会遍历该列表，对每一个action创建其对应的handler(处理函数)，然后通过将HTTP Method和action.Path以及对应handler添加到route中形成路由：
+
+```go
+		case "GET": // Get a resource.
+			var handler restful.RouteFunction
+			if isGetterWithOptions {
+				handler = restfulGetResourceWithOptions(getterWithOptions, reqScope, isSubresource)
+			} else {
+				handler = restfulGetResource(getter, exporter, reqScope)
+			}
+
+			if needOverride {
+				// need change the reported verb
+				handler = metrics.InstrumentRouteFunc(verbOverrider.OverrideMetricsVerb(action.Verb), group, version, resource, subresource, requestScope, metrics.APIServerComponent, handler)
+			} else {
+				handler = metrics.InstrumentRouteFunc(action.Verb, group, version, resource, subresource, requestScope, metrics.APIServerComponent, handler)
+			}
+
+			doc := "read the specified " + kind
+			if isSubresource {
+				doc = "read " + subresource + " of the specified " + kind
+			}
+			route := ws.GET(action.Path).To(handler).
+				Doc(doc).
+				Param(ws.QueryParameter("pretty", "If 'true', then the output is pretty printed.")).
+				Operation("read"+namespaced+kind+strings.Title(subresource)+operationSuffix).
+				Produces(append(storageMeta.ProducesMIMETypes(action.Verb), mediaTypes...)...).
+				Returns(http.StatusOK, "OK", producedObject).
+				Writes(producedObject)
+			if isGetterWithOptions {
+				if err := AddObjectParams(ws, route, versionedGetOptions); err != nil {
+					return nil, err
+				}
+			}
+			if isExporter {
+				if err := AddObjectParams(ws, route, versionedExportOptions); err != nil {
+					return nil, err
+				}
+			}
+			addParams(route, action.Params)
+			routes = append(routes, route)
+
+
+// GetResource returns a function that handles retrieving a single resource from a rest.Storage object.
+func GetResource(r rest.Getter, e rest.Exporter, scope *RequestScope) http.HandlerFunc {
+	return getResourceHandler(scope,
+		func(ctx context.Context, name string, req *http.Request, trace *utiltrace.Trace) (runtime.Object, error) {
+			// check for export
+			options := metav1.GetOptions{}
+			if values := req.URL.Query(); len(values) > 0 {
+				exports := metav1.ExportOptions{}
+				if err := metainternalversionscheme.ParameterCodec.DecodeParameters(values, scope.MetaGroupVersion, &exports); err != nil {
+					err = errors.NewBadRequest(err.Error())
+					return nil, err
+				}
+				if exports.Export {
+					if e == nil {
+						return nil, errors.NewBadRequest(fmt.Sprintf("export of %q is not supported", scope.Resource.Resource))
+					}
+					return e.Export(ctx, name, exports)
+				}
+				if err := metainternalversionscheme.ParameterCodec.DecodeParameters(values, scope.MetaGroupVersion, &options); err != nil {
+					err = errors.NewBadRequest(err.Error())
+					return nil, err
+				}
+			}
+			if trace != nil {
+				trace.Step("About to Get from storage")
+			}
+			return r.Get(ctx, name, &options)
+		})
+}
+```
+
+这里最终会调用podStorage.Pod的Get函数，而podStorage.Pod也即REST{store, proxyTransport}：
+
+```go
+// REST implements a RESTStorage for pods
+type REST struct {
+	*genericregistry.Store
+	proxyTransport http.RoundTripper
+}
+
+// NewStorage returns a RESTStorage object that will work against pods.
+func NewStorage(optsGetter generic.RESTOptionsGetter, k client.ConnectionInfoGetter, proxyTransport http.RoundTripper, podDisruptionBudgetClient policyclient.PodDisruptionBudgetsGetter) (PodStorage, error) {
+
+	store := &genericregistry.Store{
+		NewFunc:                  func() runtime.Object { return &api.Pod{} },
+		NewListFunc:              func() runtime.Object { return &api.PodList{} },
+		PredicateFunc:            registrypod.MatchPod,
+		DefaultQualifiedResource: api.Resource("pods"),
+
+		CreateStrategy:      registrypod.Strategy,
+		UpdateStrategy:      registrypod.Strategy,
+		DeleteStrategy:      registrypod.Strategy,
+		ReturnDeletedObject: true,
+
+		TableConvertor: printerstorage.TableConvertor{TableGenerator: printers.NewTableGenerator().With(printersinternal.AddHandlers)},
+	}
+	options := &generic.StoreOptions{
+		RESTOptions: optsGetter,
+		AttrFunc:    registrypod.GetAttrs,
+		TriggerFunc: map[string]storage.IndexerFunc{"spec.nodeName": registrypod.NodeNameTriggerFunc},
+		Indexers:    registrypod.Indexers(),
+	}
+	if err := store.CompleteWithOptions(options); err != nil {
+		return PodStorage{}, err
+	}
+
+	statusStore := *store
+	statusStore.UpdateStrategy = registrypod.StatusStrategy
+	ephemeralContainersStore := *store
+	ephemeralContainersStore.UpdateStrategy = registrypod.EphemeralContainersStrategy
+
+	bindingREST := &BindingREST{store: store}
+	return PodStorage{
+		Pod:                 &REST{store, proxyTransport},
+		Binding:             &BindingREST{store: store},
+		LegacyBinding:       &LegacyBindingREST{bindingREST},
+		Eviction:            newEvictionStorage(store, podDisruptionBudgetClient),
+		Status:              &StatusREST{store: &statusStore},
+		EphemeralContainers: &EphemeralContainersREST{store: &ephemeralContainersStore},
+		Log:                 &podrest.LogREST{Store: store, KubeletConn: k},
+		Proxy:               &podrest.ProxyREST{Store: store, ProxyTransport: proxyTransport},
+		Exec:                &podrest.ExecREST{Store: store, KubeletConn: k},
+		Attach:              &podrest.AttachREST{Store: store, KubeletConn: k},
+		PortForward:         &podrest.PortForwardREST{Store: store, KubeletConn: k},
+	}, nil
+}
+```
+
+该结构继承了genericregistry.Store，并最终掉用该结构体对应的Get函数，如下：
+
+```go
+// Get retrieves the item from storage.
+func (e *Store) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+	obj := e.NewFunc()
+	key, err := e.KeyFunc(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.Storage.Get(ctx, key, options.ResourceVersion, obj, false); err != nil {
+		return nil, storeerr.InterpretGetError(err, e.qualifiedResourceFromContext(ctx), name)
+	}
+	if e.Decorator != nil {
+		if err := e.Decorator(obj); err != nil {
+			return nil, err
+		}
+	}
+	return obj, nil
+}
+```
+
+该函数会从etcd中读取相应的key并返回
+
+从上述分析可以总结如下：
+
+* (NewRESTStorage)通过创建rest.Storage并实现k8s.io/apiserver/pkg/registry/rest/rest.go中的相关接口来实现与存储后端(etcd)的CRUD操作
+* (InstallAPIGroup)通过判断rest.Storage实现的接口类型来构建路由信息，包括：HTTP Method，路径以及相应的处理函数
 

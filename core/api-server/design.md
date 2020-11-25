@@ -26,6 +26,8 @@ Table of Contents
 
 kube-apiserver作为整个Kubernetes集群操作etcd的唯一入口，负责Kubernetes各资源的认证&鉴权，校验以及CRUD等操作。Kubernetes提供RESTful APIs，供其它组件调用，本文将对kube-apiserver整体架构进行源码分析(后续分章节展开各部分细节)
 
+![img](https://feisky.gitbooks.io/kubernetes/content/components/images/kube-apiserver.png)
+
 ## 概念梳理
 
 上述分析了kube-apiserver的整体流程，也即：
@@ -2742,4 +2744,598 @@ func (e *Store) Get(ctx context.Context, name string, options *metav1.GetOptions
 
 * (NewRESTStorage)通过创建rest.Storage并实现k8s.io/apiserver/pkg/registry/rest/rest.go中的相关接口来实现与存储后端(etcd)的CRUD操作
 * (InstallAPIGroup)通过判断rest.Storage实现的接口类型来构建路由信息，包括：HTTP Method，路径以及相应的处理函数
+
+### 调用拓扑
+
+调用 `genericapiserver.NewConfig` 生成默认的 genericConfig，genericConfig 中主要配置了 `DefaultBuildHandlerChain`，`DefaultBuildHandlerChain` 中包含了认证、鉴权等一系列 http filter chain；
+
+```go
+// CreateServerChain creates the apiservers connected via delegation.
+func CreateServerChain(completedOptions completedServerRunOptions, stopCh <-chan struct{}) (*aggregatorapiserver.APIAggregator, error) {
+	...
+	kubeAPIServerConfig, insecureServingInfo, serviceResolver, pluginInitializer, err := CreateKubeAPIServerConfig(completedOptions, nodeTunneler, proxyTransport)
+	if err != nil {
+		return nil, err
+	}
+
+	...
+	kubeAPIServer, err := CreateKubeAPIServer(kubeAPIServerConfig, apiExtensionsServer.GenericAPIServer)
+	if err != nil {
+		return nil, err
+	}
+	...
+
+	return aggregatorServer, nil
+}
+
+// CreateKubeAPIServerConfig creates all the resources for running the API server, but runs none of them
+func CreateKubeAPIServerConfig(
+	s completedServerRunOptions,
+	nodeTunneler tunneler.Tunneler,
+	proxyTransport *http.Transport,
+) (
+	*master.Config,
+	*genericapiserver.DeprecatedInsecureServingInfo,
+	aggregatorapiserver.ServiceResolver,
+	[]admission.PluginInitializer,
+	error,
+) {
+	genericConfig, versionedInformers, insecureServingInfo, serviceResolver, pluginInitializers, admissionPostStartHook, storageFactory, err := buildGenericConfig(s.ServerRunOptions, proxyTransport)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	...
+
+	return config, insecureServingInfo, serviceResolver, pluginInitializers, nil
+}
+
+// BuildGenericConfig takes the master server options and produces the genericapiserver.Config associated with it
+func buildGenericConfig(
+	s *options.ServerRunOptions,
+	proxyTransport *http.Transport,
+) (
+	genericConfig *genericapiserver.Config,
+	versionedInformers clientgoinformers.SharedInformerFactory,
+	insecureServingInfo *genericapiserver.DeprecatedInsecureServingInfo,
+	serviceResolver aggregatorapiserver.ServiceResolver,
+	pluginInitializers []admission.PluginInitializer,
+	admissionPostStartHook genericapiserver.PostStartHookFunc,
+	storageFactory *serverstorage.DefaultStorageFactory,
+	lastErr error,
+) {
+	// 1、为 genericConfig 设置默认值
+	genericConfig = genericapiserver.NewConfig(legacyscheme.Codecs)
+	genericConfig.MergedResourceConfig = master.DefaultAPIResourceConfigSource()
+
+	...
+
+	genericConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(generatedopenapi.GetOpenAPIDefinitions, openapinamer.NewDefinitionNamer(legacyscheme.Scheme, extensionsapiserver.Scheme, aggregatorscheme.Scheme))
+	genericConfig.OpenAPIConfig.Info.Title = "Kubernetes"
+	genericConfig.LongRunningFunc = filters.BasicLongRunningRequestCheck(
+		sets.NewString("watch", "proxy"),
+		sets.NewString("attach", "exec", "proxy", "log", "portforward"),
+	)
+
+	kubeVersion := version.Get()
+	genericConfig.Version = &kubeVersion
+
+	storageFactoryConfig := kubeapiserver.NewStorageFactoryConfig()
+	storageFactoryConfig.APIResourceConfig = genericConfig.MergedResourceConfig
+	completedStorageFactoryConfig, err := storageFactoryConfig.Complete(s.Etcd)
+	if err != nil {
+		lastErr = err
+		return
+	}
+	// 初始化 storageFactory
+	storageFactory, lastErr = completedStorageFactoryConfig.New()
+	if lastErr != nil {
+		return
+	}
+	if genericConfig.EgressSelector != nil {
+		storageFactory.StorageConfig.Transport.EgressLookup = genericConfig.EgressSelector.Lookup
+	}
+	// 2、初始化 RESTOptionsGetter，后期根据其获取操作 Etcd 的句柄，同时添加 etcd 的健康检查方法
+	if lastErr = s.Etcd.ApplyWithStorageFactoryTo(storageFactory, genericConfig); lastErr != nil {
+		return
+	}
+
+	// 3、设置使用 protobufs 用来内部交互，并且禁用压缩功能
+	// Use protobufs for self-communication.
+	// Since not every generic apiserver has to support protobufs, we
+	// cannot default to it in generic apiserver and need to explicitly
+	// set it in kube-apiserver.
+	genericConfig.LoopbackClientConfig.ContentConfig.ContentType = "application/vnd.kubernetes.protobuf"
+	// Disable compression for self-communication, since we are going to be
+	// on a fast local network
+	genericConfig.LoopbackClientConfig.DisableCompression = true
+
+	// 4、创建 clientset
+	kubeClientConfig := genericConfig.LoopbackClientConfig
+	clientgoExternalClient, err := clientgoclientset.NewForConfig(kubeClientConfig)
+	if err != nil {
+		lastErr = fmt.Errorf("failed to create real external clientset: %v", err)
+		return
+	}
+	versionedInformers = clientgoinformers.NewSharedInformerFactory(clientgoExternalClient, 10*time.Minute)
+
+	// 5、创建认证实例，支持多种认证方式：请求 Header 认证、Auth 文件认证、CA 证书认证、Bearer token 认证、
+	// ServiceAccount 认证、BootstrapToken 认证、WebhookToken 认证等
+	genericConfig.Authentication.Authenticator, genericConfig.OpenAPIConfig.SecurityDefinitions, err = BuildAuthenticator(s, genericConfig.EgressSelector, clientgoExternalClient, versionedInformers)
+	if err != nil {
+		lastErr = fmt.Errorf("invalid authentication config: %v", err)
+		return
+	}
+
+	// 6、创建鉴权实例，包含：Node、RBAC、Webhook、ABAC、AlwaysAllow、AlwaysDeny
+	genericConfig.Authorization.Authorizer, genericConfig.RuleResolver, err = BuildAuthorizer(s, genericConfig.EgressSelector, versionedInformers)
+	if err != nil {
+		lastErr = fmt.Errorf("invalid authorization config: %v", err)
+		return
+	}
+	if !sets.NewString(s.Authorization.Modes...).Has(modes.ModeRBAC) {
+		genericConfig.DisabledPostStartHooks.Insert(rbacrest.PostStartHookName)
+	}
+
+	admissionConfig := &kubeapiserveradmission.Config{
+		ExternalInformers:    versionedInformers,
+		LoopbackClientConfig: genericConfig.LoopbackClientConfig,
+		CloudConfigFile:      s.CloudProvider.CloudConfigFile,
+	}
+	serviceResolver = buildServiceResolver(s.EnableAggregatorRouting, genericConfig.LoopbackClientConfig.Host, versionedInformers)
+
+	authInfoResolverWrapper := webhook.NewDefaultAuthenticationInfoResolverWrapper(proxyTransport, genericConfig.EgressSelector, genericConfig.LoopbackClientConfig)
+
+	// 7、审计插件的初始化
+	lastErr = s.Audit.ApplyTo(
+		genericConfig,
+		genericConfig.LoopbackClientConfig,
+		versionedInformers,
+		serveroptions.NewProcessInfo("kube-apiserver", "kube-system"),
+		&serveroptions.WebhookOptions{
+			AuthInfoResolverWrapper: authInfoResolverWrapper,
+			ServiceResolver:         serviceResolver,
+		},
+	)
+	if lastErr != nil {
+		return
+	}
+
+	// 8、准入插件的初始化
+	pluginInitializers, admissionPostStartHook, err = admissionConfig.New(proxyTransport, genericConfig.EgressSelector, serviceResolver)
+	if err != nil {
+		lastErr = fmt.Errorf("failed to create admission plugin initializer: %v", err)
+		return
+	}
+
+	err = s.Admission.ApplyTo(
+		genericConfig,
+		versionedInformers,
+		kubeClientConfig,
+		feature.DefaultFeatureGate,
+		pluginInitializers...)
+	if err != nil {
+		lastErr = fmt.Errorf("failed to initialize admission: %v", err)
+	}
+
+	return
+}
+
+// NewConfig returns a Config struct with the default values
+func NewConfig(codecs serializer.CodecFactory) *Config {
+	defaultHealthChecks := []healthz.HealthChecker{healthz.PingHealthz, healthz.LogHealthz}
+	return &Config{
+		Serializer:                  codecs,
+		BuildHandlerChainFunc:       DefaultBuildHandlerChain,
+		HandlerChainWaitGroup:       new(utilwaitgroup.SafeWaitGroup),
+		LegacyAPIGroupPrefixes:      sets.NewString(DefaultLegacyAPIPrefix),
+		DisabledPostStartHooks:      sets.NewString(),
+		PostStartHooks:              map[string]PostStartHookConfigEntry{},
+		HealthzChecks:               append([]healthz.HealthChecker{}, defaultHealthChecks...),
+		ReadyzChecks:                append([]healthz.HealthChecker{}, defaultHealthChecks...),
+		LivezChecks:                 append([]healthz.HealthChecker{}, defaultHealthChecks...),
+		EnableIndex:                 true,
+		EnableDiscovery:             true,
+		EnableProfiling:             true,
+		EnableMetrics:               true,
+		MaxRequestsInFlight:         400,
+		MaxMutatingRequestsInFlight: 200,
+		RequestTimeout:              time.Duration(60) * time.Second,
+		MinRequestTimeout:           1800,
+		LivezGracePeriod:            time.Duration(0),
+		ShutdownDelayDuration:       time.Duration(0),
+		// 1.5MB is the default client request size in bytes
+		// the etcd server should accept. See
+		// https://github.com/etcd-io/etcd/blob/release-3.4/embed/config.go#L56.
+		// A request body might be encoded in json, and is converted to
+		// proto when persisted in etcd, so we allow 2x as the largest size
+		// increase the "copy" operations in a json patch may cause.
+		JSONPatchMaxCopyBytes: int64(3 * 1024 * 1024),
+		// 1.5MB is the recommended client request size in byte
+		// the etcd server should accept. See
+		// https://github.com/etcd-io/etcd/blob/release-3.4/embed/config.go#L56.
+		// A request body might be encoded in json, and is converted to
+		// proto when persisted in etcd, so we allow 2x as the largest request
+		// body size to be accepted and decoded in a write request.
+		MaxRequestBodyBytes: int64(3 * 1024 * 1024),
+
+		// Default to treating watch as a long-running operation
+		// Generic API servers have no inherent long-running subresources
+		LongRunningFunc: genericfilters.BasicLongRunningRequestCheck(sets.NewString("watch"), sets.NewString()),
+	}
+}
+
+// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/config.go:664
+func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
+	handler := genericapifilters.WithAuthorization(apiHandler, c.Authorization.Authorizer, c.Serializer)
+	if c.FlowControl != nil {
+		handler = genericfilters.WithPriorityAndFairness(handler, c.LongRunningFunc, c.FlowControl)
+	} else {
+		handler = genericfilters.WithMaxInFlightLimit(handler, c.MaxRequestsInFlight, c.MaxMutatingRequestsInFlight, c.LongRunningFunc)
+	}
+	handler = genericapifilters.WithImpersonation(handler, c.Authorization.Authorizer, c.Serializer)
+	handler = genericapifilters.WithAudit(handler, c.AuditBackend, c.AuditPolicyChecker, c.LongRunningFunc)
+	failedHandler := genericapifilters.Unauthorized(c.Serializer, c.Authentication.SupportsBasicAuth)
+	failedHandler = genericapifilters.WithFailedAuthenticationAudit(failedHandler, c.AuditBackend, c.AuditPolicyChecker)
+	handler = genericapifilters.WithAuthentication(handler, c.Authentication.Authenticator, failedHandler, c.Authentication.APIAudiences)
+	handler = genericfilters.WithCORS(handler, c.CorsAllowedOriginList, nil, nil, nil, "true")
+	handler = genericfilters.WithTimeoutForNonLongRunningRequests(handler, c.LongRunningFunc, c.RequestTimeout)
+	handler = genericfilters.WithWaitGroup(handler, c.LongRunningFunc, c.HandlerChainWaitGroup)
+	handler = genericapifilters.WithRequestInfo(handler, c.RequestInfoResolver)
+	if c.SecureServing != nil && !c.SecureServing.DisableHTTP2 && c.GoawayChance > 0 {
+		handler = genericfilters.WithProbabilisticGoaway(handler, c.GoawayChance)
+	}
+	handler = genericapifilters.WithCacheControl(handler)
+	handler = genericfilters.WithPanicRecovery(handler)
+	return handler
+}
+
+// DefaultAPIResourceConfigSource returns default configuration for an APIResource.
+func DefaultAPIResourceConfigSource() *serverstorage.ResourceConfig {
+	ret := serverstorage.NewResourceConfig()
+	// NOTE: GroupVersions listed here will be enabled by default. Don't put alpha versions in the list.
+	ret.EnableVersions(
+		admissionregistrationv1.SchemeGroupVersion,
+		admissionregistrationv1beta1.SchemeGroupVersion,
+		apiv1.SchemeGroupVersion,
+		appsv1.SchemeGroupVersion,
+		authenticationv1.SchemeGroupVersion,
+		authenticationv1beta1.SchemeGroupVersion,
+		authorizationapiv1.SchemeGroupVersion,
+		authorizationapiv1beta1.SchemeGroupVersion,
+		autoscalingapiv1.SchemeGroupVersion,
+		autoscalingapiv2beta1.SchemeGroupVersion,
+		autoscalingapiv2beta2.SchemeGroupVersion,
+		batchapiv1.SchemeGroupVersion,
+		batchapiv1beta1.SchemeGroupVersion,
+		certificatesapiv1beta1.SchemeGroupVersion,
+		coordinationapiv1.SchemeGroupVersion,
+		coordinationapiv1beta1.SchemeGroupVersion,
+		discoveryv1beta1.SchemeGroupVersion,
+		eventsv1beta1.SchemeGroupVersion,
+		extensionsapiv1beta1.SchemeGroupVersion,
+		networkingapiv1.SchemeGroupVersion,
+		networkingapiv1beta1.SchemeGroupVersion,
+		nodev1beta1.SchemeGroupVersion,
+		policyapiv1beta1.SchemeGroupVersion,
+		rbacv1.SchemeGroupVersion,
+		rbacv1beta1.SchemeGroupVersion,
+		storageapiv1.SchemeGroupVersion,
+		storageapiv1beta1.SchemeGroupVersion,
+		schedulingapiv1beta1.SchemeGroupVersion,
+		schedulingapiv1.SchemeGroupVersion,
+	)
+	// enable non-deprecated beta resources in extensions/v1beta1 explicitly so we have a full list of what's possible to serve
+	ret.EnableResources(
+		extensionsapiv1beta1.SchemeGroupVersion.WithResource("ingresses"),
+	)
+	// disable alpha versions explicitly so we have a full list of what's possible to serve
+	ret.DisableVersions(
+		auditregistrationv1alpha1.SchemeGroupVersion,
+		batchapiv2alpha1.SchemeGroupVersion,
+		nodev1alpha1.SchemeGroupVersion,
+		rbacv1alpha1.SchemeGroupVersion,
+		schedulingv1alpha1.SchemeGroupVersion,
+		settingsv1alpha1.SchemeGroupVersion,
+		storageapiv1alpha1.SchemeGroupVersion,
+		flowcontrolv1alpha1.SchemeGroupVersion,
+	)
+
+	return ret
+}
+```
+
+这里通过`genericapiserver.NewConfig`设置了Config.BuildHandlerChainFunc并在返回之后设置了Config.MergedResourceConfig，如下：
+
+```go
+// BuildGenericConfig takes the master server options and produces the genericapiserver.Config associated with it
+func buildGenericConfig(
+	s *options.ServerRunOptions,
+	proxyTransport *http.Transport,
+) (
+	genericConfig *genericapiserver.Config,
+	versionedInformers clientgoinformers.SharedInformerFactory,
+	insecureServingInfo *genericapiserver.DeprecatedInsecureServingInfo,
+	serviceResolver aggregatorapiserver.ServiceResolver,
+	pluginInitializers []admission.PluginInitializer,
+	admissionPostStartHook genericapiserver.PostStartHookFunc,
+	storageFactory *serverstorage.DefaultStorageFactory,
+	lastErr error,
+) {
+	genericConfig = genericapiserver.NewConfig(legacyscheme.Codecs)
+	genericConfig.MergedResourceConfig = master.DefaultAPIResourceConfigSource()
+	...
+}
+
+// NewConfig returns a Config struct with the default values
+func NewConfig(codecs serializer.CodecFactory) *Config {
+	defaultHealthChecks := []healthz.HealthChecker{healthz.PingHealthz, healthz.LogHealthz}
+	return &Config{
+		Serializer:                  codecs,
+		BuildHandlerChainFunc:       DefaultBuildHandlerChain,
+		...    
+	}
+}
+```
+
+其中DefaultBuildHandlerChain为一些filter处理函数，而在创建apiserver过程中会使用这个config.BuildHandlerChainFunc：
+
+CreateKubeAPIServer => kubeAPIServerConfig.Complete().New => c.GenericConfig.New：
+
+```go
+// APIServerHandlers holds the different http.Handlers used by the API server.
+// This includes the full handler chain, the director (which chooses between gorestful and nonGoRestful,
+// the gorestful handler (used for the API) which falls through to the nonGoRestful handler on unregistered paths,
+// and the nonGoRestful handler (which can contain a fallthrough of its own)
+// FullHandlerChain -> Director -> {GoRestfulContainer,NonGoRestfulMux} based on inspection of registered web services
+type APIServerHandler struct {
+	// FullHandlerChain is the one that is eventually served with.  It should include the full filter
+	// chain and then call the Director.
+	FullHandlerChain http.Handler
+	// The registered APIs.  InstallAPIs uses this.  Other servers probably shouldn't access this directly.
+	GoRestfulContainer *restful.Container
+	// NonGoRestfulMux is the final HTTP handler in the chain.
+	// It comes after all filters and the API handling
+	// This is where other servers can attach handler to various parts of the chain.
+	NonGoRestfulMux *mux.PathRecorderMux
+
+	// Director is here so that we can properly handle fall through and proxy cases.
+	// This looks a bit bonkers, but here's what's happening.  We need to have /apis handling registered in gorestful in order to have
+	// swagger generated for compatibility.  Doing that with `/apis` as a webservice, means that it forcibly 404s (no defaulting allowed)
+	// all requests which are not /apis or /apis/.  We need those calls to fall through behind goresful for proper delegation.  Trying to
+	// register for a pattern which includes everything behind it doesn't work because gorestful negotiates for verbs and content encoding
+	// and all those things go crazy when gorestful really just needs to pass through.  In addition, openapi enforces unique verb constraints
+	// which we don't fit into and it still muddies up swagger.  Trying to switch the webservices into a route doesn't work because the
+	//  containing webservice faces all the same problems listed above.
+	// This leads to the crazy thing done here.  Our mux does what we need, so we'll place it in front of gorestful.  It will introspect to
+	// decide if the route is likely to be handled by goresful and route there if needed.  Otherwise, it goes to PostGoRestful mux in
+	// order to handle "normal" paths and delegation. Hopefully no API consumers will ever have to deal with this level of detail.  I think
+	// we should consider completely removing gorestful.
+	// Other servers should only use this opaquely to delegate to an API server.
+	Director http.Handler
+}
+
+// New creates a new server which logically combines the handling chain with the passed server.
+// name is used to differentiate for logging. The handler chain in particular can be difficult as it starts delgating.
+// delegationTarget may not be nil.
+func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*GenericAPIServer, error) {
+	...
+	handlerChainBuilder := func(handler http.Handler) http.Handler {
+		return c.BuildHandlerChainFunc(handler, c.Config)
+	}
+	apiServerHandler := NewAPIServerHandler(name, c.Serializer, handlerChainBuilder, delegationTarget.UnprotectedHandler())
+
+	s := &GenericAPIServer{
+		discoveryAddresses:         c.DiscoveryAddresses,
+		LoopbackClientConfig:       c.LoopbackClientConfig,
+		legacyAPIGroupPrefixes:     c.LegacyAPIGroupPrefixes,
+		admissionControl:           c.AdmissionControl,
+		Serializer:                 c.Serializer,
+		AuditBackend:               c.AuditBackend,
+		Authorizer:                 c.Authorization.Authorizer,
+		delegationTarget:           delegationTarget,
+		EquivalentResourceRegistry: c.EquivalentResourceRegistry,
+		HandlerChainWaitGroup:      c.HandlerChainWaitGroup,
+
+		minRequestTimeout:     time.Duration(c.MinRequestTimeout) * time.Second,
+		ShutdownTimeout:       c.RequestTimeout,
+		ShutdownDelayDuration: c.ShutdownDelayDuration,
+		SecureServingInfo:     c.SecureServing,
+		ExternalAddress:       c.ExternalAddress,
+
+		Handler: apiServerHandler,
+
+		listedPathProvider: apiServerHandler,
+
+		openAPIConfig: c.OpenAPIConfig,
+
+		postStartHooks:         map[string]postStartHookEntry{},
+		preShutdownHooks:       map[string]preShutdownHookEntry{},
+		disabledPostStartHooks: c.DisabledPostStartHooks,
+
+		healthzChecks:    c.HealthzChecks,
+		livezChecks:      c.LivezChecks,
+		readyzChecks:     c.ReadyzChecks,
+		readinessStopCh:  make(chan struct{}),
+		livezGracePeriod: c.LivezGracePeriod,
+
+		DiscoveryGroupManager: discovery.NewRootAPIsHandler(c.DiscoveryAddresses, c.Serializer),
+
+		maxRequestBodyBytes: c.MaxRequestBodyBytes,
+		livezClock:          clock.RealClock{},
+	}
+	...
+
+	installAPI(s, c.Config)
+
+	return s, nil
+}
+
+// FullHandlerChain -> Director -> {GoRestfulContainer,NonGoRestfulMux} based on inspection of registered web services
+func NewAPIServerHandler(name string, s runtime.NegotiatedSerializer, handlerChainBuilder HandlerChainBuilderFn, notFoundHandler http.Handler) *APIServerHandler {
+	nonGoRestfulMux := mux.NewPathRecorderMux(name)
+	if notFoundHandler != nil {
+		nonGoRestfulMux.NotFoundHandler(notFoundHandler)
+	}
+
+	gorestfulContainer := restful.NewContainer()
+	gorestfulContainer.ServeMux = http.NewServeMux()
+	gorestfulContainer.Router(restful.CurlyRouter{}) // e.g. for proxy/{kind}/{name}/{*}
+	gorestfulContainer.RecoverHandler(func(panicReason interface{}, httpWriter http.ResponseWriter) {
+		logStackOnRecover(s, panicReason, httpWriter)
+	})
+	gorestfulContainer.ServiceErrorHandler(func(serviceErr restful.ServiceError, request *restful.Request, response *restful.Response) {
+		serviceErrorHandler(s, serviceErr, request, response)
+	})
+
+	director := director{
+		name:               name,
+		goRestfulContainer: gorestfulContainer,
+		nonGoRestfulMux:    nonGoRestfulMux,
+	}
+
+	return &APIServerHandler{
+		FullHandlerChain:   handlerChainBuilder(director),
+		GoRestfulContainer: gorestfulContainer,
+		NonGoRestfulMux:    nonGoRestfulMux,
+		Director:           director,
+	}
+}
+
+func installAPI(s *GenericAPIServer, c *Config) {
+	if c.EnableIndex {
+		routes.Index{}.Install(s.listedPathProvider, s.Handler.NonGoRestfulMux)
+	}
+	if c.EnableProfiling {
+		routes.Profiling{}.Install(s.Handler.NonGoRestfulMux)
+		if c.EnableContentionProfiling {
+			goruntime.SetBlockProfileRate(1)
+		}
+		// so far, only logging related endpoints are considered valid to add for these debug flags.
+		routes.DebugFlags{}.Install(s.Handler.NonGoRestfulMux, "v", routes.StringFlagPutHandler(logs.GlogSetter))
+	}
+	if c.EnableMetrics {
+		if c.EnableProfiling {
+			routes.MetricsWithReset{}.Install(s.Handler.NonGoRestfulMux)
+		} else {
+			routes.DefaultMetrics{}.Install(s.Handler.NonGoRestfulMux)
+		}
+	}
+
+	routes.Version{Version: c.Version}.Install(s.Handler.GoRestfulContainer)
+
+	if c.EnableDiscovery {
+		s.Handler.GoRestfulContainer.Add(s.DiscoveryGroupManager.WebService())
+	}
+}
+```
+
+首先调用 `c.GenericConfig.New` 按照`go-restful`的模式初始化 Container，在 `c.GenericConfig.New` 中会调用NewAPIServerHandler 初始化 handler，APIServerHandler 包含了 API Server 使用的多种http.Handler 类型，包括 go-restful 以及 non-go-restful，以及在以上两者之间选择的 Director 对象，go-restful 用于处理已经注册的 handler，non-go-restful 用来处理不存在的 handler，API URI 处理的选择过程为：FullHandlerChain-> Director ->{GoRestfulContainer， NonGoRestfulMux}。在 c.GenericConfig.New 中还会调用 installAPI来添加包括 /、/debug/*、/metrics、/version 等路由信息。三种 server 在初始化时首先都会调用 c.GenericConfig.New 来初始化一个 GenericAPIServer，然后进行 API 的注册；
+
+而在后续InstallLegacyAPI => NewLegacyRESTStorage => InstallLegacyAPIGroup => installAPIResources => getAPIGroupVersion => InstallREST => installer.Install调用链中会进行更多API资源的注册，例如：pods，nodes, and configMaps etc.
+
+```go
+// installAPIResources is a private method for installing the REST storage backing each api groupversionresource
+func (s *GenericAPIServer) installAPIResources(apiPrefix string, apiGroupInfo *APIGroupInfo, openAPIModels openapiproto.Models) error {
+	for _, groupVersion := range apiGroupInfo.PrioritizedVersions {
+		if len(apiGroupInfo.VersionedResourcesStorageMap[groupVersion.Version]) == 0 {
+			klog.Warningf("Skipping API %v because it has no resources.", groupVersion)
+			continue
+		}
+
+		apiGroupVersion := s.getAPIGroupVersion(apiGroupInfo, groupVersion, apiPrefix)
+		if apiGroupInfo.OptionsExternalVersion != nil {
+			apiGroupVersion.OptionsExternalVersion = apiGroupInfo.OptionsExternalVersion
+		}
+		apiGroupVersion.OpenAPIModels = openAPIModels
+		apiGroupVersion.MaxRequestBodyBytes = s.maxRequestBodyBytes
+
+		if err := apiGroupVersion.InstallREST(s.Handler.GoRestfulContainer); err != nil {
+			return fmt.Errorf("unable to setup API %v: %v", apiGroupInfo, err)
+		}
+	}
+
+	return nil
+}
+
+func (s *GenericAPIServer) getAPIGroupVersion(apiGroupInfo *APIGroupInfo, groupVersion schema.GroupVersion, apiPrefix string) *genericapi.APIGroupVersion {
+	storage := make(map[string]rest.Storage)
+	for k, v := range apiGroupInfo.VersionedResourcesStorageMap[groupVersion.Version] {
+		storage[strings.ToLower(k)] = v
+	}
+	version := s.newAPIGroupVersion(apiGroupInfo, groupVersion)
+	version.Root = apiPrefix
+	version.Storage = storage
+	return version
+}
+
+// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints/groupversion.go:94
+// InstallREST registers the REST handlers (storage, watch, proxy and redirect) into a restful Container.
+// It is expected that the provided path root prefix will serve all operations. Root MUST NOT end
+// in a slash.
+func (g *APIGroupVersion) InstallREST(container *restful.Container) error {
+	prefix := path.Join(g.Root, g.GroupVersion.Group, g.GroupVersion.Version)
+	installer := &APIInstaller{
+		group:             g,
+		prefix:            prefix,
+		minRequestTimeout: g.MinRequestTimeout,
+	}
+
+	apiResources, ws, registrationErrors := installer.Install()
+	versionDiscoveryHandler := discovery.NewAPIVersionHandler(g.Serializer, g.GroupVersion, staticLister{apiResources})
+	versionDiscoveryHandler.AddToWebService(ws)
+	container.Add(ws)
+	return utilerrors.NewAggregate(registrationErrors)
+}
+
+// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints/installer.go:92
+// Install handlers for API resources.
+func (a *APIInstaller) Install() ([]metav1.APIResource, *restful.WebService, []error) {
+	var apiResources []metav1.APIResource
+	var errors []error
+	ws := a.newWebService()
+
+	// Register the paths in a deterministic (sorted) order to get a deterministic swagger spec.
+	paths := make([]string, len(a.group.Storage))
+	var i int = 0
+	for path := range a.group.Storage {
+		paths[i] = path
+		i++
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		apiResource, err := a.registerResourceHandlers(path, a.group.Storage[path], ws)
+		if err != nil {
+			errors = append(errors, fmt.Errorf("error in registering resource: %s, %v", path, err))
+		}
+		if apiResource != nil {
+			apiResources = append(apiResources, *apiResource)
+		}
+	}
+	return apiResources, ws, errors
+}
+```
+
+通过上述c.GenericConfig.New以及installer.Install就构成了一个请求链路，当一个请求过来时整个apiserver的请求链路如下：
+
+```
+filters(DefaultBuildHandlerChain) => installAPI(/|/metrics|/debug|/version) | GenericAPIServer.installAPIResources(/api/v1) => APIGroupVersion.InstallREST(/api/v1/namespaces/{namespace}/pods/{name})
+```
+
+可以归纳如下：
+
+* 创建apiserver config中，调用c.GenericConfig.New，通过DefaultBuildHandlerChain设置一些filter handler，通常包括：认证&鉴权以及admission等操作；然后通过installAPI设置暴露系统状态的API路由，例如：/metrics，/debug，/version等
+* 创建apiserver中，调用InstallLegacyAPIGroup，通过installAPIResources设置一些核心API资源handler，包括core group资源以及named groups资源
+
+这样整个kube-apiserver就提供了三类API资源接口：
+
+- core group：主要在 `/api/v1` 下；
+- named groups：其 path 为 `/apis/$GROUP/$VERSION`；
+- 暴露系统状态的一些 API：如`/metrics` 、`/version` 等；
+
+而API 的 URL 大致以 `/apis/group/version/namespaces/{namespace}/resource/{name}` 组成，结构大致如下图所示：
+
+![](images/apis.png)
+
+### 编解码
 

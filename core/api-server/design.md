@@ -457,7 +457,7 @@ func createAPIExtensionsServer(apiextensionsConfig *apiextensionsapiserver.Confi
 }
 
 ...
-// k8s.io/kubernetes/vendor/k8s.io/apiextensions-apiserver/pkg/apiserver/apiserver.go:129
+// k8s.io/kubernetes/staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/apiserver.go:129
 // New returns a new instance of CustomResourceDefinitions from the given config.
 func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*CustomResourceDefinitions, error) {
 	// 1、初始化 genericServer
@@ -575,7 +575,7 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 	return s, nil
 }
 
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/config.go:520
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/server/config.go:520
 // New creates a new server which logically combines the handling chain with the passed server.
 // name is used to differentiate for logging. The handler chain in particular can be difficult as it starts delgating.
 // delegationTarget may not be nil.
@@ -635,7 +635,7 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 	return s, nil
 }
 
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/handler.go:73
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/server/handler.go:73
 func NewAPIServerHandler(name string, s runtime.NegotiatedSerializer, handlerChainBuilder HandlerChainBuilderFn, notFoundHandler http.Handler) *APIServerHandler {
 	nonGoRestfulMux := mux.NewPathRecorderMux(name)
 	if notFoundHandler != nil {
@@ -666,7 +666,7 @@ func NewAPIServerHandler(name string, s runtime.NegotiatedSerializer, handlerCha
 	}
 }
 
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/config.go:688
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/server/config.go:688
 func installAPI(s *GenericAPIServer, c *Config) {
 	if c.EnableIndex {
 		routes.Index{}.Install(s.listedPathProvider, s.Handler.NonGoRestfulMux)
@@ -695,7 +695,7 @@ func installAPI(s *GenericAPIServer, c *Config) {
 }
 ```
 
-最终返回CustomResourceDefinitions(k8s.io/kubernetes/vendor/k8s.io/apiextensions-apiserver/pkg/apiserver/apiserver.go:106)：
+最终返回CustomResourceDefinitions(k8s.io/kubernetes/staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/apiserver.go:106)：
 
 ```go
 type CustomResourceDefinitions struct {
@@ -989,7 +989,7 @@ func createAggregatorServer(aggregatorConfig *aggregatorapiserver.Config, delega
 - 4、初始化 apiserviceRegistrationController：负责 APIServices 中资源的注册与删除以及availableConditionController：维护 APIServices 的可用状态，包括其引用 Service 是否可用等
 
 ```go
-// k8s.io/kubernetes/vendor/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go:159
+// k8s.io/kubernetes/staging/src/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go:159
 // NewWithDelegate returns a new instance of APIAggregator from the given config.
 func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.DelegationTarget) (*APIAggregator, error) {
 	// Prevent generic API server to install OpenAPI handler. Aggregator server
@@ -1206,7 +1206,7 @@ func (s preparedAPIAggregator) Run(stopCh <-chan struct{}) error {
 	return s.runnable.Run(stopCh)
 }
 
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/genericapiserver.go:314
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/server/genericapiserver.go:314
 // Run spawns the secure http server. It only returns if stopCh is closed
 // or the secure port cannot be listened on initially.
 func (s preparedGenericAPIServer) Run(stopCh <-chan struct{}) error {
@@ -1247,7 +1247,7 @@ func (s preparedGenericAPIServer) Run(stopCh <-chan struct{}) error {
 - 4、向 systemd 发送 ready 信号；
 
 ```go
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/genericapiserver.go:355
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/server/genericapiserver.go:355
 // NonBlockingRun spawns the secure http server. An error is
 // returned if the secure port cannot be listened on.
 func (s preparedGenericAPIServer) NonBlockingRun(stopCh <-chan struct{}) error {
@@ -1549,7 +1549,7 @@ type REST struct {
 在`CompleteWithOptions`方法内，调用了` options.RESTOptions.GetRESTOptions` 方法，其最终返回`generic.RESTOptions` 对象，`generic.RESTOptions` 对象中包含对 etcd 初始化的一些配置、数据序列化方法以及对 etcd 操作的 storage.Interface 对象。其会依次调用`StorageWithCacher-->NewRawStorage-->Create`方法创建最终依赖的后端存储
 
 ```go
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/registry/generic/registry/store.go:1204
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:1204
 // CompleteWithOptions updates the store with the provided options and
 // defaults common fields.
 func (e *Store) CompleteWithOptions(options *generic.StoreOptions) error {
@@ -1675,7 +1675,7 @@ type StoreOptions struct {
 	Indexers    *cache.Indexers
 }
 
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/options/etcd.go:192
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/server/options/etcd.go:192
 func (s *EtcdOptions) ApplyWithStorageFactoryTo(factory serverstorage.StorageFactory, c *server.Config) error {
 	if err := s.addEtcdHealthEndpoint(c); err != nil {
 		return err
@@ -1689,7 +1689,7 @@ type StorageFactoryRestOptionsFactory struct {
 	StorageFactory serverstorage.StorageFactory
 }
 
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/options/etcd.go:253
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/server/options/etcd.go:253
 func (f *StorageFactoryRestOptionsFactory) GetRESTOptions(resource schema.GroupResource) (generic.RESTOptions, error) {
 	storageConfig, err := f.StorageFactory.NewConfig(resource)
 	if err != nil {
@@ -1724,7 +1724,7 @@ func (f *StorageFactoryRestOptionsFactory) GetRESTOptions(resource schema.GroupR
 在 `genericregistry.StorageWithCacher` 中又调用了不同的方法最终会调用 `factory.Create` 来初始化存储实例，其调用链为：`genericregistry.StorageWithCacher --> generic.NewRawStorage --> factory.Create`
 
 ```go
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/registry/generic/registry/storage_factory.go:34
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/registry/generic/registry/storage_factory.go:34
 // Creates a cacher based given storageConfig.
 func StorageWithCacher(capacity int) generic.StorageDecorator {
 	return func(
@@ -1789,7 +1789,7 @@ func NewRawStorage(config *storagebackend.Config) (storage.Interface, factory.De
 	return factory.Create(*config)
 }
 
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/factory.go:29
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/storagebackend/factory/factory.go:29
 // Create creates a storage backend based on given config.
 func Create(c storagebackend.Config) (storage.Interface, DestroyFunc, error) {
 	switch c.Type {
@@ -1809,7 +1809,7 @@ func Create(c storagebackend.Config) (storage.Interface, DestroyFunc, error) {
 在 `newETCD3Storage` 中，首先通过调用 `newETCD3Client` 创建 etcd 的 client，client 的创建最终是通过 etcd 官方提供的客户端工具 [clientv3](https://github.com/etcd-io/etcd/tree/master/clientv3) 进行创建的
 
 ```go
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/etcd3.go:209
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/storagebackend/factory/etcd3.go:209
 func newETCD3Storage(c storagebackend.Config) (storage.Interface, DestroyFunc, error) {
 	stopCompactor, err := startCompactorOnce(c.Transport, c.CompactionInterval)
 	if err != nil {
@@ -1875,7 +1875,7 @@ func (m *Master) InstallLegacyAPI(c *completedConfig, restOptionsGetter generic.
 - `installer.Install`：返回最终的 `restful.WebService` 对象
 
 ```go
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/genericapiserver.go:428
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/server/genericapiserver.go:428
 func (s *GenericAPIServer) InstallLegacyAPIGroup(apiPrefix string, apiGroupInfo *APIGroupInfo) error {
 	if !s.legacyAPIGroupPrefixes.Has(apiPrefix) {
 		return fmt.Errorf("%q is not in the allowed legacy API prefixes: %v", apiPrefix, s.legacyAPIGroupPrefixes.List())
@@ -1931,7 +1931,7 @@ func (s *GenericAPIServer) getAPIGroupVersion(apiGroupInfo *APIGroupInfo, groupV
 	return version
 }
 
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints/groupversion.go:94
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/groupversion.go:94
 // InstallREST registers the REST handlers (storage, watch, proxy and redirect) into a restful Container.
 // It is expected that the provided path root prefix will serve all operations. Root MUST NOT end
 // in a slash.
@@ -1950,7 +1950,7 @@ func (g *APIGroupVersion) InstallREST(container *restful.Container) error {
 	return utilerrors.NewAggregate(registrationErrors)
 }
 
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints/installer.go:92
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/installer.go:92
 // Install handlers for API resources.
 func (a *APIInstaller) Install() ([]metav1.APIResource, *restful.WebService, []error) {
 	var apiResources []metav1.APIResource
@@ -2273,7 +2273,7 @@ v1beta1 ⇒ internal ⇒    |    ⇒       |    ⇒  v1  ⇒ json/yaml ⇒ etcd
 ```
 
 ```go
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints/handlers/create.go:47
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go:47
 func createHandler(r rest.NamedCreater, scope *RequestScope, admit admission.Interface, includeName bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		...
@@ -2961,7 +2961,7 @@ func NewConfig(codecs serializer.CodecFactory) *Config {
 	}
 }
 
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/config.go:664
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/server/config.go:664
 func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
 	handler := genericapifilters.WithAuthorization(apiHandler, c.Authorization.Authorizer, c.Serializer)
 	if c.FlowControl != nil {
@@ -3265,7 +3265,7 @@ func (s *GenericAPIServer) getAPIGroupVersion(apiGroupInfo *APIGroupInfo, groupV
 	return version
 }
 
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints/groupversion.go:94
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/groupversion.go:94
 // InstallREST registers the REST handlers (storage, watch, proxy and redirect) into a restful Container.
 // It is expected that the provided path root prefix will serve all operations. Root MUST NOT end
 // in a slash.
@@ -3284,7 +3284,7 @@ func (g *APIGroupVersion) InstallREST(container *restful.Container) error {
 	return utilerrors.NewAggregate(registrationErrors)
 }
 
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints/installer.go:92
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/installer.go:92
 // Install handlers for API resources.
 func (a *APIInstaller) Install() ([]metav1.APIResource, *restful.WebService, []error) {
 	var apiResources []metav1.APIResource
@@ -3932,7 +3932,7 @@ func NewStorage(optsGetter generic.RESTOptionsGetter, k client.ConnectionInfoGet
 }
 
 ...
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/etcd3.go:209
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/storagebackend/factory/etcd3.go:209
 func newETCD3Storage(c storagebackend.Config) (storage.Interface, DestroyFunc, error) {
 	stopCompactor, err := startCompactorOnce(c.Transport, c.CompactionInterval)
 	if err != nil {
@@ -3962,7 +3962,7 @@ func newETCD3Storage(c storagebackend.Config) (storage.Interface, DestroyFunc, e
 	return etcd3.New(client, c.Codec, c.Prefix, transformer, c.Paging), destroyFunc, nil
 }
 
-// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/storage/etcd3/store.go:143
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go:143
 // Create implements storage.Interface.Create.
 func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object, ttl uint64) error {
 	if version, err := s.versioner.ObjectResourceVersion(obj); err == nil && version != 0 {
@@ -4043,12 +4043,12 @@ v1beta1 ⇒ internal ⇒    |    ⇒       |    ⇒  v1  ⇒ json/yaml ⇒ etcd
 ```
 apiserver整体启动逻辑 k8s.io/kubernetes/cmd/kube-apiserver
 API Resource对应后端RESTStorage(based on genericregistry.Store)创建 k8s.io/kubernetes/pkg/registry
-aggregated-apiserver创建&处理逻辑 k8s.io/kubernetes/vendor/k8s.io/kube-aggregator
-extensions-apiserver创建&处理逻辑 k8s.io/kubernetes/vendor/k8s.io/apiextensions-apiserver
-apiserver创建&运行 k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server
-注册API Resource资源处理handler(InstallREST&Install&registerResourceHandlers) k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints
-创建存储后端(etcdv3) k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/storage
-genericregistry.Store.CompleteWithOptions初始化 k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/registry
+aggregated-apiserver创建&处理逻辑 k8s.io/kubernetes/staging/src/k8s.io/kube-aggregator
+extensions-apiserver创建&处理逻辑 k8s.io/kubernetes/staging/src/k8s.io/apiextensions-apiserver
+apiserver创建&运行 k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/server
+注册API Resource资源处理handler(InstallREST&Install&registerResourceHandlers) k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints
+创建存储后端(etcdv3) k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/storage
+genericregistry.Store.CompleteWithOptions初始化 k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/registry
 ```
 
 ## Refs

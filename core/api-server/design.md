@@ -24,18 +24,11 @@ Table of Contents
 * [调用链分析](#调用链分析)
 * [调用拓扑](#调用拓扑)
          
+## 概念梳理
 
 kube-apiserver作为整个Kubernetes集群操作etcd的唯一入口，负责Kubernetes各资源的认证&鉴权，校验以及CRUD等操作。Kubernetes提供RESTful APIs，供其它组件调用，本文将对kube-apiserver整体架构进行源码分析(后续分章节展开各部分细节)
 
 ![img](https://feisky.gitbooks.io/kubernetes/content/components/images/kube-apiserver.png)
-
-## 概念梳理
-
-上述分析了kube-apiserver的整体流程，也即：
-
-```
-CreateServerChain(创建三种APIServer)->PrepareRun(执行APIServer运行前的准备工作)->prepared.Run(运行APIServer)
-```
 
 kube-apiserver包含三个APIServer：
 

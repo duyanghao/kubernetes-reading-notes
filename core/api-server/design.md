@@ -4055,3 +4055,4 @@ genericregistry.Store.CompleteWithOptions初始化 k8s.io/kubernetes/vendor/k8s.
 
 * [Serialization of State Flow in Detail](https://www.openshift.com/blog/kubernetes-deep-dive-api-server-part-2)
 * [kube_apiserver.md](https://github.com/gosoon/source-code-reading-notes/blob/master/kubernetes/kube_apiserver.md)
+* [kubernetes API OVERVIEW](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.19/)

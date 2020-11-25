@@ -4038,25 +4038,17 @@ v1beta1 ⇒ internal ⇒    |    ⇒       |    ⇒  v1  ⇒ json/yaml ⇒ etcd
 
 ## kube-apiserver代码模块整理
 
-整个kube-apiserver代码看起来很混乱，读起来很费劲，这里稍微整理一下各个目录模块功能：
+整个kube-apiserver代码分析下来感觉很混乱，跳来跳去，读起来挺费劲的，这里稍微整理一下各个目录模块功能：
 
 ```
-kube-apiserver启动入口 k8s.io/kubernetes/cmd/kube-apiserver/app/server.go:151
-buildGenericConfig => genericapiserver.NewConfig apiserver配置构建 k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/config.go:287
-InstallLegacyAPI注册API Resource路由以及处理函数 k8s.io/kubernetes/pkg/master/master.go:487
-createAggregatorServer k8s.io/kubernetes/cmd/kube-apiserver/app/aggregator.go:129
-初始化 aggregatorServer 的方法(NewWithDelegate) k8s.io/kubernetes/vendor/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go:159
-运行apiserver(Run) k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/genericapiserver.go:314
-APIExtensionsServer创建(apiextensionsConfig.Complete().New(delegateAPIServer)) k8s.io/kubernetes/vendor/k8s.io/apiextensions-apiserver/pkg/apiserver/apiserver.go:129
-NewLegacyRESTStorage创建 k8s.io/kubernetes/pkg/registry/core/rest/storage_core.go:102
-pod创建后端RESTStorage对象(podstore.NewStorage) k8s.io/kubernetes/pkg/registry/core/pod/storage/storage.go:70
-genericregistry.Store.CompleteWithOptions k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/registry/generic/registry/store.go:1204
-genericregistry.Store.Storage初始化 k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/options/etcd.go:253
-创建存储后端storage k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/factory.go:29
-InstallREST k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints/groupversion.go:94
-Install k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints/installer.go:92
-registerResourceHandlers k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/installer.go:181
-etcdv3 client pkg：k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/storage/etcd3/store.go
+apiserver整体启动逻辑 k8s.io/kubernetes/cmd/kube-apiserver
+API Resource对应后端RESTStorage(based on genericregistry.Store)创建 k8s.io/kubernetes/pkg/registry
+aggregated-apiserver创建&处理逻辑 k8s.io/kubernetes/vendor/k8s.io/kube-aggregator
+extensions-apiserver创建&处理逻辑 k8s.io/kubernetes/vendor/k8s.io/apiextensions-apiserver
+apiserver创建&运行 k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server
+注册API Resource资源处理handler(InstallREST&Install&registerResourceHandlers) k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints
+创建存储后端(etcdv3) k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/storage
+genericregistry.Store.CompleteWithOptions初始化 k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/registry
 ```
 
 ## Refs

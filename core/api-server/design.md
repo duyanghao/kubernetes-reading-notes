@@ -25,7 +25,7 @@ Table of Contents
 * [调用拓扑](#调用拓扑)
 * [etcd交互细节](#etcd交互细节)
 * [kube-apiserver代码模块整理](#kube-apiserver代码模块整理)
-         
+* [Refs](#Refs)       
 ## 概念梳理
 
 kube-apiserver作为整个Kubernetes集群操作etcd的唯一入口，负责Kubernetes各资源的认证&鉴权，校验以及CRUD等操作。Kubernetes提供RESTful APIs，供其它组件调用，本文将对kube-apiserver整体架构进行源码分析(后续分章节展开各部分细节)
@@ -4013,7 +4013,7 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 
 **Decoder**
 
-kubernetes 中的多数 resource 都会有一个 `internal version`，因为在整个开发过程中一个 resource 可能会对应多个 version，比如 deployment 会有 `extensions/v1beta1`，`apps/v1`。 为了避免出现问题，kube-apiserver 必须要知道如何在每一对版本之间进行转换（例如，v1⇔v1alpha1，v1⇔v1beta1，v1beta1⇔v1alpha1），因此其使用了一个特殊的`internal version`，`internal version` 作为一个通用的 version 会包含所有 version 的字段，它具有所有 version 的功能。 Decoder 会首先把 creater object 转换到 `internal version`，然后将其转换为 `storage version`，`storage version` 是在 etcd 中存储时的另一个 version。
+kubernetes 中的多数 resource 都会有一个 `internal version`，因为在整个开发过程中一个 resource 可能会对应多个 version，比如 deployment 会有 `extensions/v1beta1`，`apps/v1`。 为了避免出现问题，kube-apiserver 必须要知道如何在每一对版本之间进行转换（例如，v1⇔v1alpha1，v1⇔v1beta1，v1beta1⇔v1alpha1），因此其使用了一个特殊的`internal version`，`internal version` 作为一个通用的 version 会包含所有 version 的字段，它具有所有 version 的功能。 Decoder 会首先把 creater object 转换到 `internal version`。
 
 在解码时，首先从 HTTP path 中获取期待的 version，然后使用 scheme 以正确的 version 创建一个与之匹配的空对象，并使用 JSON 或 protobuf 解码器进行转换，在转换的第一步中，如果用户省略了某些字段，Decoder 会把其设置为默认值。
 
@@ -4023,15 +4023,24 @@ kubernetes 中的多数 resource 都会有一个 `internal version`，因为在�
 
 **Validation**
 
-主要检查 object 中字段的合法性。
+主要检查 object 中字段的合法性
 
-在 handler 中执行完以上操作后最后会执行与 etcd 相关的操作，POST 操作会将数据写入到 etcd 中，以上在 handler 中的主要处理流程如下所示：
+**Encode**
+
+Encode完成与Decoder相反的操作，将internal version object转化为storage version object，`storage version` 是在 etcd 中存储时的另一个 version
+
+POST 操作会将数据写入到 etcd 中，以上在 handler 中的主要处理流程如下所示：
 
 ```
 v1beta1 ⇒ internal ⇒    |    ⇒       |    ⇒  v1  ⇒ json/yaml ⇒ etcd
                      admission    validation
 ```
 
-
-
 ## kube-apiserver代码模块整理
+
+
+
+## Refs
+
+* [Serialization of State Flow in Detail](https://www.openshift.com/blog/kubernetes-deep-dive-api-server-part-2)
+* [kube_apiserver.md](https://github.com/gosoon/source-code-reading-notes/blob/master/kubernetes/kube_apiserver.md)

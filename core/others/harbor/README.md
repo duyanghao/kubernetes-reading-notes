@@ -5,4 +5,4 @@ Harbor
 
 ## Contents
 
-* [harbor auth](/auth.md)
+* [harbor auth](auth.md)

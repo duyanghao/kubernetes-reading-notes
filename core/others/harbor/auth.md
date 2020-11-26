@@ -446,7 +446,7 @@ src/core/filter/security.go——auth入口
 
 ## token协议流程
 
-![](/public/img/v2-registry-auth.png)
+![](images/v2-registry-auth.png)
 
 ```bash
 docker login x.x.x.x

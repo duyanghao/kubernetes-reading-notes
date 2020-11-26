@@ -24,7 +24,7 @@ harbor使用[clair](https://github.com/quay/clair)组件进行镜像扫描，cla
 
 >> 4.When updates to vulnerability metadata occur, a notification can be sent to alert systems that a change has occurred.
 
-![](/public/img/clair/architecture.png)
+![](images/image-scan/architecture.png)
 
 使用如下(Refers to [static-analysis-of-docker-image-vulnerabilities-with-clair](https://www.nearform.com/blog/static-analysis-of-docker-image-vulnerabilities-with-clair/))：
 
@@ -118,7 +118,7 @@ clair默认需要联网下载`CVE`库，而官方目前也并不支持在无网�
 
 该方案原理图如下：
 
-![](/public/img/clair/clair-db-migrate.png)
+![](images/image-scan/clair-db-migrate.png)
 
 执行操作如下(参考[clair-local-scan](https://github.com/arminc/clair-local-scan/blob/master/.travis.yml))：
 

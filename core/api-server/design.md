@@ -4042,6 +4042,7 @@ v1beta1 ⇒ internal ⇒    |    ⇒       |    ⇒  v1  ⇒ json/yaml ⇒ etcd
 
 ```
 apiserver整体启动逻辑 k8s.io/kubernetes/cmd/kube-apiserver
+apiserver bootstrap-controller创建&运行逻辑 k8s.io/kubernetes/pkg/master
 API Resource对应后端RESTStorage(based on genericregistry.Store)创建 k8s.io/kubernetes/pkg/registry
 aggregated-apiserver创建&处理逻辑 k8s.io/kubernetes/staging/src/k8s.io/kube-aggregator
 extensions-apiserver创建&处理逻辑 k8s.io/kubernetes/staging/src/k8s.io/apiextensions-apiserver

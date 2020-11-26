@@ -5,4 +5,5 @@ Harbor
 
 ## Contents
 
+* [harbor企业级实践](practice.md)
 * [harbor auth](auth.md)

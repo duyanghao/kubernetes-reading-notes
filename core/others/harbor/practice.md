@@ -66,15 +66,19 @@ Harbor的鉴权也即`RBAC`是基于`Project`的，用户对`Project`可以有�
 
 * API无侵入认证&鉴权
 
-将`认证&鉴权`逻辑从Harbor内部抽取到外部，由上层完成。也即：产品平台根据`认证中心`进行`认证和鉴权`，权限通过后，通过`admin`账号调用`Harbor API`执行相关操作，执行成功后，将相应的`RBAC`信息写入数据库：
-![](images/practice/harbor-api-auth.png)
+  将`认证&鉴权`逻辑从Harbor内部抽取到外部，由上层完成。也即：产品平台根据`认证中心`进行`认证和鉴权`，权限通过后，通过`admin`账号调用`Harbor API`执行相关操作，执行成功后，将相应的`RBAC`信息写入数据库：
+  
+  ![](images/practice/harbor-api-auth.png)
 
 * Docker cmd无侵入认证&鉴权
 
-这里`Docker cmd`的无侵入改造方案利用了`Docker Token`的六次握手协议，如下：
-![](images/practice/docker-token-auth.png)
-通过配置外部认证服务器`auth server`，走`认证中心`进行统一的`认证和鉴权`，并产生相应的`token`给Docker，最终实现`Docker cmd无侵入认证&鉴权`方案：
-![](images/practice/docker-cmd-auth.png)
+  这里`Docker cmd`的无侵入改造方案利用了`Docker Token`的六次握手协议，如下：
+  
+  ![](images/practice/docker-token-auth.png)
+  
+  通过配置外部认证服务器`auth server`，走`认证中心`进行统一的`认证和鉴权`，并产生相应的`token`给Docker，最终实现`Docker cmd无侵入认证&鉴权`方案：
+  
+  ![](images/practice/docker-cmd-auth.png)
 
 这里在讲完`harbor API无侵入改造`和`harbor认证&鉴权 无侵入改造`的方案后，我们还需要再补充说明一点：虽然上述方案可以满足企业二次定制的一般情况，但是如果遇到无法通过非侵入改造的情况，那么就只能修改Harbor了，这里保留一个原则即可：尽量不改动Harbor内部逻辑，实在不行那也必须对Harbor进行代码定制
 
@@ -123,7 +127,7 @@ Harbor的鉴权也即`RBAC`是基于`Project`的，用户对`Project`可以有�
 
 在企业生产环境中使用Harbor，我们需要对Harbor进行高并发压测，来得出Harbor生产环境的性能数据。这里我们用三台压测机(Docker)，一台被测机(Harbor)进行压测，所有机器均使用万兆网卡且忽略CPU、内存、I/0瓶颈等因素([压测方案](https://github.com/duyanghao/registry-pressure-measurement-tools))：
 
-![](/public/img/docker-registry/pressure-tests/pt-Few-Machines.png)
+![](images/practice/pt-Few-Machines.png)
 
 我们分别针对三种存储：`Ceph FS`，`Rook Ceph FS`以及`Rook Ceph RGW`进行压测对比：
 
@@ -138,7 +142,6 @@ Harbor的鉴权也即`RBAC`是基于`Project`的，用户对`Project`可以有�
 * 3、Rook Ceph RGW
 
 ![](images/practice/harbor-pressure-rook-ceph-rgw.png)
-
 
 从压测数据可以看出：
 
@@ -161,17 +164,24 @@ Harbor的鉴权也即`RBAC`是基于`Project`的，用户对`Project`可以有�
 这里我们针对该存储选型定制备份还原方案。由于采用的是混合方案，所以我们需要分别对文件系统和对象存储进行备份还原：
 
 * 1、Ceph 文件系统BUR
+  
   * Ceph 文件系统备份——对于CephFS，Harbor中的应用数据保存在`pv`中，而我们的部署场景实际上是落在CephFS路径上。因此要备份Harbor应用数据只需要备份每个`pv`对应的CephFS目录即可
+    
     ![](images/practice/harbor-bur-cephfs-backup.png)
+  
   * Ceph 文件系统还原——还原是备份的逆过程，只需要将备份的应用数据写入到`pv`对应的CephFS路径上即可
+    
     ![](images/practice/harbor-bur-cephfs-restore.png)
 
 * 2、Ceph 对象存储BUR
 
-对于`Ceph RGW`，Harbor中的应用数据保存在`BUCKET`中，因此要备份Harbor应用数据只需要备份`BUCKET`即可，还原同理（这里我们用`s3cmd`工具进行数据同步）：
-![](images/practice/harbor-bur-rgw.png)
-对于`Ceph RGW`的BUR，如果单纯`s3cmd`同步整个应用目录，则比较慢；需要对应用目录进行数据切分，并发同步数据分区（[registry-rgw-BUR-tools](https://github.com/duyanghao/registry-rgw-BUR-tools)）：
-![](images/practice/harbor-bur-rgw-concurrent.png)
+  对于`Ceph RGW`，Harbor中的应用数据保存在`BUCKET`中，因此要备份Harbor应用数据只需要备份`BUCKET`即可，还原同理（这里我们用`s3cmd`工具进行数据同步）：
+  
+  ![](images/practice/harbor-bur-rgw.png)
+  
+  对于`Ceph RGW`的BUR，如果单纯`s3cmd`同步整个应用目录，则比较慢；需要对应用目录进行数据切分，并发同步数据分区（[registry-rgw-BUR-tools](https://github.com/duyanghao/registry-rgw-BUR-tools)）：
+  
+  ![](images/practice/harbor-bur-rgw-concurrent.png)
 
 ## harbor迁移
 

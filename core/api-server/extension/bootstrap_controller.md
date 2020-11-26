@@ -202,7 +202,7 @@ func (c *completedConfig) NewBootstrapController(legacyRESTStorage corerest.Lega
 		ServicePort:               c.ExtraConfig.APIServerServicePort,
 		ExtraServicePorts:         c.ExtraConfig.ExtraServicePorts,
 		ExtraEndpointPorts:        c.ExtraConfig.ExtraEndpointPorts,
-    // 通过--secure-port指定，默认为6443
+		// 通过--secure-port指定，默认为6443
 		PublicServicePort:         publicServicePort,
 		// 缺省是基于 ClusterIP 启动模式，这里为0    
 		KubernetesServiceNodePort: c.ExtraConfig.KubernetesServiceNodePort,

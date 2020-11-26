@@ -3,11 +3,11 @@
 Table of Contents
 =================
 
-* [harbor auth流程](#harbor auth流程)
-* [docker distribution token协议流程](#docker distribution token协议流程)
+* [harbor auth流程](#auth流程)
+* [docker distribution token协议流程](#token协议流程)
 * [Refs](#refs)
       
-## harbor auth流程
+## auth流程
 
 以[harbor v1.8.1](https://github.com/goharbor/harbor/tree/v1.8.1)为例进行分析，目录结构日下：
 
@@ -444,7 +444,7 @@ src/core/filter/security.go——auth入口
 
 * 这里若要添加一种认证和鉴权，则只需要分别在auth目录和security目录分别创建一个目录，对应认证和鉴权逻辑
 
-## docker distribution token协议流程
+## token协议流程
 
 ![](/public/img/v2-registry-auth.png)
 

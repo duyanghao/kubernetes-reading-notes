@@ -1,6 +1,21 @@
 kube-apiserver bootstrap-controller
 ===================================
 
+Table of Contents
+=================
+
+* [bootstrap-controller概述](#bootstrap-controller概述)
+* [代码分析](#代码分析)
+  * [NewBootstrapController](#newbootstrapcontroller)
+  * [BootstrapController.PostStartHook](#bootstrapcontrollerpoststarthook)
+    * [RunKubernetesNamespaces](#runkubernetesnamespaces)
+    * [RunKubernetesService](#runkubernetesservice)
+    * [repairClusterIPs.RunUntil](#repairclusteripsrununtil)
+    * [repairNodePorts.RunUntil](#repairnodeportsrununtil)
+  * [BootstrapController.PreShutdownHook](#bootstrapcontrollerpreshutdownhook)
+* [总结](#总结)
+* [Refs](#refs)
+      
 ## bootstrap-controller概述
 
 在 kubernetes，可以从集群外部和内部两种方式访问 kubernetes API，在集群外直接访问 apiserver 提供的 API，在集群内即 pod 中可以通过访问 service 为 kubernetes 的 ClusterIP。kubernetes 集群在初始化完成后就会创建一个 kubernetes service，该 service 是 kube-apiserver 创建并进行维护的，如下所示：

@@ -15,7 +15,7 @@ Kubernetes reading notes based on v1.17.4
 * [kube-proxy](core/kube-proxy/README.md)
 * [kubelet](core/kubelet/README.md)
 * [container-runtime](core/container-runtime/README.md)
-* [others(golang, harbor and etc)](core/others/README.md)
+* [others(golang, harbor, kernel and etc)](core/others/README.md)
 
 ## Shares
 

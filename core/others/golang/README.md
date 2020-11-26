@@ -1,6 +1,8 @@
 Golang
 ======
 
+Based on go1.13.5, and **Stay tuned as this evolves!**
+
 ## Contents
 
 * [http transport](http/README.md)

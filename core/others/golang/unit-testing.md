@@ -11,7 +11,9 @@ Table of Contents
   * [网络测试](#网络测试)
 * [基准测试](#基准测试)
   * [比较型基准测试](#比较型基准测试)
+  * [并发基准测试](#并发基准测试)
 * [GoMock](#gomock)
+* [Conclusion](#conclusion)
 * [Refs](#refs)
 
 本文总结日常开发中常用的golang单元测试经验
@@ -49,14 +51,14 @@ func Fib(n int) int {
 ```go
 // fib_test.go
 func TestFib(t *testing.T) {
-    var (
-        in       = 7
-        expected = 13
-    )
-    actual := Fib(in)
-    if actual != expected {
-        t.Errorf("Fib(%d) = %d; expected %d", in, actual, expected)
-    }
+        var (
+                in       = 7
+                expected = 13
+        )
+        actual := Fib(in)
+        if actual != expected {
+                t.Fatalf("Fib(%d) = %d; expected %d", in, actual, expected)
+        }
 }
 ```
 
@@ -94,17 +96,23 @@ FAIL    _/root/test     0.002s
 示例代码：
 
 ```go
+package split
+
+import (
+        "strings"
+)
+
 // Split slices s into all substrings separated by sep and
 // returns a slice of the substrings between those separators.
 func Split(s, sep string) []string {
-    var result []string
-    i := strings.Index(s, sep)
-    for i > -1 {
-        result = append(result, s[:i])
-        s = s[i+len(sep):]
-        i = strings.Index(s, sep)
-    }
-    return append(result, s)
+        var result []string
+        i := strings.Index(s, sep)
+        for i > -1 {
+                result = append(result, s[:i])
+                s = s[i+len(sep):]
+                i = strings.Index(s, sep)
+        }
+        return append(result, s)
 }
 ```
 
@@ -112,22 +120,22 @@ func Split(s, sep string) []string {
 
 ```go
 func TestSplit(t *testing.T) {
-    tests := []struct {
-        input string
-        sep   string
-        want  []string
-    }{
-        {input: "a/b/c", sep: "/", want: []string{"a", "b", "c"}},
-        {input: "a/b/c", sep: ",", want: []string{"a/b"}},
-        {input: "abc", sep: "/", want: []string{"ab"}},
-    } 
-
-    for _, tc := range tests {
-        got := Split(tc.input, tc.sep)
-        if !reflect.DeepEqual(tc.want, got) {
-            t.Fatalf("expected: %v, got: %v", tc.want, got)
+        tests := []struct {
+                input string
+                sep   string
+                want  []string
+        }{
+                {input: "a/b/c", sep: "/", want: []string{"a", "b", "c"}},
+                {input: "a/b/c", sep: ",", want: []string{"a/b"}},
+                {input: "abc", sep: "/", want: []string{"ab"}},
         }
-    }
+
+        for _, tc := range tests {
+                got := Split(tc.input, tc.sep)
+                if !reflect.DeepEqual(tc.want, got) {
+                        t.Fatalf("expected: %v, got: %v", tc.want, got)
+                }
+        }
 }
 ```
 
@@ -146,25 +154,6 @@ FAIL    _/root/test/split       0.002s
 如果换成t.Errorf，则运行结果如下：
 
 ```go
-func TestSplit(t *testing.T) {
-    tests := []struct {
-        input string
-        sep   string
-        want  []string
-    }{
-        {input: "a/b/c", sep: "/", want: []string{"a", "b", "c"}},
-        {input: "a/b/c", sep: ",", want: []string{"a/b"}},
-        {input: "abc", sep: "/", want: []string{"ab"}},
-    } 
-
-    for _, tc := range tests {
-        got := Split(tc.input, tc.sep)
-        if !reflect.DeepEqual(tc.want, got) {
-            t.Errorf("expected: %v, got: %v", tc.want, got)
-        }
-    }
-}
-
 $ go test -run=TestSplit -v
 === RUN   TestSplit
     split_test.go:45: expected: [a/b], got: [a/b/c]
@@ -183,29 +172,33 @@ t.Errorf遇错不停，还会继续执行其他的测试用例；而t.Fatalf遇�
 
 因此我们可以在上述基础上添加子测试。子测试是 Go 语言内置支持的，可以在某个测试用例中，根据测试场景使用 `t.Run`创建不同的子测试用例，示例如下：
 
-```bash
+```go
 func TestSplit(t *testing.T) {
-    tests := map[string]struct {
-        input string
-        sep   string
-        want  []string
-    }{
-        "simple":       {input: "a/b/c", sep: "/", want: []string{"a", "b", "c"}},
-        "wrong sep":    {input: "a/b/c", sep: ",", want: []string{"a/b/c"}},
-        "no sep":       {input: "abc", sep: "/", want: []string{"abc"}},
-        "trailing sep": {input: "a/b/c/", sep: "/", want: []string{"a", "b", "c"}},
-    }
+        tests := map[string]struct {
+                input string
+                sep   string
+                want  []string
+        }{
+                "simple":       {input: "a/b/c", sep: "/", want: []string{"a", "b", "c"}},
+                "trailing sep": {input: "a/b/c/", sep: "/", want: []string{"a", "b", "c"}},
+                "wrong sep":    {input: "a/b/c", sep: ",", want: []string{"a/b/c"}},
+                "no sep":       {input: "abc", sep: "/", want: []string{"abc"}},
+        }
 
-    for name, tc := range tests {
-        t.Run(name, func(t *testing.T) {
-            got := Split(tc.input, tc.sep)
-            if !reflect.DeepEqual(tc.want, got) {
-                t.Fatalf("expected: %v, got: %v", tc.want, got)
-            }
-        })
-    }
+        for name, tc := range tests {
+                t.Run(name, func(t *testing.T) {
+                        got := Split(tc.input, tc.sep)
+                        if !reflect.DeepEqual(tc.want, got) {
+                                t.Fatalf("expected: %v, got: %v", tc.want, got)
+                        }
+                })
+        }
 }
+```
 
+运行如下：
+
+```bash
 $ go test -run=TestSplit -v
 === RUN   TestSplit
 === RUN   TestSplit/simple
@@ -223,7 +216,9 @@ exit status 1
 FAIL    _/root/test/split       0.002s
 ```
 
-可以看到当trailing_sep子测试失败后，其它测试依旧可以正常完成，而且每个子测试有对应相关信息输出。而关于子测试的好处可以总结如下：
+可以看到当trailing_sep子测试失败后，其它测试依旧可以正常完成，而且每个子测试有对应相关信息输出
+
+而关于子测试的好处可以总结如下：
 
 - 新增用例非常简单，只需给 cases 新增一条测试数据即可
 - 测试代码可读性好，直观地能够看到每个子测试的参数和期待的返回值
@@ -444,7 +439,7 @@ ok      _/root/test/conn        0.003s
 
 ## 基准测试
 
-基准测试是测量一个程序在固定工作负载下的性能。在Go语言中，基准测试函数和普通测试函数写法类似，但是以Benchmark为前缀名，并且带有一个`*testing.B`类型的参数；`*testing.B`参数除了提供和`*testing.T`类似的方法，还有额外一些和性能测量相关的方法。它还提供了一个整数N，用于指定操作执行的循环次数：
+基准测试是测量一个程序在固定工作负载下的性能。在Go语言中，基准测试函数和单元测试函数写法类似，但是以Benchmark为前缀名，并且带有一个`*testing.B`类型的参数；`*testing.B`参数除了提供和`*testing.T`类似的方法，还有额外一些和性能测量相关的方法。它还提供了一个整数N，用于指定操作执行的循环次数：
 
 ```go
 func BenchmarkFib10(b *testing.B) {
@@ -479,14 +474,14 @@ ok      _/root/test     1.219s
 
 ```go
 func benchmarkFib(b *testing.B, size int) {
-    for n := 0; n < b.N; n++ {
-        Fib(size)
-    }
+        for n := 0; n < b.N; n++ {
+                Fib(size)
+        }
 }
 
 func BenchmarkFib1(b *testing.B)  { benchmarkFib(b, 1) }
 func BenchmarkFib10(b *testing.B) { benchmarkFib(b, 10) }
-func BenchmarkFib100(b *testing.B) { benchmarkFib(b, 100) }
+func BenchmarkFib20(b *testing.B) { benchmarkFib(b, 20) }
 ```
 
 比较型的基准测试反映出的模式在程序设计阶段是很有帮助的，它可以用来比较不同数量级下的基准测试数据：
@@ -504,9 +499,238 @@ ok      _/root/test     4.123s
 
 默认情况下，每个基准测试最少运行 1 秒。如果基准测试函数返回时，还不到 1 秒钟，`b.N` 的值会按照序列 1,2,5,10,20,50,... 增加，同时再次运行基准测试函数
 
+### 并发基准测试
+
+可以使用 `RunParallel` 测试并发基准性能，如下：
+
+```go
+func BenchmarkParallel(b *testing.B) {
+        templ := template.Must(template.New("test").Parse("Hello, {{.}}!"))
+        b.RunParallel(func(pb *testing.PB) {
+                var buf bytes.Buffer
+                for pb.Next() {
+                        // 所有 goroutine 一起，循环一共执行 b.N 次
+                        buf.Reset()
+                        templ.Execute(&buf, "World")
+                }
+        })
+}
+```
+
+运行如下：
+
+```bash
+$ go test -benchmem -bench=BenchmarkParallel .
+goos: linux
+goarch: amd64
+BenchmarkParallel-16            21238836                56.9 ns/op            48 B/op          1 allocs/op
+PASS
+ok      _/root/test     2.251s
+```
+
 ## GoMock
 
+当待测试的函数/对象的依赖关系很复杂，并且有些依赖不能直接创建，例如数据库连接、文件I/O等。这种场景就非常适合使用 mock/stub 测试。简单来说，就是用 mock 对象模拟依赖项的行为
 
+[gomock](https://github.com/golang/mock) 是官方提供的 mock 框架，同时还提供了 mockgen 工具用来辅助生成测试代码。使用如下命令即可安装：
+
+```bash
+$ go get -u github.com/golang/mock/gomock
+$ go get -u github.com/golang/mock/mockgen
+```
+
+文档如下：
+
+```bash
+Standard usage:
+
+    (1) Define an interface that you wish to mock.
+          type MyInterface interface {
+            SomeMethod(x int64, y string)
+          }
+    (2) Use mockgen to generate a mock from the interface.
+    (3) Use the mock in a test:
+          func TestMyThing(t *testing.T) {
+            mockCtrl := gomock.NewController(t)
+            defer mockCtrl.Finish()
+
+            mockObj := something.NewMockMyInterface(mockCtrl)
+            mockObj.EXPECT().SomeMethod(4, "blah")
+            // pass mockObj to a real object and play with it.
+          }
+```
+
+这里以一个实际例子来说明上述GoMock使用步骤
+
+step1 - 构建接口
+
+整个目录结构如下：
+
+```bash
+server/
+|-- server.go
+`-- server_test.go
+db/
+|-- db.go
+|-- db_mock.go
+```
+
+编写db源文件如下，其中包含MyDB接口和User结构体：
+
+```go
+// db.go
+package db
+
+type User struct {
+        ID   string `json:"id"`
+        Name string `json:"name"`
+        Age int `json:age`
+}
+
+type MyDB interface {
+        Retrieve(key string) (*User, error)
+        // TODO
+}
+```
+
+step2 - 生成mock
+
+通过gomock生成mock文件，如下：
+
+```bash
+mockgen -source=./db/db.go -destination=./db/db_mock.go -package=db
+```
+
+db_mock.go文件内容如下：
+
+```go
+// Code generated by MockGen. DO NOT EDIT.
+// Source: db/db.go
+
+// Package db is a generated GoMock package.
+package db
+
+import (
+        gomock "github.com/golang/mock/gomock"
+        reflect "reflect"
+)
+
+// MockMyDB is a mock of MyDB interface
+type MockMyDB struct {
+        ctrl     *gomock.Controller
+        recorder *MockMyDBMockRecorder
+}
+
+// MockMyDBMockRecorder is the mock recorder for MockMyDB
+type MockMyDBMockRecorder struct {
+        mock *MockMyDB
+}
+
+// NewMockMyDB creates a new mock instance
+func NewMockMyDB(ctrl *gomock.Controller) *MockMyDB {
+        mock := &MockMyDB{ctrl: ctrl}
+        mock.recorder = &MockMyDBMockRecorder{mock}
+        return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use
+func (m *MockMyDB) EXPECT() *MockMyDBMockRecorder {
+        return m.recorder
+}
+
+// Retrieve mocks base method
+func (m *MockMyDB) Retrieve(key string) (*User, error) {
+        m.ctrl.T.Helper()
+        ret := m.ctrl.Call(m, "Retrieve", key)
+        ret0, _ := ret[0].(*User)
+        ret1, _ := ret[1].(error)
+        return ret0, ret1
+}
+
+// Retrieve indicates an expected call of Retrieve
+func (mr *MockMyDBMockRecorder) Retrieve(key interface{}) *gomock.Call {
+        mr.mock.ctrl.T.Helper()
+        return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Retrieve", reflect.TypeOf((*MockMyDB)(nil).Retrieve), key)
+}
+```
+
+step3 - 使用mock
+
+假设有如下代码使用了上述db，如下：
+
+```go
+// server.go
+package server
+
+import (
+        "db"
+)
+
+type Server struct {
+        db db.MyDB
+}
+
+func (s *Server) AddUserAge(key string) (*db.User, error) {
+        user, _ := s.db.Retrieve(key)
+        user.Age++
+        return user, nil
+}
+```
+
+该函数逻辑很简单，就是获取用户，并对用户年龄加1
+
+接着编写测试文件如下：
+
+```go
+// server_test.go
+package server
+
+import (
+        "db"
+        "github.com/golang/mock/gomock"
+        "testing"
+)
+
+func TestCreateUser(t *testing.T) {
+        ctl := gomock.NewController(t)
+        defer ctl.Finish()
+
+        mockMyDB := db.NewMockMyDB(ctl)
+
+        mockMyDB.EXPECT().Retrieve("1").Return(&db.User{
+                ID:   "1",
+                Name: "duyanghao",
+                Age:  27,
+        }, nil)
+
+        server := &Server{
+                db: mockMyDB,
+        }
+
+        user, _ := server.AddUserAge("1")
+
+        if user.Age != 28 {
+                t.Fatal("expected age 28, but got", user.Age)
+        }
+}
+```
+
+* ctl := gomock.NewController(t)实例化mock对象
+* ctl.Finish() 每个控制器都需要调用这个方法，确保mock的断言被引用
+* mockMyDB.EXPECT() 确保链式调用
+* Retrieve("1") Mock输入参数
+* Return() 定义返回值
+
+运行测试如下：
+
+```go
+$ go test .
+ok      _/root/test/server      0.002s
+```
+
+## Conclusion
+
+本文先概述了Go单元测试，并通过例子展开介绍了table driven tests，子测试，帮助函数以及网络测试，这些都是日常开发过程中经常会遇到的单元测试使用场景。接着介绍了测量程序在固定工作负载下性能的Go基准测试，并引入了比较型基准测试以及并发基准测试。最后介绍了Gomock，用于补充当待测试的函数/对象的依赖关系很复杂，并且有些依赖不能直接创建(例如数据库)的单元测试场景
 
 ## Refs
 
@@ -514,3 +738,4 @@ ok      _/root/test     4.123s
 * [Prefer table driven tests](https://dave.cheney.net/2019/05/07/prefer-table-driven-tests)
 * [testing - 单元测试](https://books.studygolang.com/The-Golang-Standard-Library-by-Example/chapter09/09.1.html)
 
+* [GO单元测试之一 （GoMock）](https://juejin.cn/post/6857189382307184647)

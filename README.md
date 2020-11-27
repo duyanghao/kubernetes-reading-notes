@@ -27,4 +27,8 @@ Kubernetes reading notes based on v1.17.4
 
   直播PPT见[这里](shares/harbor-in-practice.pptx)
   
+* 自研镜像P2P分发系统-Eagle分享
+
+  PPT见[这里](shares/eagle.pptx)  
+  
 ![](images/duyanghao.png)

@@ -16,7 +16,7 @@ Table of Contents
 * [Conclusion](#conclusion)
 * [Refs](#refs)
 
-本文总结日常开发中常用的golang单元测试经验
+本文总结日常开发中常用的golang测试经验
 
 ## 单元测试
 
@@ -691,7 +691,7 @@ import (
         "testing"
 )
 
-func TestCreateUser(t *testing.T) {
+func TestAddUserAge(t *testing.T) {
         ctl := gomock.NewController(t)
         defer ctl.Finish()
 
@@ -715,6 +715,8 @@ func TestCreateUser(t *testing.T) {
 }
 ```
 
+测试流程如下：
+
 * ctl := gomock.NewController(t)实例化mock对象
 * ctl.Finish() 每个控制器都需要调用这个方法，确保mock的断言被引用
 * mockMyDB.EXPECT() 确保链式调用
@@ -737,5 +739,4 @@ ok      _/root/test/server      0.002s
 * [Go Test 单元测试简明教程](https://geektutu.com/post/quick-go-test.html)
 * [Prefer table driven tests](https://dave.cheney.net/2019/05/07/prefer-table-driven-tests)
 * [testing - 单元测试](https://books.studygolang.com/The-Golang-Standard-Library-by-Example/chapter09/09.1.html)
-
 * [GO单元测试之一 （GoMock）](https://juejin.cn/post/6857189382307184647)

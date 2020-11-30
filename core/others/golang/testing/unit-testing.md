@@ -343,7 +343,7 @@ FAIL    _/root/test/mul 0.002s
 
 可以看到错误行又变成createMulTestCase函数内部了，而不是帮助函数调用处了。这里其实也比较好理解，因为子测试已经有标识了(TestMul/subtest#3)，那么就可以很容易定位到是哪里调用帮助函数了(createMulTestCase(t, &calcCase{"subtest#3", 2, 0, 1}))
 
-关于 `helper` 函数的 2 个建议：
+另外，这里给出关于`helper`函数的2个建议：
 
 - 不要返回错误， 帮助函数内部直接使用 `t.Error` 或 `t.Fatal` 即可，在用例主逻辑中不会因为太多的错误处理代码，影响可读性
 - 调用 `t.Helper()` 让报错信息更准确，有助于定位

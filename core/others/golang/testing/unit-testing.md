@@ -739,7 +739,6 @@ func TestAddUserAge(t *testing.T) {
 可以看到利用GoMock模拟了MyDB接口的Retrieve方法，整个测试流程如下：
 
 * ctl := gomock.NewController(t)实例化mock控制器
-* ctl.Finish() 每个控制器都需要调用这个方法，确保mock的断言被引用(It is not idempotent and therefore can only be invoked once.)
 * db.NewMockMyDB(ctl)：注入控制器创建mock对象
 * Retrieve("1") Mock输入参数
 * Return() 定义返回值
@@ -751,7 +750,7 @@ $ go test .
 ok      _/root/test/server      0.002s
 ```
 
-除了上述明确规定参数和返回值的基本打桩用法以外，GoMock还支持其它更加高级和灵活的打桩技巧，例如：检测调用次数(Times)、调用顺序(InOrder or After)，动态设置返回值(DoAndReturn)等，这里不展开介绍
+除了上述明确规定参数和返回值的基本打桩用法以外，GoMock还支持其它更加高级和灵活的打桩技巧，例如：调用次数(Times)、调用顺序(InOrder or After)，动态设置返回值(DoAndReturn)等，这里不展开介绍
 
 ## Conclusion
 

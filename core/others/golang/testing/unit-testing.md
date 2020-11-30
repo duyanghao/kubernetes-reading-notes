@@ -479,7 +479,7 @@ ok      _/root/test     1.219s
 - `0 B/op`：平均每次迭代内存所分配的字节数
 - `0 allocs/op`：平均每次迭代的内存分配次数
 
-由于这里没有Fib没有使用内存(除了函数栈桢以外)，所以这里关于内存的两个指标都为0
+由于这里Fib没有使用内存(除了函数栈桢以外)，所以这里关于内存的两个指标都为0
 
 ### 比较型基准测试
 
@@ -590,7 +590,7 @@ step1 - 构建接口
 ```bash
 server/
 |-- server.go
-`-- server_test.go
+|-- server_test.go
 db/
 |-- db.go
 |-- db_mock.go
@@ -616,7 +616,7 @@ type MyDB interface {
 
 step2 - 生成mock
 
-通过gomock生成mock文件，如下：
+通过mockgen生成mock文件，如下：
 
 ```bash
 mockgen -source=./db/db.go -destination=./db/db_mock.go -package=db
@@ -677,7 +677,7 @@ func (mr *MockMyDBMockRecorder) Retrieve(key interface{}) *gomock.Call {
 
 step3 - 使用mock
 
-假设有如下代码使用了上述db，如下：
+假设有如下代码使用了上述db：
 
 ```go
 // server.go
@@ -736,7 +736,7 @@ func TestAddUserAge(t *testing.T) {
 }
 ```
 
-可以看到利用GoMock模拟了MyDB接口的Retrieve函数，整个测试流程如下：
+可以看到利用GoMock模拟了MyDB接口的Retrieve方法，整个测试流程如下：
 
 * ctl := gomock.NewController(t)实例化mock控制器
 * ctl.Finish() 每个控制器都需要调用这个方法，确保mock的断言被引用(It is not idempotent and therefore can only be invoked once.)
@@ -751,11 +751,11 @@ $ go test .
 ok      _/root/test/server      0.002s
 ```
 
-除了上述规定明确参数和返回值的基本打桩用法以外，GoMock还支持其它更加高级和灵活的打桩技巧，例如：检测调用次数(Times)、调用顺序(InOrder or After)，动态设置返回值(DoAndReturn)等，这里不展开介绍
+除了上述明确规定参数和返回值的基本打桩用法以外，GoMock还支持其它更加高级和灵活的打桩技巧，例如：检测调用次数(Times)、调用顺序(InOrder or After)，动态设置返回值(DoAndReturn)等，这里不展开介绍
 
 ## Conclusion
 
-本文先概述了Go单元测试，并通过例子展开介绍了table driven tests，子测试，帮助函数以及网络测试，这些都是日常开发过程中经常会遇到的单元测试使用场景。接着介绍了测量程序在固定工作负载下性能的Go基准测试，并引入了比较型基准测试以及并发基准测试。最后介绍了Go mock/stub 测试框架GoMock，并以一个例子说明了GoMock的使用流程。希望通过本文对Go测试有一个基本的了解和使用
+本文先概述了Go单元测试，并通过例子展开介绍了table driven tests，子测试，帮助函数以及网络测试，这些都是日常开发过程中经常会遇到的单元测试使用场景。接着介绍了测量程序在固定工作负载下性能的Go基准测试，并引入了比较型基准测试以及并发基准测试。最后介绍了Go mock/stub测试框架GoMock，并以一个例子说明了GoMock的使用流程。希望通过本文对Go测试有一个基本的了解和使用
 
 ## Refs
 

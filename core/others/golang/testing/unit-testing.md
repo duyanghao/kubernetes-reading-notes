@@ -464,7 +464,7 @@ func BenchmarkFib10(b *testing.B) {
 
 基准函数会运行目标代码 b.N 次。在基准执行期间，程序会自动调整 b.N 直到基准测试函数持续足够长的时间。执行如下：
 
-```go
+```bash
 $ go test -bench=Fib10 -benchmem
 goos: linux
 goarch: amd64

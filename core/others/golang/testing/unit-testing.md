@@ -166,7 +166,7 @@ FAIL    _/root/test/split       0.002s
 
 如果换成t.Errorf，则运行结果如下：
 
-```go
+```bash
 $ go test -run=TestSplit -v
 === RUN   TestSplit
     split_test.go:45: expected: [a/b], got: [a/b/c]

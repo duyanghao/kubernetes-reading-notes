@@ -62,7 +62,7 @@ func TestFib(t *testing.T) {
 }
 ```
 
-执行 `go test .`显示失败，输出：
+执行`go test .`显示失败，输出：
 
 ```go
 $ go test .
@@ -71,7 +71,19 @@ $ go test .
 FAIL
 FAIL    _/root/test     0.002s
 FAIL
+```
 
+这里再添加一个测试用例：
+
+```go
+func TestFib2(t *testing.T) {
+        // ...
+}
+```
+
+执行`go test -v`，结果如下：
+
+```go
 $ go test -run TestFib -v -cover
 === RUN   TestFib
     fib_test.go:15: Fib(7) = 64; expected 13
@@ -84,8 +96,9 @@ exit status 1
 FAIL    _/root/test     0.002s
 ```
 
-* 运行 `go test`，该 package 下所有的测试用例都会被执行
+通过上述例子可以总结如下：
 
+* 运行 `go test`，该 package 下所有的测试用例都会被执行
 * `go test -v`，`-v` 参数会显示每个用例的测试结果，另外 `-cover` 参数可以查看覆盖率
 * 如果只想运行其中的一个用例，例如 `TestFib`，可以用 `-run` 参数指定，该参数支持通配符 `*`和部分正则表达式，例如 `^`、`$`
 

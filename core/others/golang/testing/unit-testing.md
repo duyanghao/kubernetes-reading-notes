@@ -16,7 +16,7 @@ Table of Contents
 * [Conclusion](#conclusion)
 * [Refs](#refs)
 
-本文总结日常开发中常用的golang测试经验
+本文总结日常开发中基础的Go测试知识，以便可以更加快速和高效进行Go测试用例编写
 
 ## 单元测试
 
@@ -532,7 +532,15 @@ ok      _/root/test     2.251s
 
 当待测试的函数/对象的依赖关系很复杂，并且有些依赖不能直接创建，例如数据库连接、文件I/O等。这种场景就非常适合使用 mock/stub 测试。简单来说，就是用 mock 对象模拟依赖项的行为
 
-[gomock](https://github.com/golang/mock) 是官方提供的 mock 框架，同时还提供了 mockgen 工具用来辅助生成测试代码。使用如下命令即可安装：
+常用的Go mock/stub框架主要有：
+
+* GoStub：支持全局变量，函数，过程打桩；但是不支持为接口以及方法打桩
+* Monkey：支持函数，过程，方法打桩
+* GoMock：支持接口打桩
+
+日常工作中会结合使用上述工具，本文主要介绍如何使用GoMock测试框架：
+
+[GoMock](https://github.com/golang/mock)是由Go官方开发维护的测试框架，实现了较为完整的基于interface的Mock功能，能够与Go内置的testing包良好集成，也能用于其它的测试环境中。GoMock测试框架包含了GoMock包和mockgen工具两部分，其中GoMock包完成对Mock对象生命周期的管理，mockgen工具用来生成interface对应的Mock类源文件。使用如下命令即可安装：
 
 ```bash
 $ go get -u github.com/golang/mock/gomock
@@ -560,7 +568,7 @@ Standard usage:
           }
 ```
 
-这里以一个实际例子来说明上述GoMock使用步骤
+这里以一个实际例子来说明上述GoMock使用步骤：
 
 step1 - 构建接口
 
@@ -715,11 +723,11 @@ func TestAddUserAge(t *testing.T) {
 }
 ```
 
-测试流程如下：
+可以看到利用GoMock模拟了MyDB接口的Retrieve函数，整个测试流程如下：
 
-* ctl := gomock.NewController(t)实例化mock对象
-* ctl.Finish() 每个控制器都需要调用这个方法，确保mock的断言被引用
-* mockMyDB.EXPECT() 确保链式调用
+* ctl := gomock.NewController(t)实例化mock控制器
+* ctl.Finish() 每个控制器都需要调用这个方法，确保mock的断言被引用(It is not idempotent and therefore can only be invoked once.)
+* db.NewMockMyDB(ctl)：注入控制器创建mock对象
 * Retrieve("1") Mock输入参数
 * Return() 定义返回值
 
@@ -730,9 +738,11 @@ $ go test .
 ok      _/root/test/server      0.002s
 ```
 
+除了上述规定明确参数和返回值的基本打桩用法以外，GoMock还支持其它更加高级和灵活的打桩技巧，例如：检测调用次数(Times)、调用顺序(InOrder or After)，动态设置返回值(DoAndReturn)等，这里不展开介绍
+
 ## Conclusion
 
-本文先概述了Go单元测试，并通过例子展开介绍了table driven tests，子测试，帮助函数以及网络测试，这些都是日常开发过程中经常会遇到的单元测试使用场景。接着介绍了测量程序在固定工作负载下性能的Go基准测试，并引入了比较型基准测试以及并发基准测试。最后介绍了Gomock，用于补充当待测试的函数/对象的依赖关系很复杂，并且有些依赖不能直接创建(例如数据库)的单元测试场景
+本文先概述了Go单元测试，并通过例子展开介绍了table driven tests，子测试，帮助函数以及网络测试，这些都是日常开发过程中经常会遇到的单元测试使用场景。接着介绍了测量程序在固定工作负载下性能的Go基准测试，并引入了比较型基准测试以及并发基准测试。最后介绍了Go mock/stub 测试框架GoMock，并以一个例子说明了GoMock的使用流程。希望通过本文对Go测试有一个基本的了解和使用
 
 ## Refs
 
@@ -740,3 +750,4 @@ ok      _/root/test/server      0.002s
 * [Prefer table driven tests](https://dave.cheney.net/2019/05/07/prefer-table-driven-tests)
 * [testing - 单元测试](https://books.studygolang.com/The-Golang-Standard-Library-by-Example/chapter09/09.1.html)
 * [GO单元测试之一 （GoMock）](https://juejin.cn/post/6857189382307184647)
+* [What's the difference between a mock & stub?](https://stackoverflow.com/questions/3459287/whats-the-difference-between-a-mock-stub)

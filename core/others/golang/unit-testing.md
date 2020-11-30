@@ -16,7 +16,7 @@ Table of Contents
 * [Conclusion](#conclusion)
 * [Refs](#refs)
 
-本文总结日常开发中常用的golang测试经验
+本文总结日常开发中基础的Go测试知识，以便可以更加快速和高效进行Go测试用例编写
 
 ## 单元测试
 

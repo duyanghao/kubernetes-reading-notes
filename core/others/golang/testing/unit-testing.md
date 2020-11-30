@@ -267,7 +267,7 @@ func TestMul(t *testing.T) {
 运行如下：
 
 ```bash
-# go test -v
+$ go test -v
 === RUN   TestMul
     calc_test.go:10: 2 * 0 expected 1, but 0 got
 --- FAIL: TestMul (0.00s)

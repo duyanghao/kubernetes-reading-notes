@@ -266,7 +266,7 @@ func TestMul(t *testing.T) {
 
 运行如下：
 
-```go
+```bash
 # go test -v
 === RUN   TestMul
     calc_test.go:10: 2 * 0 expected 1, but 0 got
@@ -280,7 +280,7 @@ FAIL    _/root/test/mul 0.002s
 
 修改 `createMulTestCase`，调用 `t.Helper()`，测试如下：
 
-```go
+```bash
 $ go test -v
 === RUN   TestMul
     calc_test.go:19: 2 * 0 expected 1, but 0 got

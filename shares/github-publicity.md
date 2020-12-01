@@ -46,7 +46,7 @@ Table of Contents
 
 ## [kubernetes-reading-notes](https://github.com/duyanghao/kubernetes-reading-notes)
 
-![](/public/img/github-overview/kubernetes-reading-notes.png)
+![img](https://duyanghao.github.io/public/img/github-overview/kubernetes-reading-notes.png)
 
 kubernetes-reading-notes主要以源码分析为主，实践总结为辅：
 

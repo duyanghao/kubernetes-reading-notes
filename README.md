@@ -31,4 +31,6 @@ Kubernetes reading notes based on v1.17.4
 
   PPT见[这里](shares/eagle.pptx)  
   
+* [github自研项目推广](shares/github-publicity.md)  
+  
 ![](images/duyanghao.png)

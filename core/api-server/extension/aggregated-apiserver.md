@@ -1679,3 +1679,122 @@ func (r *loopbackResolver) ResolveEndpoint(namespace, name string, port int32) (
 ```
 
 对于kubernetes/default service with port 443会直接转发给loopback；其它service则交给aggregatorEndpointRouting或者aggregatorClusterRouting处理
+
+上面总结的是apiservice.Spec.Service字段非空的情形；下面我们分析apiservice.Spec.Service字段为空(也即Local SERVICE)类型的场景：
+
+```go
+// k8s.io/kubernetes/staging/src/k8s.io/kube-aggregator/pkg/apiserver/handler_proxy.go:245
+func (r *proxyHandler) updateAPIService(apiService *apiregistrationv1api.APIService) {
+	if apiService.Spec.Service == nil {
+		r.handlingInfo.Store(proxyHandlingInfo{local: true})
+		return
+	}
+
+	// 根据apiService定义构建proxyHandlingInfo结构体，主要是service部分
+	newInfo := proxyHandlingInfo{
+		name: apiService.Name,
+		restConfig: &restclient.Config{
+			TLSClientConfig: restclient.TLSClientConfig{
+				Insecure:   apiService.Spec.InsecureSkipTLSVerify,
+				ServerName: apiService.Spec.Service.Name + "." + apiService.Spec.Service.Namespace + ".svc",
+				CertData:   r.proxyClientCert,
+				KeyData:    r.proxyClientKey,
+				CAData:     apiService.Spec.CABundle,
+			},
+		},
+		serviceName:      apiService.Spec.Service.Name,
+		serviceNamespace: apiService.Spec.Service.Namespace,
+		servicePort:      *apiService.Spec.Service.Port,
+		serviceAvailable: apiregistrationv1apihelper.IsAPIServiceConditionTrue(apiService, apiregistrationv1api.Available),
+	}
+	if r.egressSelector != nil {
+		networkContext := egressselector.Cluster.AsNetworkContext()
+		var egressDialer utilnet.DialFunc
+		egressDialer, err := r.egressSelector.Lookup(networkContext)
+		if err != nil {
+			klog.Warning(err.Error())
+		} else {
+			newInfo.restConfig.Dial = egressDialer
+		}
+	} else if r.proxyTransport != nil && r.proxyTransport.DialContext != nil {
+		newInfo.restConfig.Dial = r.proxyTransport.DialContext
+	}
+	// 构建proxyRoundTripper
+	newInfo.proxyRoundTripper, newInfo.transportBuildingError = restclient.TransportFor(newInfo.restConfig)
+	if newInfo.transportBuildingError != nil {
+		klog.Warning(newInfo.transportBuildingError.Error())
+	}
+	// 将proxyHandlingInfo存放于handlingInfo
+	r.handlingInfo.Store(newInfo)
+}
+```
+
+可以看到如果apiService.Spec.Service为空，则会执行r.handlingInfo.Store(proxyHandlingInfo{local: true})操作，进行执行localDelegate.ServeHTTP：
+
+```go
+func (r *proxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	value := r.handlingInfo.Load()
+	if value == nil {
+		r.localDelegate.ServeHTTP(w, req)
+		return
+	}
+	handlingInfo := value.(proxyHandlingInfo)
+	if handlingInfo.local {
+		if r.localDelegate == nil {
+			http.Error(w, "", http.StatusNotFound)
+			return
+		}
+		r.localDelegate.ServeHTTP(w, req)
+		return
+	}
+	...
+}
+
+// k8s.io/kubernetes/staging/src/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go:285
+// AddAPIService adds an API service.  It is not thread-safe, so only call it on one thread at a time please.
+// It's a slow moving API, so its ok to run the controller on a single thread
+func (s *APIAggregator) AddAPIService(apiService *v1.APIService) error {
+	// if the proxyHandler already exists, it needs to be updated. The aggregation bits do not
+	// since they are wired against listers because they require multiple resources to respond
+	if proxyHandler, exists := s.proxyHandlers[apiService.Name]; exists {
+		proxyHandler.updateAPIService(apiService)
+		if s.openAPIAggregationController != nil {
+			s.openAPIAggregationController.UpdateAPIService(proxyHandler, apiService)
+		}
+		return nil
+	}
+
+	proxyPath := "/apis/" + apiService.Spec.Group + "/" + apiService.Spec.Version
+	// v1. is a special case for the legacy API.  It proxies to a wider set of endpoints.
+	if apiService.Name == legacyAPIServiceName {
+		proxyPath = "/api"
+	}
+
+	// register the proxy handler
+	proxyHandler := &proxyHandler{
+		localDelegate:   s.delegateHandler,
+		proxyClientCert: s.proxyClientCert,
+		proxyClientKey:  s.proxyClientKey,
+		proxyTransport:  s.proxyTransport,
+		serviceResolver: s.serviceResolver,
+		egressSelector:  s.egressSelector,
+	}
+	proxyHandler.updateAPIService(apiService)
+	if s.openAPIAggregationController != nil {
+		s.openAPIAggregationController.AddAPIService(proxyHandler, apiService)
+	}
+	s.proxyHandlers[apiService.Name] = proxyHandler
+	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle(proxyPath, proxyHandler)
+	s.GenericAPIServer.Handler.NonGoRestfulMux.UnlistedHandlePrefix(proxyPath+"/", proxyHandler)
+
+	...
+	return nil
+}
+```
+
+这里我们追本溯源localDelegate.ServeHTTP，如下：
+
+```go
+
+```
+

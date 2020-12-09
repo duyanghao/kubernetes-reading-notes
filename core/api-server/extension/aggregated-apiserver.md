@@ -913,11 +913,769 @@ metadata:
     sample-label: "true"
 ```
 
-这些yamls中最关键的就是apiservice.yaml，它将core kube-apiserver与extension apiserver连接在一起，下面开始分析：
+这些yamls中最关键的就是apiservice.yaml，它将core kube-apiserver与extension apiserver联系在一起。这里面就会涉及kube-apiserver中AggregatorServer的controller逻辑了：
+
+> 其中，Aggregator 通过 APIServices 对象关联到某个 Service 来进行请求的转发，其关联的 Service 类型进一步决定了请求转发形式。Aggregator 包括一个 `GenericAPIServer` 和维护自身状态的 Controller。其中 `GenericAPIServer` 主要处理 `apiregistration.k8s.io` 组下的 APIService 资源请求，controller包括：
+
+- `apiserviceRegistrationController`：负责 APIServices 中资源的注册与删除；
+- `availableConditionController`：维护 APIServices 的可用状态，包括其引用 Service 是否可用等；
+- `autoRegistrationController`：用于保持 API 中存在的一组特定的 APIServices；
+- `crdRegistrationController`：负责将 CRD GroupVersions 自动注册到 APIServices 中；
+- `openAPIAggregationController`：将 APIServices 资源的变化同步至提供的 OpenAPI 文档；
+
+对应要研究的是`apiserviceRegistrationController`：
 
 ```go
+// k8s.io/kubernetes/cmd/kube-apiserver/app/aggregator.go:129
+func createAggregatorServer(aggregatorConfig *aggregatorapiserver.Config, delegateAPIServer genericapiserver.DelegationTarget, apiExtensionInformers apiextensionsinformers.SharedInformerFactory) (*aggregatorapiserver.APIAggregator, error) {
+	aggregatorServer, err := aggregatorConfig.Complete().NewWithDelegate(delegateAPIServer)
+	if err != nil {
+		return nil, err
+	}
 
+	// create controllers for auto-registration
+	apiRegistrationClient, err := apiregistrationclient.NewForConfig(aggregatorConfig.GenericConfig.LoopbackClientConfig)
+	if err != nil {
+		return nil, err
+	}
+	autoRegistrationController := autoregister.NewAutoRegisterController(aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(), apiRegistrationClient)
+	apiServices := apiServicesToRegister(delegateAPIServer, autoRegistrationController)
+	crdRegistrationController := crdregistration.NewCRDRegistrationController(
+		apiExtensionInformers.Apiextensions().V1().CustomResourceDefinitions(),
+		autoRegistrationController)
+
+	err = aggregatorServer.GenericAPIServer.AddPostStartHook("kube-apiserver-autoregistration", func(context genericapiserver.PostStartHookContext) error {
+		go crdRegistrationController.Run(5, context.StopCh)
+		go func() {
+			// let the CRD controller process the initial set of CRDs before starting the autoregistration controller.
+			// this prevents the autoregistration controller's initial sync from deleting APIServices for CRDs that still exist.
+			// we only need to do this if CRDs are enabled on this server.  We can't use discovery because we are the source for discovery.
+			if aggregatorConfig.GenericConfig.MergedResourceConfig.AnyVersionForGroupEnabled("apiextensions.k8s.io") {
+				crdRegistrationController.WaitForInitialSync()
+			}
+			autoRegistrationController.Run(5, context.StopCh)
+		}()
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	err = aggregatorServer.GenericAPIServer.AddBootSequenceHealthChecks(
+		makeAPIServiceAvailableHealthCheck(
+			"autoregister-completion",
+			apiServices,
+			aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(),
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return aggregatorServer, nil
+}
+
+k8s.io/kubernetes/staging/src/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go:159
+// NewWithDelegate returns a new instance of APIAggregator from the given config.
+func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.DelegationTarget) (*APIAggregator, error) {
+	...
+	apisHandler := &apisHandler{
+		codecs:         aggregatorscheme.Codecs,
+		lister:         s.lister,
+		discoveryGroup: discoveryGroup(enabledVersions),
+	}
+	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", apisHandler)
+	s.GenericAPIServer.Handler.NonGoRestfulMux.UnlistedHandle("/apis/", apisHandler)
+
+	apiserviceRegistrationController := NewAPIServiceRegistrationController(informerFactory.Apiregistration().V1().APIServices(), s)
+	availableController, err := statuscontrollers.NewAvailableConditionController(
+		informerFactory.Apiregistration().V1().APIServices(),
+		c.GenericConfig.SharedInformerFactory.Core().V1().Services(),
+		c.GenericConfig.SharedInformerFactory.Core().V1().Endpoints(),
+		apiregistrationClient.ApiregistrationV1(),
+		c.ExtraConfig.ProxyTransport,
+		c.ExtraConfig.ProxyClientCert,
+		c.ExtraConfig.ProxyClientKey,
+		s.serviceResolver,
+		c.GenericConfig.EgressSelector,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	s.GenericAPIServer.AddPostStartHookOrDie("start-kube-aggregator-informers", func(context genericapiserver.PostStartHookContext) error {
+		informerFactory.Start(context.StopCh)
+		c.GenericConfig.SharedInformerFactory.Start(context.StopCh)
+		return nil
+	})
+	s.GenericAPIServer.AddPostStartHookOrDie("apiservice-registration-controller", func(context genericapiserver.PostStartHookContext) error {
+		go apiserviceRegistrationController.Run(context.StopCh)
+		return nil
+	})
+	s.GenericAPIServer.AddPostStartHookOrDie("apiservice-status-available-controller", func(context genericapiserver.PostStartHookContext) error {
+		// if we end up blocking for long periods of time, we may need to increase threadiness.
+		go availableController.Run(5, context.StopCh)
+		return nil
+	})
+
+	return s, nil
+}
 ```
 
+重点看`apiserviceRegistrationController := NewAPIServiceRegistrationController(informerFactory.Apiregistration().V1().APIServices(), s)`，如下：
 
+```go
+// k8s.io/kubernetes/vendor/k8s.io/kube-aggregator/pkg/apiserver/apiservice_controller.go:56
+// NewAPIServiceRegistrationController returns a new APIServiceRegistrationController.
+func NewAPIServiceRegistrationController(apiServiceInformer informers.APIServiceInformer, apiHandlerManager APIHandlerManager) *APIServiceRegistrationController {
+	c := &APIServiceRegistrationController{
+		apiHandlerManager: apiHandlerManager,
+		apiServiceLister:  apiServiceInformer.Lister(),
+		apiServiceSynced:  apiServiceInformer.Informer().HasSynced,
+		queue:             workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "APIServiceRegistrationController"),
+	}
 
+	apiServiceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.addAPIService,
+		UpdateFunc: c.updateAPIService,
+		DeleteFunc: c.deleteAPIService,
+	})
+
+	c.syncFn = c.sync
+
+	return c
+}
+
+func (c *APIServiceRegistrationController) addAPIService(obj interface{}) {
+	castObj := obj.(*v1.APIService)
+	klog.V(4).Infof("Adding %s", castObj.Name)
+	c.enqueue(castObj)
+}
+
+func (c *APIServiceRegistrationController) updateAPIService(obj, _ interface{}) {
+	castObj := obj.(*v1.APIService)
+	klog.V(4).Infof("Updating %s", castObj.Name)
+	c.enqueue(castObj)
+}
+
+func (c *APIServiceRegistrationController) deleteAPIService(obj interface{}) {
+	castObj, ok := obj.(*v1.APIService)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			klog.Errorf("Couldn't get object from tombstone %#v", obj)
+			return
+		}
+		castObj, ok = tombstone.Obj.(*v1.APIService)
+		if !ok {
+			klog.Errorf("Tombstone contained object that is not expected %#v", obj)
+			return
+		}
+	}
+	klog.V(4).Infof("Deleting %q", castObj.Name)
+	c.enqueue(castObj)
+}
+
+func (c *APIServiceRegistrationController) enqueue(obj *v1.APIService) {
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	if err != nil {
+		klog.Errorf("Couldn't get key for object %#v: %v", obj, err)
+		return
+	}
+
+	c.queue.Add(key)
+}
+```
+
+通过Run在启动AggregatorServer之后执行APIServiceRegistrationController：
+
+```go
+...
+	s.GenericAPIServer.AddPostStartHookOrDie("apiservice-registration-controller", func(context genericapiserver.PostStartHookContext) error {
+		go apiserviceRegistrationController.Run(context.StopCh)
+		return nil
+	})
+...
+
+// Run starts APIServiceRegistrationController which will process all registration requests until stopCh is closed.
+func (c *APIServiceRegistrationController) Run(stopCh <-chan struct{}) {
+	defer utilruntime.HandleCrash()
+	defer c.queue.ShutDown()
+
+	klog.Infof("Starting APIServiceRegistrationController")
+	defer klog.Infof("Shutting down APIServiceRegistrationController")
+
+	if !controllers.WaitForCacheSync("APIServiceRegistrationController", stopCh, c.apiServiceSynced) {
+		return
+	}
+
+	// only start one worker thread since its a slow moving API and the aggregation server adding bits
+	// aren't threadsafe
+	go wait.Until(c.runWorker, time.Second, stopCh)
+
+	<-stopCh
+}
+
+func (c *APIServiceRegistrationController) runWorker() {
+	for c.processNextWorkItem() {
+	}
+}
+
+// processNextWorkItem deals with one key off the queue.  It returns false when it's time to quit.
+func (c *APIServiceRegistrationController) processNextWorkItem() bool {
+	key, quit := c.queue.Get()
+	if quit {
+		return false
+	}
+	defer c.queue.Done(key)
+
+	err := c.syncFn(key.(string))
+	if err == nil {
+		c.queue.Forget(key)
+		return true
+	}
+
+	utilruntime.HandleError(fmt.Errorf("%v failed with : %v", key, err))
+	c.queue.AddRateLimited(key)
+
+	return true
+}
+```
+
+可以看到典型的Kubernetes controller代码结构，这里不展开分析controller数据结构细节(在kube-controller部分会深入研究)，只分析controller逻辑，其中最主要的处理函数是sync：
+
+```go
+func (c *APIServiceRegistrationController) sync(key string) error {
+	apiService, err := c.apiServiceLister.Get(key)
+	if apierrors.IsNotFound(err) {
+		c.apiHandlerManager.RemoveAPIService(key)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	return c.apiHandlerManager.AddAPIService(apiService)
+}
+```
+
+首先获取apiService对象，然后执行AddAPIService操作：
+
+```go
+// k8s.io/kubernetes/staging/src/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go:285
+// AddAPIService adds an API service.  It is not thread-safe, so only call it on one thread at a time please.
+// It's a slow moving API, so its ok to run the controller on a single thread
+func (s *APIAggregator) AddAPIService(apiService *v1.APIService) error {
+	// if the proxyHandler already exists, it needs to be updated. The aggregation bits do not
+	// since they are wired against listers because they require multiple resources to respond
+	if proxyHandler, exists := s.proxyHandlers[apiService.Name]; exists {
+		proxyHandler.updateAPIService(apiService)
+		if s.openAPIAggregationController != nil {
+			s.openAPIAggregationController.UpdateAPIService(proxyHandler, apiService)
+		}
+		return nil
+	}
+
+	proxyPath := "/apis/" + apiService.Spec.Group + "/" + apiService.Spec.Version
+	// v1. is a special case for the legacy API.  It proxies to a wider set of endpoints.
+	if apiService.Name == legacyAPIServiceName {
+		proxyPath = "/api"
+	}
+
+	// register the proxy handler
+	proxyHandler := &proxyHandler{
+		localDelegate:   s.delegateHandler,
+		proxyClientCert: s.proxyClientCert,
+		proxyClientKey:  s.proxyClientKey,
+		proxyTransport:  s.proxyTransport,
+		serviceResolver: s.serviceResolver,
+		egressSelector:  s.egressSelector,
+	}
+	proxyHandler.updateAPIService(apiService)
+	if s.openAPIAggregationController != nil {
+		s.openAPIAggregationController.AddAPIService(proxyHandler, apiService)
+	}
+	s.proxyHandlers[apiService.Name] = proxyHandler
+	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle(proxyPath, proxyHandler)
+	s.GenericAPIServer.Handler.NonGoRestfulMux.UnlistedHandlePrefix(proxyPath+"/", proxyHandler)
+
+	// if we're dealing with the legacy group, we're done here
+	if apiService.Name == legacyAPIServiceName {
+		return nil
+	}
+
+	// if we've already registered the path with the handler, we don't want to do it again.
+	if s.handledGroups.Has(apiService.Spec.Group) {
+		return nil
+	}
+
+	// it's time to register the group aggregation endpoint
+	groupPath := "/apis/" + apiService.Spec.Group
+	groupDiscoveryHandler := &apiGroupHandler{
+		codecs:    aggregatorscheme.Codecs,
+		groupName: apiService.Spec.Group,
+		lister:    s.lister,
+		delegate:  s.delegateHandler,
+	}
+	// aggregation is protected
+	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle(groupPath, groupDiscoveryHandler)
+	s.GenericAPIServer.Handler.NonGoRestfulMux.UnlistedHandle(groupPath+"/", groupDiscoveryHandler)
+	s.handledGroups.Insert(apiService.Spec.Group)
+	return nil
+}
+```
+
+结合yamls文件分析代码：
+
+```yaml
+// apiservice.yaml
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1alpha1.wardle.example.com
+spec:
+  insecureSkipTLSVerify: true
+  group: wardle.example.com
+  groupPriorityMinimum: 1000
+  versionPriority: 15
+  service:
+    name: api
+    namespace: wardle
+  version: v1alpha1
+```
+
+构建proxyPath("/apis/" + apiService.Spec.Group + "/" + apiService.Spec.Version)以及proxyHandler：
+
+```go
+// proxyHandler provides a http.Handler which will proxy traffic to locations
+// specified by items implementing Redirector.
+type proxyHandler struct {
+	// localDelegate is used to satisfy local APIServices
+	localDelegate http.Handler
+
+	// proxyClientCert/Key are the client cert used to identify this proxy. Backing APIServices use
+	// this to confirm the proxy's identity
+	proxyClientCert []byte
+	proxyClientKey  []byte
+	proxyTransport  *http.Transport
+
+	// Endpoints based routing to map from cluster IP to routable IP
+	serviceResolver ServiceResolver
+
+	handlingInfo atomic.Value
+
+	// egressSelector selects the proper egress dialer to communicate with the custom apiserver
+	// overwrites proxyTransport dialer if not nil
+	egressSelector *egressselector.EgressSelector
+}
+
+type proxyHandlingInfo struct {
+	// local indicates that this APIService is locally satisfied
+	local bool
+
+	// name is the name of the APIService
+	name string
+	// restConfig holds the information for building a roundtripper
+	restConfig *restclient.Config
+	// transportBuildingError is an error produced while building the transport.  If this
+	// is non-nil, it will be reported to clients.
+	transportBuildingError error
+	// proxyRoundTripper is the re-useable portion of the transport.  It does not vary with any request.
+	proxyRoundTripper http.RoundTripper
+	// serviceName is the name of the service this handler proxies to
+	serviceName string
+	// namespace is the namespace the service lives in
+	serviceNamespace string
+	// serviceAvailable indicates this APIService is available or not
+	serviceAvailable bool
+	// servicePort is the port of the service this handler proxies to
+	servicePort int32
+}
+
+// k8s.io/kubernetes/staging/src/k8s.io/kube-aggregator/pkg/apiserver/handler_proxy.go:245
+func (r *proxyHandler) updateAPIService(apiService *apiregistrationv1api.APIService) {
+	if apiService.Spec.Service == nil {
+		r.handlingInfo.Store(proxyHandlingInfo{local: true})
+		return
+	}
+
+	// 根据apiService定义构建proxyHandlingInfo结构体，主要是service部分
+	newInfo := proxyHandlingInfo{
+		name: apiService.Name,
+		restConfig: &restclient.Config{
+			TLSClientConfig: restclient.TLSClientConfig{
+				Insecure:   apiService.Spec.InsecureSkipTLSVerify,
+				ServerName: apiService.Spec.Service.Name + "." + apiService.Spec.Service.Namespace + ".svc",
+				CertData:   r.proxyClientCert,
+				KeyData:    r.proxyClientKey,
+				CAData:     apiService.Spec.CABundle,
+			},
+		},
+		serviceName:      apiService.Spec.Service.Name,
+		serviceNamespace: apiService.Spec.Service.Namespace,
+		servicePort:      *apiService.Spec.Service.Port,
+		serviceAvailable: apiregistrationv1apihelper.IsAPIServiceConditionTrue(apiService, apiregistrationv1api.Available),
+	}
+	if r.egressSelector != nil {
+		networkContext := egressselector.Cluster.AsNetworkContext()
+		var egressDialer utilnet.DialFunc
+		egressDialer, err := r.egressSelector.Lookup(networkContext)
+		if err != nil {
+			klog.Warning(err.Error())
+		} else {
+			newInfo.restConfig.Dial = egressDialer
+		}
+	} else if r.proxyTransport != nil && r.proxyTransport.DialContext != nil {
+		newInfo.restConfig.Dial = r.proxyTransport.DialContext
+	}
+	// 构建proxyRoundTripper
+	newInfo.proxyRoundTripper, newInfo.transportBuildingError = restclient.TransportFor(newInfo.restConfig)
+	if newInfo.transportBuildingError != nil {
+		klog.Warning(newInfo.transportBuildingError.Error())
+	}
+	// 将roxyHandlingInfo存放于handlingInfo
+	r.handlingInfo.Store(newInfo)
+}
+```
+
+这里通过APIService的定义构建了proxyHandler，通过查看proxyHandlingInfo结构体基本就能确定proxyHander作用：将请求代理给制定APIService定义的API service服务，如下是proxyHander具体的请求处理逻辑：
+
+```go
+// k8s.io/kubernetes/staging/src/k8s.io/kube-aggregator/pkg/apiserver/handler_proxy.go:109
+func (r *proxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// 加载roxyHandlingInfo处理请求  
+	value := r.handlingInfo.Load()
+	if value == nil {
+		r.localDelegate.ServeHTTP(w, req)
+		return
+	}
+	handlingInfo := value.(proxyHandlingInfo)
+	if handlingInfo.local {
+		if r.localDelegate == nil {
+			http.Error(w, "", http.StatusNotFound)
+			return
+		}
+		r.localDelegate.ServeHTTP(w, req)
+		return
+	}
+	// 判断APIService服务是否正常
+	if !handlingInfo.serviceAvailable {
+		proxyError(w, req, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	if handlingInfo.transportBuildingError != nil {
+		proxyError(w, req, handlingInfo.transportBuildingError.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// 从请求解析用户  
+	user, ok := genericapirequest.UserFrom(req.Context())
+	if !ok {
+		proxyError(w, req, "missing user", http.StatusInternalServerError)
+		return
+	}
+
+	// 将原始请求转化为对APIService的请求
+	// write a new location based on the existing request pointed at the target service
+	location := &url.URL{}
+	location.Scheme = "https"
+	rloc, err := r.serviceResolver.ResolveEndpoint(handlingInfo.serviceNamespace, handlingInfo.serviceName, handlingInfo.servicePort)
+	if err != nil {
+		klog.Errorf("error resolving %s/%s: %v", handlingInfo.serviceNamespace, handlingInfo.serviceName, err)
+		proxyError(w, req, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	location.Host = rloc.Host
+	location.Path = req.URL.Path
+	location.RawQuery = req.URL.Query().Encode()
+
+	newReq, cancelFn := newRequestForProxy(location, req)
+	defer cancelFn()
+
+	if handlingInfo.proxyRoundTripper == nil {
+		proxyError(w, req, "", http.StatusNotFound)
+		return
+	}
+
+	// we need to wrap the roundtripper in another roundtripper which will apply the front proxy headers
+	proxyRoundTripper, upgrade, err := maybeWrapForConnectionUpgrades(handlingInfo.restConfig, handlingInfo.proxyRoundTripper, req)
+	if err != nil {
+		proxyError(w, req, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	proxyRoundTripper = transport.NewAuthProxyRoundTripper(user.GetName(), user.GetGroups(), user.GetExtra(), proxyRoundTripper)
+
+	// if we are upgrading, then the upgrade path tries to use this request with the TLS config we provide, but it does
+	// NOT use the roundtripper.  Its a direct call that bypasses the round tripper.  This means that we have to
+	// attach the "correct" user headers to the request ahead of time.  After the initial upgrade, we'll be back
+	// at the roundtripper flow, so we only have to muck with this request, but we do have to do it.
+	if upgrade {
+		transport.SetAuthProxyHeaders(newReq, user.GetName(), user.GetGroups(), user.GetExtra())
+	}
+
+	handler := proxy.NewUpgradeAwareHandler(location, proxyRoundTripper, true, upgrade, &responder{w: w})
+	handler.ServeHTTP(w, newReq)
+}
+```
+
+APIService共有两种类型，这里我们看一下serviceResolver：
+
+```go
+// CreateServerChain creates the apiservers connected via delegation.
+func CreateServerChain(completedOptions completedServerRunOptions, stopCh <-chan struct{}) (*aggregatorapiserver.APIAggregator, error) {
+	nodeTunneler, proxyTransport, err := CreateNodeDialer(completedOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	kubeAPIServerConfig, insecureServingInfo, serviceResolver, pluginInitializer, err := CreateKubeAPIServerConfig(completedOptions, nodeTunneler, proxyTransport)
+	if err != nil {
+		return nil, err
+	}
+
+	...
+	// aggregator comes last in the chain
+	aggregatorConfig, err := createAggregatorConfig(*kubeAPIServerConfig.GenericConfig, completedOptions.ServerRunOptions, kubeAPIServerConfig.ExtraConfig.VersionedInformers, serviceResolver, proxyTransport, pluginInitializer)
+	if err != nil {
+		return nil, err
+	}
+	aggregatorServer, err := createAggregatorServer(aggregatorConfig, kubeAPIServer.GenericAPIServer, apiExtensionsServer.Informers)
+	if err != nil {
+		// we don't need special handling for innerStopCh because the aggregator server doesn't create any go routines
+		return nil, err
+	}
+	...
+
+	return aggregatorServer, nil
+}
+
+// BuildGenericConfig takes the master server options and produces the genericapiserver.Config associated with it
+func buildGenericConfig(
+	s *options.ServerRunOptions,
+	proxyTransport *http.Transport,
+) (
+	genericConfig *genericapiserver.Config,
+	versionedInformers clientgoinformers.SharedInformerFactory,
+	insecureServingInfo *genericapiserver.DeprecatedInsecureServingInfo,
+	serviceResolver aggregatorapiserver.ServiceResolver,
+	pluginInitializers []admission.PluginInitializer,
+	admissionPostStartHook genericapiserver.PostStartHookFunc,
+	storageFactory *serverstorage.DefaultStorageFactory,
+	lastErr error,
+) {
+	...
+	admissionConfig := &kubeapiserveradmission.Config{
+		ExternalInformers:    versionedInformers,
+		LoopbackClientConfig: genericConfig.LoopbackClientConfig,
+		CloudConfigFile:      s.CloudProvider.CloudConfigFile,
+	}
+	serviceResolver = buildServiceResolver(s.EnableAggregatorRouting, genericConfig.LoopbackClientConfig.Host, versionedInformers)
+	...
+
+	return
+}
+
+// k8s.io/kubernetes/cmd/kube-apiserver/app/server.go:728
+func buildServiceResolver(enabledAggregatorRouting bool, hostname string, informer clientgoinformers.SharedInformerFactory) webhook.ServiceResolver {
+	var serviceResolver webhook.ServiceResolver
+	if enabledAggregatorRouting {
+		serviceResolver = aggregatorapiserver.NewEndpointServiceResolver(
+			informer.Core().V1().Services().Lister(),
+			informer.Core().V1().Endpoints().Lister(),
+		)
+	} else {
+		serviceResolver = aggregatorapiserver.NewClusterIPServiceResolver(
+			informer.Core().V1().Services().Lister(),
+		)
+	}
+	// resolve kubernetes.default.svc locally
+	if localHost, err := url.Parse(hostname); err == nil {
+		serviceResolver = aggregatorapiserver.NewLoopbackServiceResolver(serviceResolver, localHost)
+	}
+	return serviceResolver
+}
+
+	fs.BoolVar(&s.EnableAggregatorRouting, "enable-aggregator-routing", s.EnableAggregatorRouting,
+		"Turns on aggregator routing requests to endpoints IP rather than cluster IP.")
+```
+
+默认使用aggregatorClusterRouting，如下：
+
+```go
+// NewClusterIPServiceResolver returns a ServiceResolver that directly calls the
+// service's cluster IP.
+func NewClusterIPServiceResolver(services listersv1.ServiceLister) ServiceResolver {
+	return &aggregatorClusterRouting{
+		services: services,
+	}
+}
+
+type aggregatorClusterRouting struct {
+	services listersv1.ServiceLister
+}
+
+func (r *aggregatorClusterRouting) ResolveEndpoint(namespace, name string, port int32) (*url.URL, error) {
+	return proxy.ResolveCluster(r.services, namespace, name, port)
+}
+
+func ResolveCluster(services listersv1.ServiceLister, namespace, id string, port int32) (*url.URL, error) {
+	svc, err := services.Services(namespace).Get(id)
+	if err != nil {
+		return nil, err
+	}
+
+	switch {
+	case svc.Spec.Type == v1.ServiceTypeClusterIP && svc.Spec.ClusterIP == v1.ClusterIPNone:
+		return nil, fmt.Errorf(`cannot route to service with ClusterIP "None"`)
+	// use IP from a clusterIP for these service types
+	case svc.Spec.Type == v1.ServiceTypeClusterIP, svc.Spec.Type == v1.ServiceTypeLoadBalancer, svc.Spec.Type == v1.ServiceTypeNodePort:
+		svcPort, err := findServicePort(svc, port)
+		if err != nil {
+			return nil, err
+		}
+		return &url.URL{
+			Scheme: "https",
+			Host:   net.JoinHostPort(svc.Spec.ClusterIP, fmt.Sprintf("%d", svcPort.Port)),
+		}, nil
+	case svc.Spec.Type == v1.ServiceTypeExternalName:
+		return &url.URL{
+			Scheme: "https",
+			Host:   net.JoinHostPort(svc.Spec.ExternalName, fmt.Sprintf("%d", port)),
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported service type %q", svc.Spec.Type)
+	}
+}
+
+// findServicePort finds the service port by name or numerically.
+func findServicePort(svc *v1.Service, port int32) (*v1.ServicePort, error) {
+	for _, svcPort := range svc.Spec.Ports {
+		if svcPort.Port == port {
+			return &svcPort, nil
+		}
+	}
+	return nil, errors.NewServiceUnavailable(fmt.Sprintf("no service port %d found for service %q", port, svc.Name))
+}
+```
+
+可以看到对于ClusterIP，LoadBalancer以及NodePort类型service都是将Host转化为ClusterIP:Port地址；而对于ExternalName Service则转化为ExternalName:Port地址。而对于aggregatorEndpointRouting，处理如下：
+
+```go
+// NewEndpointServiceResolver returns a ServiceResolver that chooses one of the
+// service's endpoints.
+func NewEndpointServiceResolver(services listersv1.ServiceLister, endpoints listersv1.EndpointsLister) ServiceResolver {
+	return &aggregatorEndpointRouting{
+		services:  services,
+		endpoints: endpoints,
+	}
+}
+
+type aggregatorEndpointRouting struct {
+	services  listersv1.ServiceLister
+	endpoints listersv1.EndpointsLister
+}
+
+func (r *aggregatorEndpointRouting) ResolveEndpoint(namespace, name string, port int32) (*url.URL, error) {
+	return proxy.ResolveEndpoint(r.services, r.endpoints, namespace, name, port)
+}
+
+// ResourceLocation returns a URL to which one can send traffic for the specified service.
+func ResolveEndpoint(services listersv1.ServiceLister, endpoints listersv1.EndpointsLister, namespace, id string, port int32) (*url.URL, error) {
+	svc, err := services.Services(namespace).Get(id)
+	if err != nil {
+		return nil, err
+	}
+
+	svcPort, err := findServicePort(svc, port)
+	if err != nil {
+		return nil, err
+	}
+
+	switch {
+	case svc.Spec.Type == v1.ServiceTypeClusterIP, svc.Spec.Type == v1.ServiceTypeLoadBalancer, svc.Spec.Type == v1.ServiceTypeNodePort:
+		// these are fine
+	default:
+		return nil, fmt.Errorf("unsupported service type %q", svc.Spec.Type)
+	}
+
+	eps, err := endpoints.Endpoints(namespace).Get(svc.Name)
+	if err != nil {
+		return nil, err
+	}
+	if len(eps.Subsets) == 0 {
+		return nil, errors.NewServiceUnavailable(fmt.Sprintf("no endpoints available for service %q", svc.Name))
+	}
+
+	// Pick a random Subset to start searching from.
+	ssSeed := rand.Intn(len(eps.Subsets))
+
+	// Find a Subset that has the port.
+	for ssi := 0; ssi < len(eps.Subsets); ssi++ {
+		ss := &eps.Subsets[(ssSeed+ssi)%len(eps.Subsets)]
+		if len(ss.Addresses) == 0 {
+			continue
+		}
+		for i := range ss.Ports {
+			if ss.Ports[i].Name == svcPort.Name {
+				// Pick a random address.
+				ip := ss.Addresses[rand.Intn(len(ss.Addresses))].IP
+				port := int(ss.Ports[i].Port)
+				return &url.URL{
+					Scheme: "https",
+					Host:   net.JoinHostPort(ip, strconv.Itoa(port)),
+				}, nil
+			}
+		}
+	}
+	return nil, errors.NewServiceUnavailable(fmt.Sprintf("no endpoints available for service %q", id))
+}
+```
+
+可以看到aggregatorEndpointRouting是自己随机从service对应的endpoint中选择出一个backend，然后构建Host；而aggregatorClusterRouting则是直接由clusterIP进行负载均衡
+
+回到buildServiceResolver，我们分析最后local类型的ServiceResolver，如下：
+
+```go
+func buildServiceResolver(enabledAggregatorRouting bool, hostname string, informer clientgoinformers.SharedInformerFactory) webhook.ServiceResolver {
+	var serviceResolver webhook.ServiceResolver
+	if enabledAggregatorRouting {
+		serviceResolver = aggregatorapiserver.NewEndpointServiceResolver(
+			informer.Core().V1().Services().Lister(),
+			informer.Core().V1().Endpoints().Lister(),
+		)
+	} else {
+		serviceResolver = aggregatorapiserver.NewClusterIPServiceResolver(
+			informer.Core().V1().Services().Lister(),
+		)
+	}
+	// resolve kubernetes.default.svc locally
+	if localHost, err := url.Parse(hostname); err == nil {
+		serviceResolver = aggregatorapiserver.NewLoopbackServiceResolver(serviceResolver, localHost)
+	}
+	return serviceResolver
+}
+
+// NewLoopbackServiceResolver returns a ServiceResolver that routes
+// the kubernetes/default service with port 443 to loopback.
+func NewLoopbackServiceResolver(delegate ServiceResolver, host *url.URL) ServiceResolver {
+	return &loopbackResolver{
+		delegate: delegate,
+		host:     host,
+	}
+}
+
+type loopbackResolver struct {
+	delegate ServiceResolver
+	host     *url.URL
+}
+
+func (r *loopbackResolver) ResolveEndpoint(namespace, name string, port int32) (*url.URL, error) {
+	if namespace == "default" && name == "kubernetes" && port == 443 {
+		return r.host, nil
+	}
+	return r.delegate.ResolveEndpoint(namespace, name, port)
+}
+```
+
+对于kubernetes/default service with port 443会直接转发给loopback；其它service则交给aggregatorEndpointRouting或者aggregatorClusterRouting处理

@@ -1223,6 +1223,27 @@ func (s *APIAggregator) AddAPIService(apiService *v1.APIService) error {
 	s.handledGroups.Insert(apiService.Spec.Group)
 	return nil
 }
+
+// RemoveAPIService removes the APIService from being handled.  It is not thread-safe, so only call it on one thread at a time please.
+// It's a slow moving API, so it's ok to run the controller on a single thread.
+func (s *APIAggregator) RemoveAPIService(apiServiceName string) {
+	version := v1helper.APIServiceNameToGroupVersion(apiServiceName)
+
+	proxyPath := "/apis/" + version.Group + "/" + version.Version
+	// v1. is a special case for the legacy API.  It proxies to a wider set of endpoints.
+	if apiServiceName == legacyAPIServiceName {
+		proxyPath = "/api"
+	}
+	s.GenericAPIServer.Handler.NonGoRestfulMux.Unregister(proxyPath)
+	s.GenericAPIServer.Handler.NonGoRestfulMux.Unregister(proxyPath + "/")
+	if s.openAPIAggregationController != nil {
+		s.openAPIAggregationController.RemoveAPIService(apiServiceName)
+	}
+	delete(s.proxyHandlers, apiServiceName)
+
+	// TODO unregister group level discovery when there are no more versions for the group
+	// We don't need this right away because the handler properly delegates when no versions are present
+}
 ```
 
 结合yamls文件分析代码：
@@ -1795,6 +1816,218 @@ func (s *APIAggregator) AddAPIService(apiService *v1.APIService) error {
 这里我们追本溯源localDelegate.ServeHTTP，如下：
 
 ```go
+// NewWithDelegate returns a new instance of APIAggregator from the given config.
+func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.DelegationTarget) (*APIAggregator, error) {
+	// Prevent generic API server to install OpenAPI handler. Aggregator server
+	// has its own customized OpenAPI handler.
+	...
 
+	s := &APIAggregator{
+		GenericAPIServer:         genericServer,
+		delegateHandler:          delegationTarget.UnprotectedHandler(),
+		proxyClientCert:          c.ExtraConfig.ProxyClientCert,
+		proxyClientKey:           c.ExtraConfig.ProxyClientKey,
+		proxyTransport:           c.ExtraConfig.ProxyTransport,
+		proxyHandlers:            map[string]*proxyHandler{},
+		handledGroups:            sets.String{},
+		lister:                   informerFactory.Apiregistration().V1().APIServices().Lister(),
+		APIRegistrationInformers: informerFactory,
+		serviceResolver:          c.ExtraConfig.ServiceResolver,
+		openAPIConfig:            openAPIConfig,
+		egressSelector:           c.GenericConfig.EgressSelector,
+	}
+	...
+
+	return s, nil
+}
+
+// CreateServerChain creates the apiservers connected via delegation.
+func CreateServerChain(completedOptions completedServerRunOptions, stopCh <-chan struct{}) (*aggregatorapiserver.APIAggregator, error) {
+	nodeTunneler, proxyTransport, err := CreateNodeDialer(completedOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	kubeAPIServerConfig, insecureServingInfo, serviceResolver, pluginInitializer, err := CreateKubeAPIServerConfig(completedOptions, nodeTunneler, proxyTransport)
+	if err != nil {
+		return nil, err
+	}
+
+	// If additional API servers are added, they should be gated.
+	apiExtensionsConfig, err := createAPIExtensionsConfig(*kubeAPIServerConfig.GenericConfig, kubeAPIServerConfig.ExtraConfig.VersionedInformers, pluginInitializer, completedOptions.ServerRunOptions, completedOptions.MasterCount,
+		serviceResolver, webhook.NewDefaultAuthenticationInfoResolverWrapper(proxyTransport, kubeAPIServerConfig.GenericConfig.EgressSelector, kubeAPIServerConfig.GenericConfig.LoopbackClientConfig))
+	if err != nil {
+		return nil, err
+	}
+	apiExtensionsServer, err := createAPIExtensionsServer(apiExtensionsConfig, genericapiserver.NewEmptyDelegate())
+	if err != nil {
+		return nil, err
+	}
+
+	kubeAPIServer, err := CreateKubeAPIServer(kubeAPIServerConfig, apiExtensionsServer.GenericAPIServer)
+	if err != nil {
+		return nil, err
+	}
+
+	// aggregator comes last in the chain
+	aggregatorConfig, err := createAggregatorConfig(*kubeAPIServerConfig.GenericConfig, completedOptions.ServerRunOptions, kubeAPIServerConfig.ExtraConfig.VersionedInformers, serviceResolver, proxyTransport, pluginInitializer)
+	if err != nil {
+		return nil, err
+	}
+	aggregatorServer, err := createAggregatorServer(aggregatorConfig, kubeAPIServer.GenericAPIServer, apiExtensionsServer.Informers)
+	if err != nil {
+		// we don't need special handling for innerStopCh because the aggregator server doesn't create any go routines
+		return nil, err
+	}
+	...
+
+	return aggregatorServer, nil
+}
+
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/server/genericapiserver.go:227
+func (s *GenericAPIServer) UnprotectedHandler() http.Handler {
+	// when we delegate, we need the server we're delegating to choose whether or not to use gorestful
+	return s.Handler.Director
+}
+
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/server/handler.go:122
+func (d director) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	path := req.URL.Path
+
+	// check to see if our webservices want to claim this path
+	for _, ws := range d.goRestfulContainer.RegisteredWebServices() {
+		switch {
+		case ws.RootPath() == "/apis":
+			// if we are exactly /apis or /apis/, then we need special handling in loop.
+			// normally these are passed to the nonGoRestfulMux, but if discovery is enabled, it will go directly.
+			// We can't rely on a prefix match since /apis matches everything (see the big comment on Director above)
+			if path == "/apis" || path == "/apis/" {
+				klog.V(5).Infof("%v: %v %q satisfied by gorestful with webservice %v", d.name, req.Method, path, ws.RootPath())
+				// don't use servemux here because gorestful servemuxes get messed up when removing webservices
+				// TODO fix gorestful, remove TPRs, or stop using gorestful
+				d.goRestfulContainer.Dispatch(w, req)
+				return
+			}
+
+		case strings.HasPrefix(path, ws.RootPath()):
+			// ensure an exact match or a path boundary match
+			if len(path) == len(ws.RootPath()) || path[len(ws.RootPath())] == '/' {
+				klog.V(5).Infof("%v: %v %q satisfied by gorestful with webservice %v", d.name, req.Method, path, ws.RootPath())
+				// don't use servemux here because gorestful servemuxes get messed up when removing webservices
+				// TODO fix gorestful, remove TPRs, or stop using gorestful
+				d.goRestfulContainer.Dispatch(w, req)
+				return
+			}
+		}
+	}
+
+	// if we didn't find a match, then we just skip gorestful altogether
+	klog.V(5).Infof("%v: %v %q satisfied by nonGoRestful", d.name, req.Method, path)
+	d.nonGoRestfulMux.ServeHTTP(w, req)
+}
+```
+
+这里相当于回到kube-apiserver自身的处理了，这里我们可以看看具体例子：
+
+```bash
+$ kubectl get APIService
+NAME                                   SERVICE                      AVAILABLE   AGE
+v1.                                    Local                        True        50d
+v1.admissionregistration.k8s.io        Local                        True        50d
+v1.apiextensions.k8s.io                Local                        True        50d
+v1.apps                                Local                        True        50d
+v1.auth.tkestack.io                    tke/tke-auth-api             True        50d
+v1.authentication.k8s.io               Local                        True        50d
+v1.authorization.k8s.io                Local                        True        50d
+v1.autoscaling                         Local                        True        50d
+v1.batch                               Local                        True        50d
+v1.configuration.konghq.com            Local                        True        39d
+v1.coordination.k8s.io                 Local                        True        50d
+v1.monitor.tkestack.io                 tke/tke-monitor-api          True        50d
+v1.monitoring.coreos.com               Local                        True        39d
+v1.networking.k8s.io                   Local                        True        50d
+v1.notify.tkestack.io                  tke/tke-notify-api           True        50d
+v1.platform.tkestack.io                tke/tke-platform-api         True        50d
+v1.rbac.authorization.k8s.io           Local                        True        50d
+v1.scheduling.k8s.io                   Local                        True        50d
+v1.storage.k8s.io                      Local                        True        50d
+v1beta1.admissionregistration.k8s.io   Local                        True        50d
+v1beta1.apiextensions.k8s.io           Local                        True        50d
+v1beta1.authentication.k8s.io          Local                        True        50d
+v1beta1.authorization.k8s.io           Local                        True        50d
+v1beta1.batch                          Local                        True        50d
+v1beta1.certificates.k8s.io            Local                        True        50d
+v1beta1.coordination.k8s.io            Local                        True        50d
+v1beta1.discovery.k8s.io               Local                        True        50d
+v1beta1.events.k8s.io                  Local                        True        50d
+v1beta1.extensions                     Local                        True        50d
+v1beta1.metrics.k8s.io                 kube-system/metrics-server   True        50d
+v1beta1.networking.k8s.io              Local                        True        50d
+v1beta1.node.k8s.io                    Local                        True        50d
+v1beta1.policy                         Local                        True        50d
+v1beta1.rbac.authorization.k8s.io      Local                        True        50d
+v1beta1.scheduling.k8s.io              Local                        True        50d
+v1beta1.storage.k8s.io                 Local                        True        50d
+v2beta1.autoscaling                    Local                        True        50d
+v2beta2.autoscaling                    Local                        True        50d
+```
+
+Local SERVICE(apiService.Spec.Service=null)：
+
+```yaml
+$ kubectl get -o yaml APIService/v1.apps
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  creationTimestamp: "2020-10-20T10:39:48Z"
+  labels:
+    kube-aggregator.kubernetes.io/automanaged: onstart
+  name: v1.apps
+  resourceVersion: "16"
+  selfLink: /apis/apiregistration.k8s.io/v1/apiservices/v1.apps
+  uid: 09374c3d-db49-45e1-8524-1bd8f86daaae
+spec:
+  group: apps
+  groupPriorityMinimum: 17800
+  version: v1
+  versionPriority: 15
+status:
+  conditions:
+  - lastTransitionTime: "2020-10-20T10:39:48Z"
+    message: Local APIServices are always available
+    reason: Local
+    status: "True"
+    type: Available
+```
+
+other SERVICE(apiService.Spec.Service!=null)：
+
+```yaml
+$ kubectl get -o yaml APIService/v1.platform.tkestack.io
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  creationTimestamp: "2020-10-20T11:01:02Z"
+  name: v1.platform.tkestack.io
+  resourceVersion: "38020776"
+  selfLink: /apis/apiregistration.k8s.io/v1/apiservices/v1.platform.tkestack.io
+  uid: dfbb424a-8d38-4373-b105-50628f9b5902
+spec:
+  caBundle: xxxxxx...
+  group: platform.tkestack.io
+  groupPriorityMinimum: 1000
+  service:
+    name: tke-platform-api
+    namespace: tke
+    port: 443
+  version: v1
+  versionPriority: 5
+status:
+  conditions:
+  - lastTransitionTime: "2020-12-08T04:48:51Z"
+    message: all checks passed
+    reason: Passed
+    status: "True"
+    type: Available
 ```
 

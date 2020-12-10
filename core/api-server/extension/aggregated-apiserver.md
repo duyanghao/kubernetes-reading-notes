@@ -7,7 +7,7 @@ Table of Contents
 * [前言](#前言)
 * [sample-apiserver启动流程](#sample-apiserver启动流程)
 * [kube-apiserver与sample-apiserver的对接](#kube-apiserver与sample-apiserver的对接)
-* [Local APIService产生原理](#Local APIService产生原理)
+* [Local APIService产生原理](#Local-APIService产生原理)
 * [总结](#总结)
 
 ## 前言
@@ -2042,7 +2042,7 @@ status:
 
 可以看到这些APIService都是在`apiregistration.k8s.io` group，以及`v1` version下的apiservices对象，那么这些APIService是怎么产生的，有什么作用呢？
 
-## Local APIService产生原理
+## Local-APIService产生原理
 
 Aggregator 通过 APIServices 对象关联到某个 Service 来进行请求的转发，其关联的 Service 类型进一步决定了请求转发形式。Aggregator 包括一个 `GenericAPIServer` 和维护自身状态的 Controller。其中 `GenericAPIServer` 主要处理 `apiregistration.k8s.io` 组下的 APIService 资源请求，controller包括：
 

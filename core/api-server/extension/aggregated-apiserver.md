@@ -1934,7 +1934,7 @@ func (d director) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 ```
 
-这里相当于回到kube-apiserver自身的处理了，这里我们可以看看具体例子：
+这里相当于回到kube-apiserver自身AggregatorServer的处理了，这里我们可以看看具体例子：
 
 ```bash
 $ kubectl get APIService
@@ -2036,5 +2036,668 @@ status:
     reason: Passed
     status: "True"
     type: Available
+```
+
+可以看到这些APIService都是在`apiregistration.k8s.io` group，以及`v1` version下的apiservices对象，那么这些APIService是怎么产生的，有什么作用呢？
+
+## Local APIService产生原理
+
+Aggregator 通过 APIServices 对象关联到某个 Service 来进行请求的转发，其关联的 Service 类型进一步决定了请求转发形式。Aggregator 包括一个 `GenericAPIServer` 和维护自身状态的 Controller。其中 `GenericAPIServer` 主要处理 `apiregistration.k8s.io` 组下的 APIService 资源请求，controller包括：
+
+- `apiserviceRegistrationController`：负责 APIServices 中资源的注册与删除；
+- `availableConditionController`：维护 APIServices 的可用状态，包括其引用 Service 是否可用等；
+- `autoRegistrationController`：用于保持 API 中存在的一组特定的 APIServices；
+- `crdRegistrationController`：负责将 CRD GroupVersions 自动注册到 APIServices 中；
+- `openAPIAggregationController`：将 APIServices 资源的变化同步至提供的 OpenAPI 文档；
+
+Kubernetes 中的一些附加组件，比如 metrics-server 就是通过 Aggregator 的方式进行扩展的，实际环境中可以通过使用 [apiserver-builder](https://github.com/kubernetes-sigs/apiserver-builder-alpha) 工具轻松以 Aggregator 的扩展方式创建自定义资源
+
+这里我们看看autoRegistrationController逻辑：
+
+```go
+func createAggregatorServer(aggregatorConfig *aggregatorapiserver.Config, delegateAPIServer genericapiserver.DelegationTarget, apiExtensionInformers apiextensionsinformers.SharedInformerFactory) (*aggregatorapiserver.APIAggregator, error) {
+	aggregatorServer, err := aggregatorConfig.Complete().NewWithDelegate(delegateAPIServer)
+	if err != nil {
+		return nil, err
+	}
+
+	// create controllers for auto-registration
+	apiRegistrationClient, err := apiregistrationclient.NewForConfig(aggregatorConfig.GenericConfig.LoopbackClientConfig)
+	if err != nil {
+		return nil, err
+	}
+	autoRegistrationController := autoregister.NewAutoRegisterController(aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(), apiRegistrationClient)
+	apiServices := apiServicesToRegister(delegateAPIServer, autoRegistrationController)
+	crdRegistrationController := crdregistration.NewCRDRegistrationController(
+		apiExtensionInformers.Apiextensions().V1().CustomResourceDefinitions(),
+		autoRegistrationController)
+
+	err = aggregatorServer.GenericAPIServer.AddPostStartHook("kube-apiserver-autoregistration", func(context genericapiserver.PostStartHookContext) error {
+		go crdRegistrationController.Run(5, context.StopCh)
+		go func() {
+			// let the CRD controller process the initial set of CRDs before starting the autoregistration controller.
+			// this prevents the autoregistration controller's initial sync from deleting APIServices for CRDs that still exist.
+			// we only need to do this if CRDs are enabled on this server.  We can't use discovery because we are the source for discovery.
+			if aggregatorConfig.GenericConfig.MergedResourceConfig.AnyVersionForGroupEnabled("apiextensions.k8s.io") {
+				crdRegistrationController.WaitForInitialSync()
+			}
+			autoRegistrationController.Run(5, context.StopCh)
+		}()
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	err = aggregatorServer.GenericAPIServer.AddBootSequenceHealthChecks(
+		makeAPIServiceAvailableHealthCheck(
+			"autoregister-completion",
+			apiServices,
+			aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(),
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return aggregatorServer, nil
+}
+```
+
+展开autoRegisterController逻辑：
+
+```go
+// NewAutoRegisterController creates a new autoRegisterController.
+func NewAutoRegisterController(apiServiceInformer informers.APIServiceInformer, apiServiceClient apiregistrationclient.APIServicesGetter) *autoRegisterController {
+	c := &autoRegisterController{
+		apiServiceLister:  apiServiceInformer.Lister(),
+		apiServiceSynced:  apiServiceInformer.Informer().HasSynced,
+		apiServiceClient:  apiServiceClient,
+		apiServicesToSync: map[string]*v1.APIService{},
+
+		apiServicesAtStart: map[string]bool{},
+
+		syncedSuccessfullyLock: &sync.RWMutex{},
+		syncedSuccessfully:     map[string]bool{},
+
+		queue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "autoregister"),
+	}
+	c.syncHandler = c.checkAPIService
+
+	apiServiceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			cast := obj.(*v1.APIService)
+			c.queue.Add(cast.Name)
+		},
+		UpdateFunc: func(_, obj interface{}) {
+			cast := obj.(*v1.APIService)
+			c.queue.Add(cast.Name)
+		},
+		DeleteFunc: func(obj interface{}) {
+			cast, ok := obj.(*v1.APIService)
+			if !ok {
+				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					klog.V(2).Infof("Couldn't get object from tombstone %#v", obj)
+					return
+				}
+				cast, ok = tombstone.Obj.(*v1.APIService)
+				if !ok {
+					klog.V(2).Infof("Tombstone contained unexpected object: %#v", obj)
+					return
+				}
+			}
+			c.queue.Add(cast.Name)
+		},
+	})
+
+	return c
+}
+
+// Run starts the autoregister controller in a loop which syncs API services until stopCh is closed.
+func (c *autoRegisterController) Run(threadiness int, stopCh <-chan struct{}) {
+	// don't let panics crash the process
+	defer utilruntime.HandleCrash()
+	// make sure the work queue is shutdown which will trigger workers to end
+	defer c.queue.ShutDown()
+
+	klog.Infof("Starting autoregister controller")
+	defer klog.Infof("Shutting down autoregister controller")
+
+	// wait for your secondary caches to fill before starting your work
+	if !controllers.WaitForCacheSync("autoregister", stopCh, c.apiServiceSynced) {
+		return
+	}
+
+	// record APIService objects that existed when we started
+	if services, err := c.apiServiceLister.List(labels.Everything()); err == nil {
+		for _, service := range services {
+			c.apiServicesAtStart[service.Name] = true
+		}
+	}
+
+	// start up your worker threads based on threadiness.  Some controllers have multiple kinds of workers
+	for i := 0; i < threadiness; i++ {
+		// runWorker will loop until "something bad" happens.  The .Until will then rekick the worker
+		// after one second
+		go wait.Until(c.runWorker, time.Second, stopCh)
+	}
+
+	// wait until we're told to stop
+	<-stopCh
+}
+
+func (c *autoRegisterController) runWorker() {
+	// hot loop until we're told to stop.  processNextWorkItem will automatically wait until there's work
+	// available, so we don't worry about secondary waits
+	for c.processNextWorkItem() {
+	}
+}
+
+// processNextWorkItem deals with one key off the queue.  It returns false when it's time to quit.
+func (c *autoRegisterController) processNextWorkItem() bool {
+	// pull the next work item from queue.  It should be a key we use to lookup something in a cache
+	key, quit := c.queue.Get()
+	if quit {
+		return false
+	}
+	// you always have to indicate to the queue that you've completed a piece of work
+	defer c.queue.Done(key)
+
+	// do your work on the key.  This method will contains your "do stuff" logic
+	err := c.syncHandler(key.(string))
+	if err == nil {
+		// if you had no error, tell the queue to stop tracking history for your key.  This will
+		// reset things like failure counts for per-item rate limiting
+		c.queue.Forget(key)
+		return true
+	}
+
+	// there was a failure so be sure to report it.  This method allows for pluggable error handling
+	// which can be used for things like cluster-monitoring
+	utilruntime.HandleError(fmt.Errorf("%v failed with : %v", key, err))
+	// since we failed, we should requeue the item to work on later.  This method will add a backoff
+	// to avoid hotlooping on particular items (they're probably still not going to work right away)
+	// and overall controller protection (everything I've done is broken, this controller needs to
+	// calm down or it can starve other useful work) cases.
+	c.queue.AddRateLimited(key)
+
+	return true
+}
+```
+
+createAggregatorServer会执行apiServicesToRegister，如下：
+
+```go
+// CreateServerChain creates the apiservers connected via delegation.
+func CreateServerChain(completedOptions completedServerRunOptions, stopCh <-chan struct{}) (*aggregatorapiserver.APIAggregator, error) {
+	...
+	kubeAPIServer, err := CreateKubeAPIServer(kubeAPIServerConfig, apiExtensionsServer.GenericAPIServer)
+	if err != nil {
+		return nil, err
+	}
+
+	// aggregator comes last in the chain
+	aggregatorConfig, err := createAggregatorConfig(*kubeAPIServerConfig.GenericConfig, completedOptions.ServerRunOptions, kubeAPIServerConfig.ExtraConfig.VersionedInformers, serviceResolver, proxyTransport, pluginInitializer)
+	if err != nil {
+		return nil, err
+	}
+	aggregatorServer, err := createAggregatorServer(aggregatorConfig, kubeAPIServer.GenericAPIServer, apiExtensionsServer.Informers)
+	if err != nil {
+		// we don't need special handling for innerStopCh because the aggregator server doesn't create any go routines
+		return nil, err
+	}
+
+	return aggregatorServer, nil
+}
+
+func createAggregatorServer(aggregatorConfig *aggregatorapiserver.Config, delegateAPIServer genericapiserver.DelegationTarget, apiExtensionInformers apiextensionsinformers.SharedInformerFactory) (*aggregatorapiserver.APIAggregator, error) {
+	...
+	autoRegistrationController := autoregister.NewAutoRegisterController(aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(), apiRegistrationClient)
+	apiServices := apiServicesToRegister(delegateAPIServer, autoRegistrationController)
+	crdRegistrationController := crdregistration.NewCRDRegistrationController(
+		apiExtensionInformers.Apiextensions().V1().CustomResourceDefinitions(),
+		autoRegistrationController)
+
+	err = aggregatorServer.GenericAPIServer.AddPostStartHook("kube-apiserver-autoregistration", func(context genericapiserver.PostStartHookContext) error {
+		go crdRegistrationController.Run(5, context.StopCh)
+		go func() {
+			// let the CRD controller process the initial set of CRDs before starting the autoregistration controller.
+			// this prevents the autoregistration controller's initial sync from deleting APIServices for CRDs that still exist.
+			// we only need to do this if CRDs are enabled on this server.  We can't use discovery because we are the source for discovery.
+			if aggregatorConfig.GenericConfig.MergedResourceConfig.AnyVersionForGroupEnabled("apiextensions.k8s.io") {
+				crdRegistrationController.WaitForInitialSync()
+			}
+			autoRegistrationController.Run(5, context.StopCh)
+		}()
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return aggregatorServer, nil
+}
+
+func apiServicesToRegister(delegateAPIServer genericapiserver.DelegationTarget, registration autoregister.AutoAPIServiceRegistration) []*v1.APIService {
+	apiServices := []*v1.APIService{}
+
+	for _, curr := range delegateAPIServer.ListedPaths() {
+		if curr == "/api/v1" {
+			apiService := makeAPIService(schema.GroupVersion{Group: "", Version: "v1"})
+			registration.AddAPIServiceToSyncOnStart(apiService)
+			apiServices = append(apiServices, apiService)
+			continue
+		}
+
+		if !strings.HasPrefix(curr, "/apis/") {
+			continue
+		}
+		// this comes back in a list that looks like /apis/rbac.authorization.k8s.io/v1alpha1
+		tokens := strings.Split(curr, "/")
+		if len(tokens) != 4 {
+			continue
+		}
+
+		apiService := makeAPIService(schema.GroupVersion{Group: tokens[2], Version: tokens[3]})
+		if apiService == nil {
+			continue
+		}
+		registration.AddAPIServiceToSyncOnStart(apiService)
+		apiServices = append(apiServices, apiService)
+	}
+
+	return apiServices
+}
+
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/server/genericapiserver.go:240
+func (s *GenericAPIServer) ListedPaths() []string {
+	return s.listedPathProvider.ListedPaths()
+}
+
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/server/config.go:520
+// New creates a new server which logically combines the handling chain with the passed server.
+// name is used to differentiate for logging. The handler chain in particular can be difficult as it starts delgating.
+// delegationTarget may not be nil.
+func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*GenericAPIServer, error) {
+	...
+	apiServerHandler := NewAPIServerHandler(name, c.Serializer, handlerChainBuilder, delegationTarget.UnprotectedHandler())  
+	s := &GenericAPIServer{
+		discoveryAddresses:         c.DiscoveryAddresses,
+		LoopbackClientConfig:       c.LoopbackClientConfig,
+		legacyAPIGroupPrefixes:     c.LegacyAPIGroupPrefixes,
+		admissionControl:           c.AdmissionControl,
+		Serializer:                 c.Serializer,
+		AuditBackend:               c.AuditBackend,
+		Authorizer:                 c.Authorization.Authorizer,
+		delegationTarget:           delegationTarget,
+		EquivalentResourceRegistry: c.EquivalentResourceRegistry,
+		HandlerChainWaitGroup:      c.HandlerChainWaitGroup,
+
+		minRequestTimeout:     time.Duration(c.MinRequestTimeout) * time.Second,
+		ShutdownTimeout:       c.RequestTimeout,
+		ShutdownDelayDuration: c.ShutdownDelayDuration,
+		SecureServingInfo:     c.SecureServing,
+		ExternalAddress:       c.ExternalAddress,
+
+		Handler: apiServerHandler,
+
+		listedPathProvider: apiServerHandler,
+
+		openAPIConfig: c.OpenAPIConfig,
+
+		postStartHooks:         map[string]postStartHookEntry{},
+		preShutdownHooks:       map[string]preShutdownHookEntry{},
+		disabledPostStartHooks: c.DisabledPostStartHooks,
+
+		healthzChecks:    c.HealthzChecks,
+		livezChecks:      c.LivezChecks,
+		readyzChecks:     c.ReadyzChecks,
+		readinessStopCh:  make(chan struct{}),
+		livezGracePeriod: c.LivezGracePeriod,
+
+		DiscoveryGroupManager: discovery.NewRootAPIsHandler(c.DiscoveryAddresses, c.Serializer),
+
+		maxRequestBodyBytes: c.MaxRequestBodyBytes,
+		livezClock:          clock.RealClock{},
+	}
+	...
+
+	s.listedPathProvider = routes.ListedPathProviders{s.listedPathProvider, delegationTarget}
+
+	installAPI(s, c.Config)
+
+	// use the UnprotectedHandler from the delegation target to ensure that we don't attempt to double authenticator, authorize,
+	// or some other part of the filter chain in delegation cases.
+	if delegationTarget.UnprotectedHandler() == nil && c.EnableIndex {
+		s.Handler.NonGoRestfulMux.NotFoundHandler(routes.IndexLister{
+			StatusCode:   http.StatusNotFound,
+			PathProvider: s.listedPathProvider,
+		})
+	}
+
+	return s, nil
+}
+
+type ListedPathProviders []ListedPathProvider
+
+// ListedPaths unions and sorts the included paths.
+func (p ListedPathProviders) ListedPaths() []string {
+	ret := sets.String{}
+	for _, provider := range p {
+		for _, path := range provider.ListedPaths() {
+			ret.Insert(path)
+		}
+	}
+
+	return ret.List()
+}
+
+func NewAPIServerHandler(name string, s runtime.NegotiatedSerializer, handlerChainBuilder HandlerChainBuilderFn, notFoundHandler http.Handler) *APIServerHandler {
+	nonGoRestfulMux := mux.NewPathRecorderMux(name)
+	if notFoundHandler != nil {
+		nonGoRestfulMux.NotFoundHandler(notFoundHandler)
+	}
+
+	gorestfulContainer := restful.NewContainer()
+	gorestfulContainer.ServeMux = http.NewServeMux()
+	gorestfulContainer.Router(restful.CurlyRouter{}) // e.g. for proxy/{kind}/{name}/{*}
+	gorestfulContainer.RecoverHandler(func(panicReason interface{}, httpWriter http.ResponseWriter) {
+		logStackOnRecover(s, panicReason, httpWriter)
+	})
+	gorestfulContainer.ServiceErrorHandler(func(serviceErr restful.ServiceError, request *restful.Request, response *restful.Response) {
+		serviceErrorHandler(s, serviceErr, request, response)
+	})
+
+	director := director{
+		name:               name,
+		goRestfulContainer: gorestfulContainer,
+		nonGoRestfulMux:    nonGoRestfulMux,
+	}
+
+	return &APIServerHandler{
+		FullHandlerChain:   handlerChainBuilder(director),
+		GoRestfulContainer: gorestfulContainer,
+		NonGoRestfulMux:    nonGoRestfulMux,
+		Director:           director,
+	}
+}
+
+// ListedPaths returns the paths that should be shown under /
+func (a *APIServerHandler) ListedPaths() []string {
+	var handledPaths []string
+	// Extract the paths handled using restful.WebService
+	for _, ws := range a.GoRestfulContainer.RegisteredWebServices() {
+		handledPaths = append(handledPaths, ws.RootPath())
+	}
+	handledPaths = append(handledPaths, a.NonGoRestfulMux.ListedPaths()...)
+	sort.Strings(handledPaths)
+
+	return handledPaths
+}
+```
+
+从上述代码可以看出ListedPaths会返回所有kube-apiserver的API Resource路径，然后交给apiServicesToRegister进行APIService的注册处理：
+
+```go
+func apiServicesToRegister(delegateAPIServer genericapiserver.DelegationTarget, registration autoregister.AutoAPIServiceRegistration) []*v1.APIService {
+	apiServices := []*v1.APIService{}
+
+	for _, curr := range delegateAPIServer.ListedPaths() {
+		if curr == "/api/v1" {
+			apiService := makeAPIService(schema.GroupVersion{Group: "", Version: "v1"})
+			registration.AddAPIServiceToSyncOnStart(apiService)
+			apiServices = append(apiServices, apiService)
+			continue
+		}
+
+		if !strings.HasPrefix(curr, "/apis/") {
+			continue
+		}
+		// this comes back in a list that looks like /apis/rbac.authorization.k8s.io/v1alpha1
+		tokens := strings.Split(curr, "/")
+		if len(tokens) != 4 {
+			continue
+		}
+
+		apiService := makeAPIService(schema.GroupVersion{Group: tokens[2], Version: tokens[3]})
+		if apiService == nil {
+			continue
+		}
+		registration.AddAPIServiceToSyncOnStart(apiService)
+		apiServices = append(apiServices, apiService)
+	}
+
+	return apiServices
+}
+
+func makeAPIService(gv schema.GroupVersion) *v1.APIService {
+	apiServicePriority, ok := apiVersionPriorities[gv]
+	if !ok {
+		// if we aren't found, then we shouldn't register ourselves because it could result in a CRD group version
+		// being permanently stuck in the APIServices list.
+		klog.Infof("Skipping APIService creation for %v", gv)
+		return nil
+	}
+	return &v1.APIService{
+		ObjectMeta: metav1.ObjectMeta{Name: gv.Version + "." + gv.Group},
+		Spec: v1.APIServiceSpec{
+			Group:                gv.Group,
+			Version:              gv.Version,
+			GroupPriorityMinimum: apiServicePriority.group,
+			VersionPriority:      apiServicePriority.version,
+		},
+	}
+}
+```
+
+如果是core group(/api/v1)，则构造`v1.` apiService，如下：
+
+```yaml
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  creationTimestamp: "2020-10-20T10:39:48Z"
+  labels:
+    kube-aggregator.kubernetes.io/automanaged: onstart
+  name: v1.
+  resourceVersion: "11"
+  selfLink: /apis/apiregistration.k8s.io/v1/apiservices/v1.
+  uid: 724838d6-c73a-441d-a63d-e2d179556f01
+spec:
+  groupPriorityMinimum: 18000
+  version: v1
+  versionPriority: 1
+status:
+  conditions:
+  - lastTransitionTime: "2020-10-20T10:39:48Z"
+    message: Local APIServices are always available
+    reason: Local
+    status: "True"
+    type: Available
+```
+
+而对于named groups下的资源(/apis/$GROUP/$VERSION)，则构建由$GROUP和$VERSION构成的apiService，如下：
+
+```yaml
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  creationTimestamp: "2020-10-20T10:39:48Z"
+  labels:
+    kube-aggregator.kubernetes.io/automanaged: onstart
+  name: v1.apps
+  resourceVersion: "16"
+  selfLink: /apis/apiregistration.k8s.io/v1/apiservices/v1.apps
+  uid: 09374c3d-db49-45e1-8524-1bd8f86daaae
+spec:
+  group: apps
+  groupPriorityMinimum: 17800
+  version: v1
+  versionPriority: 15
+status:
+  conditions:
+  - lastTransitionTime: "2020-10-20T10:39:48Z"
+    message: Local APIServices are always available
+    reason: Local
+    status: "True"
+    type: Available
+```
+
+这两种类型apiService都会执行registration.AddAPIServiceToSyncOnStart(apiService)，回到了autoRegisterController，如下：
+
+```go
+// AddAPIServiceToSyncOnStart registers an API service to sync only when the controller starts.
+func (c *autoRegisterController) AddAPIServiceToSyncOnStart(in *v1.APIService) {
+	c.addAPIServiceToSync(in, manageOnStart)
+}
+
+const (
+	// AutoRegisterManagedLabel is a label attached to the APIService that identifies how the APIService wants to be synced.
+	AutoRegisterManagedLabel = "kube-aggregator.kubernetes.io/automanaged"
+
+	// manageOnStart is a value for the AutoRegisterManagedLabel that indicates the APIService wants to be synced one time when the controller starts.
+	manageOnStart = "onstart"
+	// manageContinuously is a value for the AutoRegisterManagedLabel that indicates the APIService wants to be synced continuously.
+	manageContinuously = "true"
+)
+
+func (c *autoRegisterController) addAPIServiceToSync(in *v1.APIService, syncType string) {
+	c.apiServicesToSyncLock.Lock()
+	defer c.apiServicesToSyncLock.Unlock()
+
+	apiService := in.DeepCopy()
+	if apiService.Labels == nil {
+		apiService.Labels = map[string]string{}
+	}
+	apiService.Labels[AutoRegisterManagedLabel] = syncType
+
+	c.apiServicesToSync[apiService.Name] = apiService
+	c.queue.Add(apiService.Name)
+}
+```
+
+这里会将apiService打标签：kube-aggregator.kubernetes.io/automanaged=onstart，从上面的示例也可以佐证，并将apiService存放于apiServicesToSync中，最终由checkAPIService处理：
+
+```go
+// checkAPIService syncs the current APIService against a list of desired APIService objects
+//
+//                                                 | A. desired: not found | B. desired: sync on start | C. desired: sync always
+// ------------------------------------------------|-----------------------|---------------------------|------------------------
+// 1. current: lookup error                        | error                 | error                     | error
+// 2. current: not found                           | -                     | create once               | create
+// 3. current: no sync                             | -                     | -                         | -
+// 4. current: sync on start, not present at start | -                     | -                         | -
+// 5. current: sync on start, present at start     | delete once           | update once               | update once
+// 6. current: sync always                         | delete                | update once               | update
+func (c *autoRegisterController) checkAPIService(name string) (err error) {
+	// 获取想注册的apiService  
+	desired := c.GetAPIServiceToSync(name)
+  // 获取实际已经创建的apiService
+	curr, err := c.apiServiceLister.Get(name)
+
+	// 下面操作成功后，将apiService标记为已经同步创建  
+	// if we've never synced this service successfully, record a successful sync.
+	hasSynced := c.hasSyncedSuccessfully(name)
+	if !hasSynced {
+		defer func() {
+			if err == nil {
+				c.setSyncedSuccessfully(name)
+			}
+		}()
+	}
+
+	switch {
+	// we had a real error, just return it (1A,1B,1C)
+	case err != nil && !apierrors.IsNotFound(err):
+		return err
+
+	// we don't have an entry and we don't want one (2A)
+	case apierrors.IsNotFound(err) && desired == nil:
+		return nil
+
+	// local apiService正常情况    
+	// the local object only wants to sync on start and has already synced (2B,5B,6B "once" enforcement)
+	case isAutomanagedOnStart(desired) && hasSynced:
+		return nil
+
+	// 如果还没有发现apiService，则创建对应的apiService    
+	// we don't have an entry and we do want one (2B,2C)
+	case apierrors.IsNotFound(err) && desired != nil:
+		_, err := c.apiServiceClient.APIServices().Create(context.TODO(), desired, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			// created in the meantime, we'll get called again
+			return nil
+		}
+		return err
+
+	// we aren't trying to manage this APIService (3A,3B,3C)
+	case !isAutomanaged(curr):
+		return nil
+
+	// the remote object only wants to sync on start, but was added after we started (4A,4B,4C)
+	case isAutomanagedOnStart(curr) && !c.apiServicesAtStart[name]:
+		return nil
+
+	// the remote object only wants to sync on start and has already synced (5A,5B,5C "once" enforcement)
+	case isAutomanagedOnStart(curr) && hasSynced:
+		return nil
+
+	// 如果不是local apiService，则对该apiService进行删除操作
+	// we have a spurious APIService that we're managing, delete it (5A,6A)
+	case desired == nil:
+		opts := metav1.DeleteOptions{Preconditions: metav1.NewUIDPreconditions(string(curr.UID))}
+		err := c.apiServiceClient.APIServices().Delete(context.TODO(), curr.Name, opts)
+		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+			// deleted or changed in the meantime, we'll get called again
+			return nil
+		}
+		return err
+
+	// if the specs already match, nothing for us to do
+	case reflect.DeepEqual(curr.Spec, desired.Spec):
+		return nil
+	}
+
+	// 如果已经创建的apiService与期望的存在矛盾，则以desired.Spec结构为准，并进行更新  
+	// we have an entry and we have a desired, now we deconflict.  Only a few fields matter. (5B,5C,6B,6C)
+	apiService := curr.DeepCopy()
+	apiService.Spec = desired.Spec
+	_, err = c.apiServiceClient.APIServices().Update(context.TODO(), apiService, metav1.UpdateOptions{})
+	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+		// deleted or changed in the meantime, we'll get called again
+		return nil
+	}
+	return err
+}
+
+// GetAPIServiceToSync gets a single API service to sync.
+func (c *autoRegisterController) GetAPIServiceToSync(name string) *v1.APIService {
+	c.apiServicesToSyncLock.RLock()
+	defer c.apiServicesToSyncLock.RUnlock()
+
+	return c.apiServicesToSync[name]
+}
+
+func (c *autoRegisterController) hasSyncedSuccessfully(name string) bool {
+	c.syncedSuccessfullyLock.RLock()
+	defer c.syncedSuccessfullyLock.RUnlock()
+	return c.syncedSuccessfully[name]
+}
+```
+
+注释其实已经说明了该函数功能以及可能的处理情况：
+
+```go
+// checkAPIService syncs the current APIService against a list of desired APIService objects
+//
+//                                                 | A. desired: not found | B. desired: sync on start | C. desired: sync always
+// ------------------------------------------------|-----------------------|---------------------------|------------------------
+// 1. current: lookup error                        | error                 | error                     | error
+// 2. current: not found                           | -                     | create once               | create
+// 3. current: no sync                             | -                     | -                         | -
+// 4. current: sync on start, not present at start | -                     | -                         | -
+// 5. current: sync on start, present at start     | delete once           | update once               | update once
+// 6. current: sync always                         | delete                | update once               | update
 ```
 

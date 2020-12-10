@@ -2440,7 +2440,7 @@ func (a *APIServerHandler) ListedPaths() []string {
 }
 ```
 
-从上述代码可以看出ListedPaths会返回所有kube-apiserver的API Resource路径，然后交给apiServicesToRegister进行APIService的注册处理：
+从上述代码可以看出ListedPaths会返回所有**kube-apiserver(kubeAPIServer.GenericAPIServer)**的API Resource路径，然后交给apiServicesToRegister进行APIService的注册处理：
 
 ```go
 func apiServicesToRegister(delegateAPIServer genericapiserver.DelegationTarget, registration autoregister.AutoAPIServiceRegistration) []*v1.APIService {

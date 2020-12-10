@@ -2705,6 +2705,237 @@ func (c *autoRegisterController) hasSyncedSuccessfully(name string) bool {
 // 6. current: sync always                         | delete                | update once               | update
 ```
 
+## AggregatorServer CRUD API接口
+
+通过查看APIService的yamls，我们可以发现这些APIService资源本身的API路径为：
+
+```bash
+/apis/apiregistration.k8s.io/v1/apiservices/xxx
+```
+
+这个路径上的API资源由谁来处理呢？这里我们看看AggregatorServer的启动逻辑：
+
+```go
+func createAggregatorServer(aggregatorConfig *aggregatorapiserver.Config, delegateAPIServer genericapiserver.DelegationTarget, apiExtensionInformers apiextensionsinformers.SharedInformerFactory) (*aggregatorapiserver.APIAggregator, error) {
+	aggregatorServer, err := aggregatorConfig.Complete().NewWithDelegate(delegateAPIServer)
+	if err != nil {
+		return nil, err
+	}
+
+	// create controllers for auto-registration
+	apiRegistrationClient, err := apiregistrationclient.NewForConfig(aggregatorConfig.GenericConfig.LoopbackClientConfig)
+	if err != nil {
+		return nil, err
+	}
+	autoRegistrationController := autoregister.NewAutoRegisterController(aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(), apiRegistrationClient)
+	apiServices := apiServicesToRegister(delegateAPIServer, autoRegistrationController)
+	crdRegistrationController := crdregistration.NewCRDRegistrationController(
+		apiExtensionInformers.Apiextensions().V1().CustomResourceDefinitions(),
+		autoRegistrationController)
+
+	err = aggregatorServer.GenericAPIServer.AddPostStartHook("kube-apiserver-autoregistration", func(context genericapiserver.PostStartHookContext) error {
+		go crdRegistrationController.Run(5, context.StopCh)
+		go func() {
+			// let the CRD controller process the initial set of CRDs before starting the autoregistration controller.
+			// this prevents the autoregistration controller's initial sync from deleting APIServices for CRDs that still exist.
+			// we only need to do this if CRDs are enabled on this server.  We can't use discovery because we are the source for discovery.
+			if aggregatorConfig.GenericConfig.MergedResourceConfig.AnyVersionForGroupEnabled("apiextensions.k8s.io") {
+				crdRegistrationController.WaitForInitialSync()
+			}
+			autoRegistrationController.Run(5, context.StopCh)
+		}()
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	err = aggregatorServer.GenericAPIServer.AddBootSequenceHealthChecks(
+		makeAPIServiceAvailableHealthCheck(
+			"autoregister-completion",
+			apiServices,
+			aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(),
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return aggregatorServer, nil
+}
+
+// k8s.io/kubernetes/staging/src/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go:159
+// NewWithDelegate returns a new instance of APIAggregator from the given config.
+func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.DelegationTarget) (*APIAggregator, error) {
+	// Prevent generic API server to install OpenAPI handler. Aggregator server
+	// has its own customized OpenAPI handler.
+	openAPIConfig := c.GenericConfig.OpenAPIConfig
+	c.GenericConfig.OpenAPIConfig = nil
+
+	genericServer, err := c.GenericConfig.New("kube-aggregator", delegationTarget)
+	if err != nil {
+		return nil, err
+	}
+
+	apiregistrationClient, err := clientset.NewForConfig(c.GenericConfig.LoopbackClientConfig)
+	if err != nil {
+		return nil, err
+	}
+	informerFactory := informers.NewSharedInformerFactory(
+		apiregistrationClient,
+		5*time.Minute, // this is effectively used as a refresh interval right now.  Might want to do something nicer later on.
+	)
+
+	s := &APIAggregator{
+		GenericAPIServer:         genericServer,
+		delegateHandler:          delegationTarget.UnprotectedHandler(),
+		proxyClientCert:          c.ExtraConfig.ProxyClientCert,
+		proxyClientKey:           c.ExtraConfig.ProxyClientKey,
+		proxyTransport:           c.ExtraConfig.ProxyTransport,
+		proxyHandlers:            map[string]*proxyHandler{},
+		handledGroups:            sets.String{},
+		lister:                   informerFactory.Apiregistration().V1().APIServices().Lister(),
+		APIRegistrationInformers: informerFactory,
+		serviceResolver:          c.ExtraConfig.ServiceResolver,
+		openAPIConfig:            openAPIConfig,
+		egressSelector:           c.GenericConfig.EgressSelector,
+	}
+
+	apiGroupInfo := apiservicerest.NewRESTStorage(c.GenericConfig.MergedResourceConfig, c.GenericConfig.RESTOptionsGetter)
+	if err := s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo); err != nil {
+		return nil, err
+	}
+
+	enabledVersions := sets.NewString()
+	for v := range apiGroupInfo.VersionedResourcesStorageMap {
+		enabledVersions.Insert(v)
+	}
+	if !enabledVersions.Has(v1.SchemeGroupVersion.Version) {
+		return nil, fmt.Errorf("API group/version %s must be enabled", v1.SchemeGroupVersion.String())
+	}
+
+	apisHandler := &apisHandler{
+		codecs:         aggregatorscheme.Codecs,
+		lister:         s.lister,
+		discoveryGroup: discoveryGroup(enabledVersions),
+	}
+	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", apisHandler)
+	s.GenericAPIServer.Handler.NonGoRestfulMux.UnlistedHandle("/apis/", apisHandler)
+
+	apiserviceRegistrationController := NewAPIServiceRegistrationController(informerFactory.Apiregistration().V1().APIServices(), s)
+	availableController, err := statuscontrollers.NewAvailableConditionController(
+		informerFactory.Apiregistration().V1().APIServices(),
+		c.GenericConfig.SharedInformerFactory.Core().V1().Services(),
+		c.GenericConfig.SharedInformerFactory.Core().V1().Endpoints(),
+		apiregistrationClient.ApiregistrationV1(),
+		c.ExtraConfig.ProxyTransport,
+		c.ExtraConfig.ProxyClientCert,
+		c.ExtraConfig.ProxyClientKey,
+		s.serviceResolver,
+		c.GenericConfig.EgressSelector,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	s.GenericAPIServer.AddPostStartHookOrDie("start-kube-aggregator-informers", func(context genericapiserver.PostStartHookContext) error {
+		informerFactory.Start(context.StopCh)
+		c.GenericConfig.SharedInformerFactory.Start(context.StopCh)
+		return nil
+	})
+	s.GenericAPIServer.AddPostStartHookOrDie("apiservice-registration-controller", func(context genericapiserver.PostStartHookContext) error {
+		go apiserviceRegistrationController.Run(context.StopCh)
+		return nil
+	})
+	s.GenericAPIServer.AddPostStartHookOrDie("apiservice-status-available-controller", func(context genericapiserver.PostStartHookContext) error {
+		// if we end up blocking for long periods of time, we may need to increase threadiness.
+		go availableController.Run(5, context.StopCh)
+		return nil
+	})
+
+	return s, nil
+}
+```
+
+我们看关键代码段：
+
+```go
+ 	apiGroupInfo := apiservicerest.NewRESTStorage(c.GenericConfig.MergedResourceConfig, c.GenericConfig.RESTOptionsGetter)
+	if err := s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo); err != nil {
+		return nil, err
+	}
+```
+
+先看NewRESTStorage的实现：
+
+```go
+// k8s.io/kubernetes/staging/src/k8s.io/kube-aggregator/pkg/registry/apiservice/rest/storage_apiservice.go:33
+// NewRESTStorage returns an APIGroupInfo object that will work against apiservice.
+func NewRESTStorage(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter) genericapiserver.APIGroupInfo {
+	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(apiregistration.GroupName, aggregatorscheme.Scheme, metav1.ParameterCodec, aggregatorscheme.Codecs)
+
+	if apiResourceConfigSource.VersionEnabled(v1beta1.SchemeGroupVersion) {
+		storage := map[string]rest.Storage{}
+		apiServiceREST := apiservicestorage.NewREST(aggregatorscheme.Scheme, restOptionsGetter)
+		storage["apiservices"] = apiServiceREST
+		storage["apiservices/status"] = apiservicestorage.NewStatusREST(aggregatorscheme.Scheme, apiServiceREST)
+		apiGroupInfo.VersionedResourcesStorageMap["v1beta1"] = storage
+	}
+
+	if apiResourceConfigSource.VersionEnabled(v1.SchemeGroupVersion) {
+		storage := map[string]rest.Storage{}
+		apiServiceREST := apiservicestorage.NewREST(aggregatorscheme.Scheme, restOptionsGetter)
+		storage["apiservices"] = apiServiceREST
+		storage["apiservices/status"] = apiservicestorage.NewStatusREST(aggregatorscheme.Scheme, apiServiceREST)
+		apiGroupInfo.VersionedResourcesStorageMap["v1"] = storage
+	}
+
+	return apiGroupInfo
+}
+
+// k8s.io/kubernetes/staging/src/k8s.io/kube-aggregator/pkg/apis/apiregistration/register.go:25
+// GroupName is the API group for apiregistration
+const GroupName = "apiregistration.k8s.io"
+
+// k8s.io/kubernetes/staging/src/k8s.io/kube-aggregator/pkg/registry/apiservice/etcd/etcd.go:39
+// NewREST returns a RESTStorage object that will work against API services.
+func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) *REST {
+	strategy := apiservice.NewStrategy(scheme)
+	store := &genericregistry.Store{
+		NewFunc:                  func() runtime.Object { return &apiregistration.APIService{} },
+		NewListFunc:              func() runtime.Object { return &apiregistration.APIServiceList{} },
+		PredicateFunc:            apiservice.MatchAPIService,
+		DefaultQualifiedResource: apiregistration.Resource("apiservices"),
+
+		CreateStrategy: strategy,
+		UpdateStrategy: strategy,
+		DeleteStrategy: strategy,
+	}
+	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: apiservice.GetAttrs}
+	if err := store.CompleteWithOptions(options); err != nil {
+		panic(err) // TODO: Propagate error up
+	}
+	return &REST{store}
+}
+
+// NewStatusREST makes a RESTStorage for status that has more limited options.
+// It is based on the original REST so that we can share the same underlying store
+func NewStatusREST(scheme *runtime.Scheme, rest *REST) *StatusREST {
+	statusStore := *rest.Store
+	statusStore.CreateStrategy = nil
+	statusStore.DeleteStrategy = nil
+	statusStore.UpdateStrategy = apiservice.NewStatusStrategy(scheme)
+	return &StatusREST{store: &statusStore}
+}
+
+// StatusREST implements the REST endpoint for changing the status of an APIService.
+type StatusREST struct {
+	store *genericregistry.Store
+}
+```
+
+可以看到在构建了$GROUP=apiregistration.k8s.io，$VERSION=v1的RESTStorage之后，会进行API Resource的路由注册操作：s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo)。通过这两段代码实现了AggregatorServer对APIService资源的CRUD API接口
+
 ## 总结
 
 * aggregated server实现CR(自定义API资源) 的CRUD API接口，并可以灵活选择后端存储，可以与core kube-apiserver一起公共etcd，也可自己独立部署etcd数据库或者其它数据库。aggregated server实现的CR API路径为：/apis/$GROUP/$VERSION，具体到sample apiserver为：/apis/wardle.example.com/v1alpha1，下面的资源类型有：flunders以及fischers
@@ -2938,3 +3169,9 @@ func (c *autoRegisterController) hasSyncedSuccessfully(name string) bool {
 
 * kube-apiserver中的AggregatorServer创建过程中会根据所有kube-apiserver定义的API资源创建默认的APIService列表，名称即是$VERSION/$GROUP，这些APIService都会有标签`kube-aggregator.kubernetes.io/automanaged: onstart`，例如：v1.apps apiService。autoRegistrationController创建并维护这些列表中的APIService，也即我们看到的Local apiService；对于自定义的APIService(aggregated server)，则不会对其进行处理
 
+* Aggregator 通过 APIServices 对象关联到某个 Service 来进行请求的转发，其关联的 Service 类型进一步决定了请求转发形式。Aggregator 包括一个 `GenericAPIServer` 和维护自身状态的 Controller。其中 `GenericAPIServer` 主要处理 `apiregistration.k8s.io` 组下的 APIService 资源请求，controller包括：
+  - `apiserviceRegistrationController`：负责 APIServices资源的注册与删除；
+  - `availableConditionController`：维护 APIServices 的可用状态，包括其引用 Service 是否可用等；
+  - `autoRegistrationController`：用于保持 API 中存在的一组特定的 APIServices；
+  - `crdRegistrationController`：负责将 CRD GroupVersions 自动注册到 APIServices 中；
+  - `openAPIAggregationController`：将 APIServices 资源的变化同步至提供的 OpenAPI 文档；

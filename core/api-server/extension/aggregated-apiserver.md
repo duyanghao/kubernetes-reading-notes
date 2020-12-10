@@ -2631,6 +2631,7 @@ func (c *autoRegisterController) checkAPIService(name string) (err error) {
 		}
 		return err
 
+	// 对于不是autoRegisterController管理的apiService(例如aggregated apiserver)，则不进行处理
 	// we aren't trying to manage this APIService (3A,3B,3C)
 	case !isAutomanaged(curr):
 		return nil
@@ -2684,6 +2685,7 @@ func (c *autoRegisterController) hasSyncedSuccessfully(name string) bool {
 	defer c.syncedSuccessfullyLock.RUnlock()
 	return c.syncedSuccessfully[name]
 }
+
 ```
 
 注释其实已经说明了该函数功能以及可能的处理情况：
@@ -2700,4 +2702,237 @@ func (c *autoRegisterController) hasSyncedSuccessfully(name string) bool {
 // 5. current: sync on start, present at start     | delete once           | update once               | update once
 // 6. current: sync always                         | delete                | update once               | update
 ```
+
+## 总结
+
+* aggregated server实现CR(自定义API资源) 的CRUD API接口，并可以灵活选择后端存储，可以与core kube-apiserver一起公共etcd，也可自己独立部署etcd数据库或者其它数据库。aggregated server实现的CR API路径为：/apis/$GROUP/$VERSION，具体到sample apiserver为：/apis/wardle.example.com/v1alpha1，下面的资源类型有：flunders以及fischers
+
+* aggregated server通过部署APIService，service fields指向对应的aggregated server service实现与core kube-apiserver的集成
+
+* aggregated server目录结构如下：
+
+  ```bash
+  staging/src/k8s.io/sample-apiserver
+  ├── artifacts
+  │   ├── example
+  │   │   ├── apiservice.yaml
+  │   │   ├── auth-delegator.yaml
+  │   │   ├── auth-reader.yaml
+  │   │   ├── deployment.yaml
+  │   │   ├── ns.yaml
+  │   │   ├── rbac-bind.yaml
+  │   │   ├── rbac.yaml
+  │   │   ├── sa.yaml
+  │   │   └── service.yaml
+  │   ├── flunders
+  │   │   └── 01-flunder.yaml
+  │   └── simple-image
+  │       └── Dockerfile
+  ├── hack
+  │   ├── build-image.sh
+  │   ├── update-codegen.sh
+  │   └── verify-codegen.sh
+  ├── main.go
+  └── pkg
+      ├── admission
+      ├── apis
+      │   └── wardle
+      │       ├── register.go
+      │       ├── types.go
+      │       ├── v1alpha1
+      │       │   ├── BUILD
+      │       │   ├── conversion.go
+      │       │   ├── defaults.go
+      │       │   ├── doc.go
+      │       │   ├── register.go
+      │       │   ├── types.go
+      │       │   ├── zz_generated.conversion.go
+      │       │   ├── zz_generated.deepcopy.go
+      │       │   └── zz_generated.defaults.go
+      │       ├── v1beta1
+      │       │   ├── BUILD
+      │       │   ├── doc.go
+      │       │   ├── register.go
+      │       │   ├── types.go
+      │       │   ├── zz_generated.conversion.go
+      │       │   ├── zz_generated.deepcopy.go
+      │       │   └── zz_generated.defaults.go
+      │       ├── validation
+      │       │   ├── BUILD
+      │       │   └── validation.go
+      │       └── zz_generated.deepcopy.go
+      ├── apiserver
+      │   ├── BUILD
+      │   ├── apiserver.go
+      │   └── scheme_test.go
+      ├── cmd
+      │   └── server
+      │       ├── BUILD
+      │       └── start.go
+      ├── generated
+      │   ├── clientset
+      │   │   └── versioned
+      │   │       ├── BUILD
+      │   │       ├── clientset.go
+      │   │       ├── doc.go
+      │   │       ├── fake
+      │   │       │   ├── BUILD
+      │   │       │   ├── clientset_generated.go
+      │   │       │   ├── doc.go
+      │   │       │   └── register.go
+      │   │       ├── scheme
+      │   │       │   ├── BUILD
+      │   │       │   ├── doc.go
+      │   │       │   └── register.go
+      │   │       └── typed
+      │   │           └── wardle
+      │   │               ├── v1alpha1
+      │   │               │   ├── BUILD
+      │   │               │   ├── doc.go
+      │   │               │   ├── fake
+      │   │               │   │   ├── BUILD
+      │   │               │   │   ├── doc.go
+      │   │               │   │   ├── fake_fischer.go
+      │   │               │   │   ├── fake_flunder.go
+      │   │               │   │   └── fake_wardle_client.go
+      │   │               │   ├── fischer.go
+      │   │               │   ├── flunder.go
+      │   │               │   ├── generated_expansion.go
+      │   │               │   └── wardle_client.go
+      │   │               └── v1beta1
+      │   │                   ├── BUILD
+      │   │                   ├── doc.go
+      │   │                   ├── fake
+      │   │                   │   ├── BUILD
+      │   │                   │   ├── doc.go
+      │   │                   │   ├── fake_flunder.go
+      │   │                   │   └── fake_wardle_client.go
+      │   │                   ├── flunder.go
+      │   │                   ├── generated_expansion.go
+      │   │                   └── wardle_client.go
+      │   ├── informers
+      │   │   └── externalversions
+      │   │       ├── BUILD
+      │   │       ├── factory.go
+      │   │       ├── generic.go
+      │   │       ├── internalinterfaces
+      │   │       │   ├── BUILD
+      │   │       │   └── factory_interfaces.go
+      │   │       └── wardle
+      │   │           ├── BUILD
+      │   │           ├── interface.go
+      │   │           ├── v1alpha1
+      │   │           │   ├── BUILD
+      │   │           │   ├── fischer.go
+      │   │           │   ├── flunder.go
+      │   │           │   └── interface.go
+      │   │           └── v1beta1
+      │   │               ├── BUILD
+      │   │               ├── flunder.go
+      │   │               └── interface.go
+      │   ├── listers
+      │   │   └── wardle
+      │   │       ├── v1alpha1
+      │   │       │   ├── BUILD
+      │   │       │   ├── expansion_generated.go
+      │   │       │   ├── fischer.go
+      │   │       │   └── flunder.go
+      │   │       └── v1beta1
+      │   │           ├── BUILD
+      │   │           ├── expansion_generated.go
+      │   │           └── flunder.go
+      │   └── openapi
+      │       ├── BUILD
+      │       └── zz_generated.openapi.go
+      └── registry
+          ├── BUILD
+          ├── registry.go
+          └── wardle
+              ├── fischer
+              │   ├── BUILD
+              │   ├── etcd.go
+              │   └── strategy.go
+              └── flunder
+                  ├── BUILD
+                  ├── etcd.go
+                  └── strategy.go
+  ```
+
+  * 其中，artifacts用于部署yaml示例
+  * hack目录存放自动脚本(eg: update-codegen)
+  * main.go是aggregated server启动入口；pkg/cmd负责启动aggregated server具体逻辑；pkg/apiserver用于aggregated server初始化以及路由注册
+  * pkg/apis负责相关CR的结构体定义，自动生成(update-codegen)
+  * pkg/admission负责准入的相关代码
+  * pkg/generated负责生成访问CR的clientset，informers，以及listers
+  * pkg/registry目录负责CR相关的RESTStorage实现
+
+* apiserviceRegistrationController负责APIService资源的注册与删除。apiService有两种类型：Local(Service为空)以及Service(Service非空)。apiserviceRegistrationController负责对这两种类型apiService设置代理：Local类型会直接路由给kube-apiserver进行处理；而Service类型则会设置代理并将请求转化为对aggregated Service的请求(proxyPath := "/apis/" + apiService.Spec.Group + "/" + apiService.Spec.Version)，而请求的负载均衡策略则是优先本地访问kube-apiserver(如果service为default kubernetes service:443)=>通过service ClusterIP:Port访问(默认) 或者 通过随机选择service endpoint backend进行访问：
+
+  ```bash
+  $ kubectl get APIService           
+  NAME                                   SERVICE                      AVAILABLE   AGE
+  ...
+  v1.apps                                Local                        True        50d
+  ...
+  v1beta1.metrics.k8s.io                 kube-system/metrics-server   True        50d
+  ...
+  ```
+
+  ```yaml
+  $ kubectl get -o yaml APIService/v1.apps
+  apiVersion: apiregistration.k8s.io/v1
+  kind: APIService
+  metadata:
+    creationTimestamp: "2020-10-20T10:39:48Z"
+    labels:
+      kube-aggregator.kubernetes.io/automanaged: onstart
+    name: v1.apps
+    resourceVersion: "16"
+    selfLink: /apis/apiregistration.k8s.io/v1/apiservices/v1.apps
+    uid: 09374c3d-db49-45e1-8524-1bd8f86daaae
+  spec:
+    group: apps
+    groupPriorityMinimum: 17800
+    version: v1
+    versionPriority: 15
+  status:
+    conditions:
+    - lastTransitionTime: "2020-10-20T10:39:48Z"
+      message: Local APIServices are always available
+      reason: Local
+      status: "True"
+      type: Available
+      
+  $ kubectl get -o yaml APIService/v1beta1.metrics.k8s.io
+  apiVersion: apiregistration.k8s.io/v1
+  kind: APIService
+  metadata:
+    creationTimestamp: "2020-10-20T10:43:12Z"
+    labels:
+      addonmanager.kubernetes.io/mode: Reconcile
+      kubernetes.io/cluster-service: "true"
+    name: v1beta1.metrics.k8s.io
+    resourceVersion: "35484437"
+    selfLink: /apis/apiregistration.k8s.io/v1/apiservices/v1beta1.metrics.k8s.io
+    uid: b16f7fb6-8aa1-475c-b616-fdbd9402bac2
+  spec:
+    group: metrics.k8s.io
+    groupPriorityMinimum: 100
+    insecureSkipTLSVerify: true
+    service:
+      name: metrics-server
+      namespace: kube-system
+      port: 443
+    version: v1beta1
+    versionPriority: 100
+  status:
+    conditions:
+    - lastTransitionTime: "2020-12-05T00:50:48Z"
+      message: all checks passed
+      reason: Passed
+      status: "True"
+      type: Available    
+  ```
+
+* kube-apiserver中的AggregatorServer创建过程中会根据所有kube-apiserver定义的API资源创建默认的APIService列表，名称即是$VERSION/$GROUP，这些APIService都会有标签`kube-aggregator.kubernetes.io/automanaged: onstart`，例如：v1.apps apiService。autoRegistrationController创建并维护这些列表中的APIService，也即我们看到的Local apiService；对于自定义的APIService(aggregated server)，则不会对其进行处理
 

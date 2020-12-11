@@ -3,6 +3,17 @@ CRD apiserver
 
 本文分析apiserver的最后一部分：CRD apiserver，在此之前先介绍CR，并展开CRD以及CRD apiserver
 
+Table of Contents
+=================
+
+* [Custom Resource](#Custom%20Resource)
+* [CRD](#CRD)
+  * [CRD CRUD API server](#CRD%20CRUD%20API%20server)
+  * [crdRegistrationController](#crdRegistrationController)
+  * [Custom Resource的CRUD API server](#Custom%20Resource的CRUD%20API%20server)
+  * [CRD相关controller功能](#CRD相关controller功能)
+* [总结](#总结)
+
 ## Custom Resource
 
 > > A resource is an endpoint in the Kubernetes API that stores a collection of API objects of a certain kind. For example, the built-in pods resource contains a collection of Pod objects.

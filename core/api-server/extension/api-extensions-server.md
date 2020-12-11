@@ -583,19 +583,6 @@ func (c *autoRegisterController) RemoveAPIServiceToSync(name string) {
 
 这里会枚举所有CRDs，然后根据CRD定义的crd.Spec.Group以及crd.Spec.Versions字段构建APIService，并添加到autoRegisterController.apiServicesToSync中，由autoRegisterController进行创建以及维护操作。这也是为什么创建完CRD后，后产生对应的APIService对象
 
-### Custom Resource的CRUD API server
-
-在创建完CRD后，也即给kubernetes扩展了一种资源类型，这里为Project，就可以对Project进行CRUD操作了，如下：
-
-```bash
-$ kubectl get projects 
-No resources found in default namespace.
-```
-
-那么对应CR的CRUD API server在哪里呢？比如这里，哪个apiserver处理Project资源的请求呢？
-
-……
-
 ### CRD相关controller功能
 
 APIExtensionServer 作为 Delegation 链的最后一层，是处理所有用户通过 Custom Resource Definition 定义的资源服务器
@@ -1956,7 +1943,176 @@ storageclasses                    sc           storage.k8s.io                 fa
 volumeattachments                              storage.k8s.io                 false        VolumeAttachment
 ```
 
+#### establishingController
 
+`establishingController`：检查 crd 是否处于正常状态，可在 crd `.status.conditions` 中查看：
+
+```go
+// New returns a new instance of CustomResourceDefinitions from the given config.
+func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*CustomResourceDefinitions, error) {
+	genericServer, err := c.GenericConfig.New("apiextensions-apiserver", delegationTarget)
+	if err != nil {
+		return nil, err
+	}
+
+	...
+
+	if err := s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo); err != nil {
+		return nil, err
+	}
+
+	crdClient, err := clientset.NewForConfig(s.GenericAPIServer.LoopbackClientConfig)
+	if err != nil {
+		// it's really bad that this is leaking here, but until we can fix the test (which I'm pretty sure isn't even testing what it wants to test),
+		// we need to be able to move forward
+		return nil, fmt.Errorf("failed to create clientset: %v", err)
+	}
+	s.Informers = externalinformers.NewSharedInformerFactory(crdClient, 5*time.Minute)
+
+	...
+	establishingController := establish.NewEstablishingController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
+		
+	...
+	s.GenericAPIServer.AddPostStartHookOrDie("start-apiextensions-controllers", func(context genericapiserver.PostStartHookContext) error {
+		// OpenAPIVersionedService and StaticOpenAPISpec are populated in generic apiserver PrepareRun().
+		// Together they serve the /openapi/v2 endpoint on a generic apiserver. A generic apiserver may
+		// choose to not enable OpenAPI by having null openAPIConfig, and thus OpenAPIVersionedService
+		// and StaticOpenAPISpec are both null. In that case we don't run the CRD OpenAPI controller.
+		if s.GenericAPIServer.OpenAPIVersionedService != nil && s.GenericAPIServer.StaticOpenAPISpec != nil {
+			go openapiController.Run(s.GenericAPIServer.StaticOpenAPISpec, s.GenericAPIServer.OpenAPIVersionedService, context.StopCh)
+		}
+
+		go crdController.Run(context.StopCh)
+		go namingController.Run(context.StopCh)
+		go establishingController.Run(context.StopCh)
+		go nonStructuralSchemaController.Run(5, context.StopCh)
+		go apiApprovalController.Run(5, context.StopCh)
+		go finalizingController.Run(5, context.StopCh)
+		return nil
+	})  
+	...
+
+	return s, nil
+}
+
+// sync is used to turn CRDs into the Established state.
+func (ec *EstablishingController) sync(key string) error {
+	cachedCRD, err := ec.crdLister.Get(key)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if !apiextensionshelpers.IsCRDConditionTrue(cachedCRD, apiextensionsv1.NamesAccepted) ||
+		apiextensionshelpers.IsCRDConditionTrue(cachedCRD, apiextensionsv1.Established) {
+		return nil
+	}
+
+	crd := cachedCRD.DeepCopy()
+	establishedCondition := apiextensionsv1.CustomResourceDefinitionCondition{
+		Type:    apiextensionsv1.Established,
+		Status:  apiextensionsv1.ConditionTrue,
+		Reason:  "InitialNamesAccepted",
+		Message: "the initial names have been accepted",
+	}
+	apiextensionshelpers.SetCRDCondition(crd, establishedCondition)
+
+	// Update server with new CRD condition.
+	_, err = ec.crdClient.CustomResourceDefinitions().UpdateStatus(context.TODO(), crd, metav1.UpdateOptions{})
+	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+		// deleted or changed in the meantime, we'll get called again
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+```
+
+设置CRD status.Conditions，如下：
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: projects.duyanghao.example.com
+  resourceVersion: "39790944"
+  selfLink: /apis/apiextensions.k8s.io/v1/customresourcedefinitions/projects.duyanghao.example.com
+  uid: c8f9bf2e-00ac-4ddd-8243-b95b810c8d6e
+spec:
+  conversion:
+    strategy: None
+  group: duyanghao.example.com
+  names:
+    kind: Project
+    listKind: ProjectList
+    plural: projects
+    singular: project
+  preserveUnknownFields: true
+  scope: Namespaced
+  versions:
+  - name: v1
+    served: true
+    storage: true
+status:
+  acceptedNames:
+    kind: Project
+    listKind: ProjectList
+    plural: projects
+    singular: project
+  conditions:
+  - lastTransitionTime: "2020-12-10T09:51:29Z"
+    message: no conflicts found
+    reason: NoConflicts
+    status: "True"
+    type: NamesAccepted
+  - lastTransitionTime: "2020-12-10T09:51:29Z"
+    message: the initial names have been accepted
+    reason: InitialNamesAccepted
+    status: "True"
+    type: Established
+  storedVersions:
+  - v1
+```
+
+### Custom Resource的CRUD API server
+
+在创建完CRD后，也即给kubernetes扩展了一种资源类型，这里为Student，就可以对Student进行CRUD操作了，如下：
+
+```bash
+$ cat << EOF > student.yaml
+apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  name: students.duyanghao.example.com
+spec:
+  group: duyanghao.example.com
+  names:
+    kind: Student
+    listKind: StudentList
+    plural: students
+  scope: Namespaced
+  version: v1
+EOF
+$ kubectl apply -f student.yaml
+customresourcedefinition.apiextensions.k8s.io/students.duyanghao.example.com created
+$ kubectl get student -v=8
+I1211 16:46:39.602389   32666 loader.go:375] Config loaded from file:  /root/.kube/config
+I1211 16:46:39.609763   32666 round_trippers.go:420] GET https://127.0.0.1:6443/apis/duyanghao.example.com/v1/namespaces/default/students?limit=500
+I1211 16:46:39.609791   32666 round_trippers.go:427] Request Headers:
+I1211 16:46:39.609802   32666 round_trippers.go:431]     User-Agent: kubectl/v1.18.3 (linux/amd64) kubernetes/2e7996e
+I1211 16:46:39.609812   32666 round_trippers.go:431]     Accept: application/json;as=Table;v=v1;g=meta.k8s.io,application/json;as=Table;v=v1beta1;g=meta.k8s.io,application/json
+...
+No resources found in default namespace.
+```
+
+对应CR的CRUD API server在哪里呢？比如这里，哪个apiserver处理Student CR资源的请求呢？
+
+……
 
 ## 总结
 

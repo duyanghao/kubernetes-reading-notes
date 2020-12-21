@@ -1,7 +1,7 @@
 Kubernetes远程调试
 =================
 
-对于像Kubernetes这样代码庞大且高度抽象化的项目来说，单独的通过静态源码走读有时候会很累而且事倍功半。当函数以及接口调用链嵌入太深的时候，就需要借助代码调试工具来阅读代码
+对于像Kubernetes这样代码庞大且高度抽象化的项目来说，单独的通过静态源码走读有时候会很累而且事倍功半。当函数以及接口调用链嵌入太深的时候(比如查找Custom Resource对应的CRUD APIServer处理逻辑)，就需要借助代码调试工具来阅读代码
 
 而单纯的利用dlv以及gdb工具来调试Kubernetes不具备实际意义，这里只介绍利用Goland IDE远程debug Kubernetes
 
@@ -252,7 +252,7 @@ $ dlv --listen=:1234 --headless=true --api-version=2 --accept-multiclient exec .
   $ dlv exec ./kubelet --headless -l x.x.x.x:1234 --api-version=2 --accept-multiclient -- --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf --config=/var/lib/kubelet/config.yaml --cgroup-driver=cgroupfs --hostname-override=x.x.x.x --network-plugin=cni ...
   ```
 
-  其中`--cgroup-driver`后面部分是`/var/lib/kubelet/kubeadm-flags.env`文件内容，而`KUBELET_EXTRA_ARGS`参数在`/etc/sysconfig/kubelet`路径中
+  其中`--cgroup-driver`后面部分是`/var/lib/kubelet/kubeadm-flags.env`文件内容，而`KUBELET_EXTRA_ARGS`参数在`/etc/sysconfig/kubelet`文件中
 
   step4：设置kubelet代码断点并调试
 

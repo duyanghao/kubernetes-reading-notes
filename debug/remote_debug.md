@@ -256,3 +256,45 @@ $ dlv --listen=:1234 --headless=true --api-version=2 --accept-multiclient exec .
 
   step4：设置kubelet代码断点并调试
 
+* 踩坑
+
+  由于Kubernetes项目`vendor/k8s.io`下各目录是相应`staging/src/k8s.io`下目录的软链，如下：
+
+  ```bash
+  $ ls -al vendor/k8s.io/
+  total 36
+  drwxr-xr-x  9 xxx xxx 4096 Dec 17 12:39 .
+  drwxr-xr-x 18 xxx xxx 4096 Dec 17 12:39 ..
+  lrwxrwxrwx  1 xxx xxx   28 Dec 17 12:27 api -> ../../staging/src/k8s.io/api
+  lrwxrwxrwx  1 xxx xxx   48 Dec 17 12:27 apiextensions-apiserver -> ../../staging/src/k8s.io/apiextensions-apiserver
+  lrwxrwxrwx  1 xxx xxx   37 Dec 17 12:27 apimachinery -> ../../staging/src/k8s.io/apimachinery
+  lrwxrwxrwx  1 xxx xxx   34 Dec 17 12:27 apiserver -> ../../staging/src/k8s.io/apiserver
+  lrwxrwxrwx  1 xxx xxx   36 Dec 17 12:27 cli-runtime -> ../../staging/src/k8s.io/cli-runtime
+  lrwxrwxrwx  1 xxx xxx   34 Dec 17 12:27 client-go -> ../../staging/src/k8s.io/client-go
+  lrwxrwxrwx  1 xxx xxx   39 Dec 17 12:27 cloud-provider -> ../../staging/src/k8s.io/cloud-provider
+  lrwxrwxrwx  1 xxx xxx   42 Dec 17 12:27 cluster-bootstrap -> ../../staging/src/k8s.io/cluster-bootstrap
+  lrwxrwxrwx  1 xxx xxx   39 Dec 17 12:27 code-generator -> ../../staging/src/k8s.io/code-generator
+  lrwxrwxrwx  1 xxx xxx   39 Dec 17 12:27 component-base -> ../../staging/src/k8s.io/component-base
+  lrwxrwxrwx  1 xxx xxx   32 Dec 17 12:27 cri-api -> ../../staging/src/k8s.io/cri-api
+  lrwxrwxrwx  1 xxx xxx   44 Dec 17 12:27 csi-translation-lib -> ../../staging/src/k8s.io/csi-translation-lib
+  drwxr-xr-x  8 xxx xxx 4096 Dec 17 12:27 gengo
+  drwxr-xr-x  3 xxx xxx 4096 Dec 17 12:27 heapster
+  drwxr-xr-x  2 xxx xxx 4096 Dec 17 12:39 klog
+  lrwxrwxrwx  1 xxx xxx   40 Dec 17 12:27 kube-aggregator -> ../../staging/src/k8s.io/kube-aggregator
+  lrwxrwxrwx  1 xxx xxx   48 Dec 17 12:27 kube-controller-manager -> ../../staging/src/k8s.io/kube-controller-manager
+  drwxr-xr-x  4 xxx xxx 4096 Dec 17 12:27 kube-openapi
+  lrwxrwxrwx  1 xxx xxx   35 Dec 17 12:27 kube-proxy -> ../../staging/src/k8s.io/kube-proxy
+  lrwxrwxrwx  1 xxx xxx   39 Dec 17 12:27 kube-scheduler -> ../../staging/src/k8s.io/kube-scheduler
+  lrwxrwxrwx  1 xxx xxx   32 Dec 17 12:27 kubectl -> ../../staging/src/k8s.io/kubectl
+  lrwxrwxrwx  1 xxx xxx   32 Dec 17 12:27 kubelet -> ../../staging/src/k8s.io/kubelet
+  lrwxrwxrwx  1 xxx xxx   47 Dec 17 12:27 legacy-cloud-providers -> ../../staging/src/k8s.io/legacy-cloud-providers
+  lrwxrwxrwx  1 xxx xxx   32 Dec 17 12:27 metrics -> ../../staging/src/k8s.io/metrics
+  drwxr-xr-x  3 xxx xxx 4096 Dec 17 12:39 repo-infra
+  lrwxrwxrwx  1 xxx xxx   41 Dec 17 12:27 sample-apiserver -> ../../staging/src/k8s.io/sample-apiserver
+  lrwxrwxrwx  1 xxx xxx   42 Dec 17 12:27 sample-cli-plugin -> ../../staging/src/k8s.io/sample-cli-plugin
+  lrwxrwxrwx  1 xxx xxx   42 Dec 17 12:27 sample-controller -> ../../staging/src/k8s.io/sample-controller
+  drwxr-xr-x  3 xxx xxx 4096 Dec 17 12:27 system-validators
+  drwxr-xr-x 16 xxx xxx 4096 Dec 17 12:27 utils
+  ```
+
+  因此本地修改代码可以直接在staging目录执行；但是设置断点要在vendor路径下(因为Golang编译是查找的vendor目录，而不是staging目录)

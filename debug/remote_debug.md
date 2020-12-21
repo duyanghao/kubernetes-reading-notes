@@ -213,6 +213,8 @@ $ dlv --listen=:1234 --headless=true --api-version=2 --accept-multiclient exec .
   --hostname-override=nodeName
   ```
 
+  **注意nodeName替换成实际节点名称**
+
   step4：设置kube-proxy代码断点并调试
 
 * kubelet

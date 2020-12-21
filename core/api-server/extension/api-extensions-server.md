@@ -2112,7 +2112,7 @@ No resources found in default namespace.
 
 对应CR的CRUD API server在哪里呢？比如这里，哪个apiserver处理Student CR资源的请求呢？
 
-……
+
 
 ## 总结
 

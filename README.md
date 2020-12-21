@@ -8,6 +8,7 @@ Kubernetes reading notes based on v1.17.4
 ## Contents
 
 * [environment](prepare/install_kubernetes_one_node.md)
+* [debug](debug/remote_debug.md)
 * [scheduler](core/scheduler/README.md)
 * [api-server](core/api-server/README.md)
 * [controller-manager](core/controller-manager/README.md)

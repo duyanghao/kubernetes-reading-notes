@@ -2621,9 +2621,326 @@ func transformResponseObject(ctx context.Context, scope *RequestScope, trace *ut
 
 ![](../images/crd-apiserver-5.png)
 
+这里我们再重点分析一下`crdInfo, err := r.getOrCreateServingInfoFor(crd.UID, crd.Name)`：
 
+```go
+// crdInfo stores enough information to serve the storage for the custom resource
+type crdInfo struct {
+	// spec and acceptedNames are used to compare against if a change is made on a CRD. We only update
+	// the storage if one of these changes.
+	spec          *apiextensionsv1.CustomResourceDefinitionSpec
+	acceptedNames *apiextensionsv1.CustomResourceDefinitionNames
 
+	// Storage per version
+	storages map[string]customresource.CustomResourceStorage
 
+	// Request scope per version
+	requestScopes map[string]*handlers.RequestScope
+
+	// Scale scope per version
+	scaleRequestScopes map[string]*handlers.RequestScope
+
+	// Status scope per version
+	statusRequestScopes map[string]*handlers.RequestScope
+
+	// storageVersion is the CRD version used when storing the object in etcd.
+	storageVersion string
+
+	waitGroup *utilwaitgroup.SafeWaitGroup
+}
+
+crdInfo, err := r.getOrCreateServingInfoFor(crd.UID, crd.Name)
+
+// CustomResourceStorage includes dummy storage for CustomResources, and their Status and Scale subresources.
+type CustomResourceStorage struct {
+	CustomResource *REST
+	Status         *StatusREST
+	Scale          *ScaleREST
+}
+```
+
+其中spec是CRD定义内容，storages存放该CRD对应CR的后端存储处理函数，如下：
+
+![](../images/crd-apiserver-6.png)
+
+这里也即对student CR进行处理的后端为customresource.REST：
+
+```go
+// getOrCreateServingInfoFor gets the CRD serving info for the given CRD UID if the key exists in the storage map.
+// Otherwise the function fetches the up-to-date CRD using the given CRD name and creates CRD serving info.
+func (r *crdHandler) getOrCreateServingInfoFor(uid types.UID, name string) (*crdInfo, error) {
+	storageMap := r.customStorage.Load().(crdStorageMap)
+	if ret, ok := storageMap[uid]; ok {
+		return ret, nil
+	}
+
+	r.customStorageLock.Lock()
+	defer r.customStorageLock.Unlock()
+
+	// Get the up-to-date CRD when we have the lock, to avoid racing with updateCustomResourceDefinition.
+	// If updateCustomResourceDefinition sees an update and happens later, the storage will be deleted and
+	// we will re-create the updated storage on demand. If updateCustomResourceDefinition happens before,
+	// we make sure that we observe the same up-to-date CRD.
+	crd, err := r.crdLister.Get(name)
+	if err != nil {
+		return nil, err
+	}
+	storageMap = r.customStorage.Load().(crdStorageMap)
+	if ret, ok := storageMap[crd.UID]; ok {
+		return ret, nil
+	}
+
+	storageVersion, err := apiextensionshelpers.GetCRDStorageVersion(crd)
+	if err != nil {
+		return nil, err
+	}
+
+	// Scope/Storages per version.
+	requestScopes := map[string]*handlers.RequestScope{}
+	storages := map[string]customresource.CustomResourceStorage{}
+	...
+	for _, v := range crd.Spec.Versions {
+		...
+		storages[v.Name] = customresource.NewStorage(
+			resource.GroupResource(),
+			kind,
+			schema.GroupVersionKind{Group: crd.Spec.Group, Version: v.Name, Kind: crd.Status.AcceptedNames.ListKind},
+			customresource.NewStrategy(
+				typer,
+				crd.Spec.Scope == apiextensionsv1.NamespaceScoped,
+				kind,
+				validator,
+				statusValidator,
+				structuralSchemas,
+				statusSpec,
+				scaleSpec,
+			),
+			crdConversionRESTOptionsGetter{
+				RESTOptionsGetter:     r.restOptionsGetter,
+				converter:             safeConverter,
+				decoderVersion:        schema.GroupVersion{Group: crd.Spec.Group, Version: v.Name},
+				encoderVersion:        schema.GroupVersion{Group: crd.Spec.Group, Version: storageVersion},
+				structuralSchemas:     structuralSchemas,
+				structuralSchemaGK:    kind.GroupKind(),
+				preserveUnknownFields: crd.Spec.PreserveUnknownFields,
+			},
+			crd.Status.AcceptedNames.Categories,
+			table,
+		)
+	...
+  }    
+
+	ret := &crdInfo{
+		spec:                &crd.Spec,
+		acceptedNames:       &crd.Status.AcceptedNames,
+		storages:            storages,
+		requestScopes:       requestScopes,
+		scaleRequestScopes:  scaleScopes,
+		statusRequestScopes: statusScopes,
+		storageVersion:      storageVersion,
+		waitGroup:           &utilwaitgroup.SafeWaitGroup{},
+	}
+	...
+
+	// Copy because we cannot write to storageMap without a race
+	// as it is used without locking elsewhere.
+	storageMap2 := storageMap.clone()
+
+	storageMap2[crd.UID] = ret
+	r.customStorage.Store(storageMap2)
+  
+	return ret, nil
+}
+```
+
+这里会先获取crd，然后遍历crd.Spec.Version为该CR的每个版本设置storages，而具体kind如下：
+
+Group：duyanghao.example.com
+
+Version：v1
+
+Kind：Student
+
+具体resource如下：
+
+Group：duyanghao.example.com
+
+Version：v1
+
+Resource：students
+
+回到newREST，创建CR存储的地方，如下：
+
+```go
+// k8s.io/kubernetes/vendor/k8s.io/apiextensions-apiserver/pkg/registry/customresource/etcd.go:77
+// newREST returns a RESTStorage object that will work against API services.
+func newREST(resource schema.GroupResource, kind, listKind schema.GroupVersionKind, strategy customResourceStrategy, optsGetter generic.RESTOptionsGetter, categories []string, tableConvertor rest.TableConvertor) (*REST, *StatusREST) {
+	store := &genericregistry.Store{
+		NewFunc: func() runtime.Object {
+			// set the expected group/version/kind in the new object as a signal to the versioning decoder
+			ret := &unstructured.Unstructured{}
+			ret.SetGroupVersionKind(kind)
+			return ret
+		},
+		NewListFunc: func() runtime.Object {
+			// lists are never stored, only manufactured, so stomp in the right kind
+			ret := &unstructured.UnstructuredList{}
+			ret.SetGroupVersionKind(listKind)
+			return ret
+		},
+		PredicateFunc:            strategy.MatchCustomResourceDefinitionStorage,
+		DefaultQualifiedResource: resource,
+
+		CreateStrategy: strategy,
+		UpdateStrategy: strategy,
+		DeleteStrategy: strategy,
+
+		TableConvertor: tableConvertor,
+	}
+	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: strategy.GetAttrs}
+	if err := store.CompleteWithOptions(options); err != nil {
+		panic(err) // TODO: Propagate error up
+	}
+
+	statusStore := *store
+	statusStore.UpdateStrategy = NewStatusStrategy(strategy)
+	return &REST{store, categories}, &StatusREST{store: &statusStore}
+}
+```
+
+重点看NewFunc以及NewListFunc函数，如下：
+
+```go
+// Unstructured allows objects that do not have Golang structs registered to be manipulated
+// generically. This can be used to deal with the API objects from a plug-in. Unstructured
+// objects still have functioning TypeMeta features-- kind, version, etc.
+//
+// WARNING: This object has accessors for the v1 standard metadata. You *MUST NOT* use this
+// type if you are dealing with objects that are not in the server meta v1 schema.
+//
+// TODO: make the serialization part of this type distinct from the field accessors.
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +k8s:deepcopy-gen=true
+type Unstructured struct {
+	// Object is a JSON compatible map with string, float, int, bool, []interface{}, or
+	// map[string]interface{}
+	// children.
+	Object map[string]interface{}
+}
+```
+
+对与NewFunc函数来说，该函数功能是返回CR实例，由于CR在Kubernetes代码中并没有具体结构体定义，所以这里会先初始化一个范型结构体Unstructured，并对该结构题进行SetGroupVersionKind操作，如下：
+
+```go
+func (u *Unstructured) SetGroupVersionKind(gvk schema.GroupVersionKind) {
+	u.SetAPIVersion(gvk.GroupVersion().String())
+	u.SetKind(gvk.Kind)
+}
+
+func (gvk GroupVersionKind) GroupVersion() GroupVersion {
+	return GroupVersion{Group: gvk.Group, Version: gvk.Version}
+}
+
+// String puts "group" and "version" into a single "group/version" string. For the legacy v1
+// it returns "v1".
+func (gv GroupVersion) String() string {
+	// special case the internal apiVersion for the legacy kube types
+	if gv.Empty() {
+		return ""
+	}
+
+	// special case of "v1" for backward compatibility
+	if len(gv.Group) == 0 && gv.Version == "v1" {
+		return gv.Version
+	}
+	if len(gv.Group) > 0 {
+		return gv.Group + "/" + gv.Version
+	}
+	return gv.Version
+}
+
+func (u *Unstructured) SetAPIVersion(version string) {
+	u.setNestedField(version, "apiVersion")
+}
+
+func (u *Unstructured) SetKind(kind string) {
+	u.setNestedField(kind, "kind")
+}
+
+func (u *Unstructured) setNestedField(value interface{}, fields ...string) {
+	if u.Object == nil {
+		u.Object = make(map[string]interface{})
+	}
+	SetNestedField(u.Object, value, fields...)
+}
+
+// SetNestedField sets the value of a nested field to a deep copy of the value provided.
+// Returns an error if value cannot be set because one of the nesting levels is not a map[string]interface{}.
+func SetNestedField(obj map[string]interface{}, value interface{}, fields ...string) error {
+	return setNestedFieldNoCopy(obj, runtime.DeepCopyJSONValue(value), fields...)
+}
+
+func setNestedFieldNoCopy(obj map[string]interface{}, value interface{}, fields ...string) error {
+	m := obj
+
+	for i, field := range fields[:len(fields)-1] {
+		if val, ok := m[field]; ok {
+			if valMap, ok := val.(map[string]interface{}); ok {
+				m = valMap
+			} else {
+				return fmt.Errorf("value cannot be set because %v is not a map[string]interface{}", jsonPath(fields[:i+1]))
+			}
+		} else {
+			newVal := make(map[string]interface{})
+			m[field] = newVal
+			m = newVal
+		}
+	}
+	m[fields[len(fields)-1]] = value
+	return nil
+}
+```
+
+总结CR CRUD APIServer处理逻辑如下：
+
+* createAPIExtensionsServer=>NewCustomResourceDefinitionHandler=>crdHandler=>注册CR CRUD API接口：
+
+  ```go
+  // New returns a new instance of CustomResourceDefinitions from the given config.
+  func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*CustomResourceDefinitions, error) {
+  	...
+  	crdHandler, err := NewCustomResourceDefinitionHandler(
+  		versionDiscoveryHandler,
+  		groupDiscoveryHandler,
+  		s.Informers.Apiextensions().V1().CustomResourceDefinitions(),
+  		delegateHandler,
+  		c.ExtraConfig.CRDRESTOptionsGetter,
+  		c.GenericConfig.AdmissionControl,
+  		establishingController,
+  		c.ExtraConfig.ServiceResolver,
+  		c.ExtraConfig.AuthResolverWrapper,
+  		c.ExtraConfig.MasterCount,
+  		s.GenericAPIServer.Authorizer,
+  		c.GenericConfig.RequestTimeout,
+  		time.Duration(c.GenericConfig.MinRequestTimeout)*time.Second,
+  		apiGroupInfo.StaticOpenAPISpec,
+  		c.GenericConfig.MaxRequestBodyBytes,
+  	)
+  	if err != nil {
+  		return nil, err
+  	}
+  	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", crdHandler)
+  	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/apis/", crdHandler)
+  	...
+  	return s, nil
+  }
+  ```
+
+* crdHandler处理逻辑如下：
+  * 解析req(GET /apis/duyanghao.example.com/v1/namespaces/default/students)，根据请求路径中的group(duyanghao.example.com)，version(v1)，以及resource字段(students)获取对应CRD内容(crd, err := r.crdLister.Get(crdName))
+  * 通过crd.UID以及crd.Name获取crdInfo，若不存在则创建对应的crdInfo(crdInfo, err := r.getOrCreateServingInfoFor(crd.UID, crd.Name))。crdInfo中包含了CRD定义以及该CRD对应Custom Resource的customresource.REST storage
+  * customresource.REST storage由CR对应的Group(duyanghao.example.com)，Version(v1)，Kind(Student)，Resource(students)等创建完成，由于CR在Kubernetes代码中并没有具体结构体定义，所以这里会先初始化一个范型结构体Unstructured(用户保存所有类型的Custom Resource)，并对该结构题进行SetGroupVersionKind操作(设置具体Custom Resource Type)
+  * 从customresource.REST storage获取Unstructured后会对该结构体进行转换然后返回 
 
 ## 总结
 

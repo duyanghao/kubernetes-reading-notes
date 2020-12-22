@@ -2112,6 +2112,517 @@ No resources found in default namespace.
 
 对应CR的CRUD API server在哪里呢？比如这里，哪个apiserver处理Student CR资源的请求呢？
 
+![](../images/crd-apiserver-1.png)
+
+```go
+// CreateServerChain creates the apiservers connected via delegation.
+func CreateServerChain(completedOptions completedServerRunOptions, stopCh <-chan struct{}) (*aggregatorapiserver.APIAggregator, error) {
+	...
+	apiExtensionsServer, err := createAPIExtensionsServer(apiExtensionsConfig, genericapiserver.NewEmptyDelegate())
+	if err != nil {
+		return nil, err
+	}
+	...
+}
+
+// New returns a new instance of CustomResourceDefinitions from the given config.
+func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*CustomResourceDefinitions, error) {
+	...
+	crdHandler, err := NewCustomResourceDefinitionHandler(
+		versionDiscoveryHandler,
+		groupDiscoveryHandler,
+		s.Informers.Apiextensions().V1().CustomResourceDefinitions(),
+		delegateHandler,
+		c.ExtraConfig.CRDRESTOptionsGetter,
+		c.GenericConfig.AdmissionControl,
+		establishingController,
+		c.ExtraConfig.ServiceResolver,
+		c.ExtraConfig.AuthResolverWrapper,
+		c.ExtraConfig.MasterCount,
+		s.GenericAPIServer.Authorizer,
+		c.GenericConfig.RequestTimeout,
+		time.Duration(c.GenericConfig.MinRequestTimeout)*time.Second,
+		apiGroupInfo.StaticOpenAPISpec,
+		c.GenericConfig.MaxRequestBodyBytes,
+	)
+	if err != nil {
+		return nil, err
+	}
+	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", crdHandler)
+	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/apis/", crdHandler)
+	...
+	return s, nil
+}
+
+func NewCustomResourceDefinitionHandler(
+	versionDiscoveryHandler *versionDiscoveryHandler,
+	groupDiscoveryHandler *groupDiscoveryHandler,
+	crdInformer informers.CustomResourceDefinitionInformer,
+	delegate http.Handler,
+	restOptionsGetter generic.RESTOptionsGetter,
+	admission admission.Interface,
+	establishingController *establish.EstablishingController,
+	serviceResolver webhook.ServiceResolver,
+	authResolverWrapper webhook.AuthenticationInfoResolverWrapper,
+	masterCount int,
+	authorizer authorizer.Authorizer,
+	requestTimeout time.Duration,
+	minRequestTimeout time.Duration,
+	staticOpenAPISpec *spec.Swagger,
+	maxRequestBodyBytes int64) (*crdHandler, error) {
+	ret := &crdHandler{
+		versionDiscoveryHandler: versionDiscoveryHandler,
+		groupDiscoveryHandler:   groupDiscoveryHandler,
+		customStorage:           atomic.Value{},
+		crdLister:               crdInformer.Lister(),
+		hasSynced:               crdInformer.Informer().HasSynced,
+		delegate:                delegate,
+		restOptionsGetter:       restOptionsGetter,
+		admission:               admission,
+		establishingController:  establishingController,
+		masterCount:             masterCount,
+		authorizer:              authorizer,
+		requestTimeout:          requestTimeout,
+		minRequestTimeout:       minRequestTimeout,
+		staticOpenAPISpec:       staticOpenAPISpec,
+		maxRequestBodyBytes:     maxRequestBodyBytes,
+	}
+	crdInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    ret.createCustomResourceDefinition,
+		UpdateFunc: ret.updateCustomResourceDefinition,
+		DeleteFunc: func(obj interface{}) {
+			ret.removeDeadStorage()
+		},
+	})
+	crConverterFactory, err := conversion.NewCRConverterFactory(serviceResolver, authResolverWrapper)
+	if err != nil {
+		return nil, err
+	}
+	ret.converterFactory = crConverterFactory
+
+	ret.customStorage.Store(crdStorageMap{})
+
+	return ret, nil
+}
+
+
+```
+
+这里看crdHandler的ServeHTTP处理逻辑：
+
+```go
+func (r *crdHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	ctx := req.Context()
+	requestInfo, ok := apirequest.RequestInfoFrom(ctx)
+	if !ok {
+		responsewriters.ErrorNegotiated(
+			apierrors.NewInternalError(fmt.Errorf("no RequestInfo found in the context")),
+			Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req,
+		)
+		return
+	}
+	if !requestInfo.IsResourceRequest {
+		pathParts := splitPath(requestInfo.Path)
+		// only match /apis/<group>/<version>
+		// only registered under /apis
+		if len(pathParts) == 3 {
+			if !r.hasSynced() {
+				responsewriters.ErrorNegotiated(serverStartingError(), Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req)
+				return
+			}
+			r.versionDiscoveryHandler.ServeHTTP(w, req)
+			return
+		}
+		// only match /apis/<group>
+		if len(pathParts) == 2 {
+			if !r.hasSynced() {
+				responsewriters.ErrorNegotiated(serverStartingError(), Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req)
+				return
+			}
+			r.groupDiscoveryHandler.ServeHTTP(w, req)
+			return
+		}
+
+		r.delegate.ServeHTTP(w, req)
+		return
+	}
+
+	crdName := requestInfo.Resource + "." + requestInfo.APIGroup
+	crd, err := r.crdLister.Get(crdName)
+	if apierrors.IsNotFound(err) {
+		if !r.hasSynced() {
+			responsewriters.ErrorNegotiated(serverStartingError(), Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req)
+			return
+		}
+
+		r.delegate.ServeHTTP(w, req)
+		return
+	}
+	if err != nil {
+		utilruntime.HandleError(err)
+		responsewriters.ErrorNegotiated(
+			apierrors.NewInternalError(fmt.Errorf("error resolving resource")),
+			Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req,
+		)
+		return
+	}
+
+	// if the scope in the CRD and the scope in request differ (with exception of the verbs in possiblyAcrossAllNamespacesVerbs
+	// for namespaced resources), pass request to the delegate, which is supposed to lead to a 404.
+	namespacedCRD, namespacedReq := crd.Spec.Scope == apiextensionsv1.NamespaceScoped, len(requestInfo.Namespace) > 0
+	if !namespacedCRD && namespacedReq {
+		r.delegate.ServeHTTP(w, req)
+		return
+	}
+	if namespacedCRD && !namespacedReq && !possiblyAcrossAllNamespacesVerbs.Has(requestInfo.Verb) {
+		r.delegate.ServeHTTP(w, req)
+		return
+	}
+
+	if !apiextensionshelpers.HasServedCRDVersion(crd, requestInfo.APIVersion) {
+		r.delegate.ServeHTTP(w, req)
+		return
+	}
+
+	// There is a small chance that a CRD is being served because NamesAccepted condition is true,
+	// but it becomes "unserved" because another names update leads to a conflict
+	// and EstablishingController wasn't fast enough to put the CRD into the Established condition.
+	// We accept this as the problem is small and self-healing.
+	if !apiextensionshelpers.IsCRDConditionTrue(crd, apiextensionsv1.NamesAccepted) &&
+		!apiextensionshelpers.IsCRDConditionTrue(crd, apiextensionsv1.Established) {
+		r.delegate.ServeHTTP(w, req)
+		return
+	}
+
+	terminating := apiextensionshelpers.IsCRDConditionTrue(crd, apiextensionsv1.Terminating)
+
+	crdInfo, err := r.getOrCreateServingInfoFor(crd.UID, crd.Name)
+	if apierrors.IsNotFound(err) {
+		r.delegate.ServeHTTP(w, req)
+		return
+	}
+	if err != nil {
+		utilruntime.HandleError(err)
+		responsewriters.ErrorNegotiated(
+			apierrors.NewInternalError(fmt.Errorf("error resolving resource")),
+			Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req,
+		)
+		return
+	}
+	if !hasServedCRDVersion(crdInfo.spec, requestInfo.APIVersion) {
+		r.delegate.ServeHTTP(w, req)
+		return
+	}
+
+	verb := strings.ToUpper(requestInfo.Verb)
+	resource := requestInfo.Resource
+	subresource := requestInfo.Subresource
+	scope := metrics.CleanScope(requestInfo)
+	supportedTypes := []string{
+		string(types.JSONPatchType),
+		string(types.MergePatchType),
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.ServerSideApply) {
+		supportedTypes = append(supportedTypes, string(types.ApplyPatchType))
+	}
+
+	var handlerFunc http.HandlerFunc
+	subresources, err := apiextensionshelpers.GetSubresourcesForVersion(crd, requestInfo.APIVersion)
+	if err != nil {
+		utilruntime.HandleError(err)
+		responsewriters.ErrorNegotiated(
+			apierrors.NewInternalError(fmt.Errorf("could not properly serve the subresource")),
+			Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req,
+		)
+		return
+	}
+	switch {
+	case subresource == "status" && subresources != nil && subresources.Status != nil:
+		handlerFunc = r.serveStatus(w, req, requestInfo, crdInfo, terminating, supportedTypes)
+	case subresource == "scale" && subresources != nil && subresources.Scale != nil:
+		handlerFunc = r.serveScale(w, req, requestInfo, crdInfo, terminating, supportedTypes)
+	case len(subresource) == 0:
+		handlerFunc = r.serveResource(w, req, requestInfo, crdInfo, terminating, supportedTypes)
+	default:
+		responsewriters.ErrorNegotiated(
+			apierrors.NewNotFound(schema.GroupResource{Group: requestInfo.APIGroup, Resource: requestInfo.Resource}, requestInfo.Name),
+			Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req,
+		)
+	}
+
+	if handlerFunc != nil {
+		handlerFunc = metrics.InstrumentHandlerFunc(verb, requestInfo.APIGroup, requestInfo.APIVersion, resource, subresource, scope, metrics.APIServerComponent, handlerFunc)
+		handler := genericfilters.WithWaitGroup(handlerFunc, longRunningFilter, crdInfo.waitGroup)
+		handler.ServeHTTP(w, req)
+		return
+	}
+}
+```
+
+首先会根据Req获取CRD定义：
+
+![](../images/crd-apiserver-2.png)
+
+然后根据crd获取对应的crdInfo，如下：
+
+```go
+...	
+crdInfo, err := r.getOrCreateServingInfoFor(crd.UID, crd.Name)
+...
+```
+
+![](../images/crd-apiserver-3.png)
+
+之后会进入到serveResource进行具体的List请求处理：
+
+```go
+func (r *crdHandler) serveResource(w http.ResponseWriter, req *http.Request, requestInfo *apirequest.RequestInfo, crdInfo *crdInfo, terminating bool, supportedTypes []string) http.HandlerFunc {
+	requestScope := crdInfo.requestScopes[requestInfo.APIVersion]
+	storage := crdInfo.storages[requestInfo.APIVersion].CustomResource
+
+	switch requestInfo.Verb {
+	case "get":
+		return handlers.GetResource(storage, storage, requestScope)
+	case "list":
+		forceWatch := false
+		return handlers.ListResource(storage, storage, requestScope, forceWatch, r.minRequestTimeout)
+	case "watch":
+		forceWatch := true
+		return handlers.ListResource(storage, storage, requestScope, forceWatch, r.minRequestTimeout)
+	case "create":
+		if terminating {
+			err := apierrors.NewMethodNotSupported(schema.GroupResource{Group: requestInfo.APIGroup, Resource: requestInfo.Resource}, requestInfo.Verb)
+			err.ErrStatus.Message = fmt.Sprintf("%v not allowed while custom resource definition is terminating", requestInfo.Verb)
+			responsewriters.ErrorNegotiated(err, Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req)
+			return nil
+		}
+		return handlers.CreateResource(storage, requestScope, r.admission)
+	case "update":
+		return handlers.UpdateResource(storage, requestScope, r.admission)
+	case "patch":
+		return handlers.PatchResource(storage, requestScope, r.admission, supportedTypes)
+	case "delete":
+		allowsOptions := true
+		return handlers.DeleteResource(storage, allowsOptions, requestScope, r.admission)
+	case "deletecollection":
+		checkBody := true
+		return handlers.DeleteCollection(storage, checkBody, requestScope, r.admission)
+	default:
+		responsewriters.ErrorNegotiated(
+			apierrors.NewMethodNotSupported(schema.GroupResource{Group: requestInfo.APIGroup, Resource: requestInfo.Resource}, requestInfo.Verb),
+			Codecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, w, req,
+		)
+		return nil
+	}
+}
+```
+
+这里会进入到List case，并返回handlerFunc，执行如下：
+
+```go
+	if handlerFunc != nil {
+		handlerFunc = metrics.InstrumentHandlerFunc(verb, requestInfo.APIGroup, requestInfo.APIVersion, resource, subresource, scope, metrics.APIServerComponent, handlerFunc)
+		handler := genericfilters.WithWaitGroup(handlerFunc, longRunningFilter, crdInfo.waitGroup)
+		handler.ServeHTTP(w, req)
+		return
+	}
+```
+
+最终执行ListResource如下：
+
+```go
+// k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints/handlers/get.go:166
+func ListResource(r rest.Lister, rw rest.Watcher, scope *RequestScope, forceWatch bool, minRequestTimeout time.Duration) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		// For performance tracking purposes.
+		trace := utiltrace.New("List", utiltrace.Field{Key: "url", Value: req.URL.Path}, utiltrace.Field{Key: "user-agent", Value: &lazyTruncatedUserAgent{req}}, utiltrace.Field{Key: "client", Value: &lazyClientIP{req}})
+
+		namespace, err := scope.Namer.Namespace(req)
+		if err != nil {
+			scope.err(err, w, req)
+			return
+		}
+
+		// Watches for single objects are routed to this function.
+		// Treat a name parameter the same as a field selector entry.
+		hasName := true
+		_, name, err := scope.Namer.Name(req)
+		if err != nil {
+			hasName = false
+		}
+
+		ctx := req.Context()
+		ctx = request.WithNamespace(ctx, namespace)
+
+		outputMediaType, _, err := negotiation.NegotiateOutputMediaType(req, scope.Serializer, scope)
+		if err != nil {
+			scope.err(err, w, req)
+			return
+		}
+
+		opts := metainternalversion.ListOptions{}
+		if err := metainternalversionscheme.ParameterCodec.DecodeParameters(req.URL.Query(), scope.MetaGroupVersion, &opts); err != nil {
+			err = errors.NewBadRequest(err.Error())
+			scope.err(err, w, req)
+			return
+		}
+
+		// transform fields
+		// TODO: DecodeParametersInto should do this.
+		if opts.FieldSelector != nil {
+			fn := func(label, value string) (newLabel, newValue string, err error) {
+				return scope.Convertor.ConvertFieldLabel(scope.Kind, label, value)
+			}
+			if opts.FieldSelector, err = opts.FieldSelector.Transform(fn); err != nil {
+				// TODO: allow bad request to set field causes based on query parameters
+				err = errors.NewBadRequest(err.Error())
+				scope.err(err, w, req)
+				return
+			}
+		}
+
+		if hasName {
+			// metadata.name is the canonical internal name.
+			// SelectionPredicate will notice that this is a request for
+			// a single object and optimize the storage query accordingly.
+			nameSelector := fields.OneTermEqualSelector("metadata.name", name)
+
+			// Note that fieldSelector setting explicitly the "metadata.name"
+			// will result in reaching this branch (as the value of that field
+			// is propagated to requestInfo as the name parameter.
+			// That said, the allowed field selectors in this branch are:
+			// nil, fields.Everything and field selector matching metadata.name
+			// for our name.
+			if opts.FieldSelector != nil && !opts.FieldSelector.Empty() {
+				selectedName, ok := opts.FieldSelector.RequiresExactMatch("metadata.name")
+				if !ok || name != selectedName {
+					scope.err(errors.NewBadRequest("fieldSelector metadata.name doesn't match requested name"), w, req)
+					return
+				}
+			} else {
+				opts.FieldSelector = nameSelector
+			}
+		}
+
+		if opts.Watch || forceWatch {
+			if rw == nil {
+				scope.err(errors.NewMethodNotSupported(scope.Resource.GroupResource(), "watch"), w, req)
+				return
+			}
+			// TODO: Currently we explicitly ignore ?timeout= and use only ?timeoutSeconds=.
+			timeout := time.Duration(0)
+			if opts.TimeoutSeconds != nil {
+				timeout = time.Duration(*opts.TimeoutSeconds) * time.Second
+			}
+			if timeout == 0 && minRequestTimeout > 0 {
+				timeout = time.Duration(float64(minRequestTimeout) * (rand.Float64() + 1.0))
+			}
+			klog.V(3).Infof("Starting watch for %s, rv=%s labels=%s fields=%s timeout=%s", req.URL.Path, opts.ResourceVersion, opts.LabelSelector, opts.FieldSelector, timeout)
+			ctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			watcher, err := rw.Watch(ctx, &opts)
+			if err != nil {
+				scope.err(err, w, req)
+				return
+			}
+			requestInfo, _ := request.RequestInfoFrom(ctx)
+			metrics.RecordLongRunning(req, requestInfo, metrics.APIServerComponent, func() {
+				serveWatch(watcher, scope, outputMediaType, req, w, timeout)
+			})
+			return
+		}
+
+		// Log only long List requests (ignore Watch).
+		defer trace.LogIfLong(500 * time.Millisecond)
+		trace.Step("About to List from storage")
+		result, err := r.List(ctx, &opts)
+		if err != nil {
+			scope.err(err, w, req)
+			return
+		}
+		trace.Step("Listing from storage done")
+
+		transformResponseObject(ctx, scope, trace, req, w, http.StatusOK, outputMediaType, result)
+		trace.Step("Writing http response done", utiltrace.Field{"count", meta.LenList(result)})
+	}
+}
+```
+
+该函数会调用List，如下：
+
+```go
+// k8s.io/kubernetes/staging/src/k8s.io/apiextensions-apiserver/pkg/registry/customresource/etcd.go:114
+// List returns a list of items matching labels and field according to the store's PredicateFunc.
+func (e *REST) List(ctx context.Context, options *metainternalversion.ListOptions) (runtime.Object, error) {
+   l, err := e.Store.List(ctx, options)
+   if err != nil {
+      return nil, err
+   }
+
+   // Shallow copy ObjectMeta in returned list for each item. Native types have `Items []Item` fields and therefore
+   // implicitly shallow copy ObjectMeta. The generic store sets the self-link for each item. So this is necessary
+   // to avoid mutation of the objects from the cache.
+   if ul, ok := l.(*unstructured.UnstructuredList); ok {
+      for i := range ul.Items {
+         shallowCopyObjectMeta(&ul.Items[i])
+      }
+   }
+
+   return l, nil
+}
+
+// k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:291
+// List returns a list of items matching labels and field according to the
+// store's PredicateFunc.
+func (e *Store) List(ctx context.Context, options *metainternalversion.ListOptions) (runtime.Object, error) {
+	label := labels.Everything()
+	if options != nil && options.LabelSelector != nil {
+		label = options.LabelSelector
+	}
+	field := fields.Everything()
+	if options != nil && options.FieldSelector != nil {
+		field = options.FieldSelector
+	}
+	out, err := e.ListPredicate(ctx, e.PredicateFunc(label, field), options)
+	if err != nil {
+		return nil, err
+	}
+	if e.Decorator != nil {
+		if err := e.Decorator(out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+```
+
+![](../images/crd-apiserver-4.png)
+
+之后会执行transformResponseObject，如下：
+
+```go
+// transformResponseObject takes an object loaded from storage and performs any necessary transformations.
+// Will write the complete response object.
+func transformResponseObject(ctx context.Context, scope *RequestScope, trace *utiltrace.Trace, req *http.Request, w http.ResponseWriter, statusCode int, mediaType negotiation.MediaTypeOptions, result runtime.Object) {
+	options, err := optionsForTransform(mediaType, req)
+	if err != nil {
+		scope.err(err, w, req)
+		return
+	}
+	obj, err := transformObject(ctx, result, options, mediaType, scope, req)
+	if err != nil {
+		scope.err(err, w, req)
+		return
+	}
+	kind, serializer, _ := targetEncodingForTransform(scope, mediaType, req)
+	responsewriters.WriteObjectNegotiated(serializer, scope, kind.GroupVersion(), w, req, statusCode, obj)
+}
+```
+
+![](../images/crd-apiserver-5.png)
+
+
+
 
 
 ## 总结

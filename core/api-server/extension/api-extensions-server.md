@@ -10,8 +10,8 @@ Table of Contents
 * [CRD](#CRD)
   * [CRD CRUD API server](#CRD%20CRUD%20API%20server)
   * [crdRegistrationController](#crdRegistrationController)
-  * [Custom Resource的CRUD API server](#Custom%20Resource的CRUD%20API%20server)
   * [CRD相关controller功能](#CRD相关controller功能)
+  * [Custom Resource的CRUD API server](#Custom%20Resource的CRUD%20API%20server)
 * [总结](#总结)
 
 ## Custom Resource

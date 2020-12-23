@@ -649,32 +649,7 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 }
 ```
 
-而kubeAPIServer从接受到创建请求到完成创建，整个与etcd的交互环节如下：
-
-```bash
-v1beta1 ⇒ internal ⇒    |    ⇒       |    ⇒  v1  ⇒ json/yaml ⇒ etcd
-                     admission    validation
-```
-
-![API-server-storage-flow-2](https://camo.githubusercontent.com/38c6882499f6d15e7322e649a07f8a602c3009d7eafb1ed6ec444aa368ef849c/687474703a2f2f63646e2e7469616e66656979752e636f6d2f4150492d7365727665722d73746f726167652d666c6f772d322e706e67)
-
-下面依次介绍各环节：
-
-**Decoder**
-
-kubernetes 中的多数 resource 都会有一个 `internal version`，因为在整个开发过程中一个 resource 可能会对应多个 version，比如 deployment 会有 `extensions/v1beta1`，`apps/v1`。 为了避免出现问题，kube-apiserver 必须要知道如何在每一对版本之间进行转换（例如，v1⇔v1alpha1，v1⇔v1beta1，v1beta1⇔v1alpha1），因此其使用了一个特殊的`internal version`，`internal version` 作为一个通用的 version 会包含所有 version 的字段，它具有所有 version 的功能。 Decoder 会首先把 creater object 转换到 `internal version`
-
-**Admission**
-
-在解码完成后，需要通过验证集群的全局约束来检查是否可以创建或更新对象，并根据集群配置设置默认值。在 `k8s.io/kubernetes/plugin/pkg/admission` 目录下可以看到 kube-apiserver 可以使用的所有全局约束插件，kube-apiserver 在启动时通过设置 `--enable-admission-plugins` 参数来开启需要使用的插件，通过 `ValidatingAdmissionWebhook` 或 `MutatingAdmissionWebhook` 添加的插件也都会在此处进行工作
-
-**Validation**
-
-主要检查 object 中字段的合法性
-
-**Encode**
-
-Encode完成与Decoder相反的操作，将internal version object转化为storage version object，`storage version` 是在 etcd 中存储时的另一个 version
+而kubeAPIServer从接受到创建请求到完成创建，会经历decode，admission，validation以及encode的流程，如下：
 
 ```go
 // k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go:196

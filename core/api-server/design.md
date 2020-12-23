@@ -2261,16 +2261,9 @@ func CreateNamedResource(r rest.NamedCreater, scope *RequestScope, admission adm
 }
 ```
 
-`createHandler` 是将数据写入到后端存储的方法，对于资源的操作都有相关的权限控制，在 `createHandler` 中首先会执行 `decoder` 和 `admission` 操作，然后调用 `create` 方法完成 resource 的创建，在 `create` 方法中会进行 `validate` 以及最终将数据保存到后端存储中。`admit` 操作即执行 kube-apiserver 中的 admission-plugins，admission-plugins 在 `CreateKubeAPIServerConfig` 中被初始化为了 admissionChain，其初始化的调用链为 `CreateKubeAPIServerConfig --> buildGenericConfig --> s.Admission.ApplyTo --> a.GenericAdmission.ApplyTo --> a.Plugins.NewFromPlugins`，最终在 `a.Plugins.NewFromPlugins` 中将所有已启用的 plugins 封装为 admissionChain，此处要执行的 admit 操作即执行 admission-plugins 中的 admit 操作。
+`createHandler` 是将数据写入到后端存储的方法，对于资源的操作都有相关的权限控制，在 `createHandler` 中首先会执行 `decoder` 和 `admission` 操作，然后调用 `create` 方法完成 resource 的创建，在 `create` 方法中会进行 `validate` 以及最终将数据保存到后端存储中。`admit` 操作即执行 kube-apiserver 中的 admission-plugins，admission-plugins 在 `CreateKubeAPIServerConfig` 中被初始化为了 admissionChain，其初始化的调用链为 `CreateKubeAPIServerConfig --> buildGenericConfig --> s.Admission.ApplyTo --> a.GenericAdmission.ApplyTo --> a.Plugins.NewFromPlugins`，最终在 `a.Plugins.NewFromPlugins` 中将所有已启用的 plugins 封装为 admissionChain，此处要执行的 admit 操作即执行 admission-plugins 中的 admit 操作
 
-`createHandler` 中调用的 create 方法是` genericregistry.Store` 对象的方法，在每个 resource 初始化 RESTStorage 都会引入 `genericregistry.Store` 对象。
-
-`createHandler` 中所有的操作就是本文开头提到的请求流程，如下所示：
-
-```
-v1beta1 ⇒ internal ⇒    |    ⇒       |    ⇒  v1  ⇒ json/yaml ⇒ etcd
-                     admission    validation
-```
+`createHandler` 中调用的 create 方法是` genericregistry.Store` 对象的方法，在每个 resource 初始化 RESTStorage 都会引入 `genericregistry.Store` 对象
 
 ```go
 // k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go:47
@@ -3335,11 +3328,9 @@ filters(DefaultBuildHandlerChain) => installAPI(/|/metrics|/debug|/version) | Ge
 
 ## etcd交互细节
 
-在分析完上述调用拓扑之后，我们再回过头来分析一下kube-apiserver与etcd之间的交互细节：
+在分析完上述调用拓扑之后，我们再回过头来分析一下kube-apiserver与etcd之间的交互细节
 
-![API-server-storage-flow-2](https://camo.githubusercontent.com/38c6882499f6d15e7322e649a07f8a602c3009d7eafb1ed6ec444aa368ef849c/687474703a2f2f63646e2e7469616e66656979752e636f6d2f4150492d7365727665722d73746f726167652d666c6f772d322e706e67)
-
-这里，我们参考一下上述图示，通过前面的分析我们知道POST请求对应的处理handler为restfulCreateResource：
+通过前面的分析我们知道POST请求对应的处理handler为restfulCreateResource：
 
 ```go
 // k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/installer.go:181
@@ -4011,30 +4002,7 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 
 在Create中会对obj进行runtime.Encode以及s.transformer.TransformToStorage，最终调用clientv3写etcd
 
-**Decoder**
-
-kubernetes 中的多数 resource 都会有一个 `internal version`，因为在整个开发过程中一个 resource 可能会对应多个 version，比如 deployment 会有 `extensions/v1beta1`，`apps/v1`。 为了避免出现问题，kube-apiserver 必须要知道如何在每一对版本之间进行转换（例如，v1⇔v1alpha1，v1⇔v1beta1，v1beta1⇔v1alpha1），因此其使用了一个特殊的`internal version`，`internal version` 作为一个通用的 version 会包含所有 version 的字段，它具有所有 version 的功能。 Decoder 会首先把 creater object 转换到 `internal version`。
-
-在解码时，首先从 HTTP path 中获取期待的 version，然后使用 scheme 以正确的 version 创建一个与之匹配的空对象，并使用 JSON 或 protobuf 解码器进行转换，在转换的第一步中，如果用户省略了某些字段，Decoder 会把其设置为默认值。
-
-**Admission**
-
-在解码完成后，需要通过验证集群的全局约束来检查是否可以创建或更新对象，并根据集群配置设置默认值。在 `k8s.io/kubernetes/plugin/pkg/admission` 目录下可以看到 kube-apiserver 可以使用的所有全局约束插件，kube-apiserver 在启动时通过设置 `--enable-admission-plugins` 参数来开启需要使用的插件，通过 `ValidatingAdmissionWebhook` 或 `MutatingAdmissionWebhook` 添加的插件也都会在此处进行工作。
-
-**Validation**
-
-主要检查 object 中字段的合法性
-
-**Encode**
-
-Encode完成与Decoder相反的操作，将internal version object转化为storage version object，`storage version` 是在 etcd 中存储时的另一个 version
-
-POST 操作会将数据写入到 etcd 中，以上在 handler 中的主要处理流程如下所示：
-
-```
-v1beta1 ⇒ internal ⇒    |    ⇒       |    ⇒  v1  ⇒ json/yaml ⇒ etcd
-                     admission    validation
-```
+整个kubeAPIServer从接受到创建请求到完成创建，会经历decode，admission，validation以及encode的流程
 
 ## kube-apiserver代码模块整理
 

@@ -1,11 +1,9 @@
-CRD apiserver
-=============
+apiExtensionsServer
+===================
 
-本文分析apiserver的最后一部分：CRD apiserver，在此之前先介绍CR，并展开CRD以及CRD apiserver
+## Table of Contents
 
-Table of Contents
-=================
-
+* [前言](#前言)
 * [Custom Resource](#Custom%20Resource)
 * [CRD](#CRD)
   * [CRD CRUD API server](#CRD%20CRUD%20API%20server)
@@ -13,6 +11,18 @@ Table of Contents
   * [CRD相关controller功能](#CRD相关controller功能)
   * [Custom Resource的CRUD API server](#Custom%20Resource的CRUD%20API%20server)
 * [总结](#总结)
+
+## 前言
+
+kube-apiserver包含三种APIServer：
+
+* aggregatorServer：暴露的功能类似于一个七层负载均衡，将来自用户的请求拦截转发给其他服务器，也即用于处理扩展api-resource的aggregated apiserver(AA)
+* kubeAPIServer：负责对请求的一些通用处理，包括：认证、鉴权以及各个内建资源(pod, deployment，service and etc)的REST服务等
+* apiExtensionsServer：负责CustomResourceDefinition（CRD）apiResources以及apiVersions的注册，同时处理CRD以及相应CustomResource（CR）的REST请求(如果对应CR不能被处理的话则会返回404)，也是apiserver Delegation的最后一环
+
+本文主要介绍apiExtensionsServer，也是Kubernetes apiserver源码分析系列的最后一篇，其它相关文章可以从如下[链接](https://github.com/duyanghao/kubernetes-reading-notes/blob/master/core/api-server/README.md)查看，这里不做过多介绍
+
+接下来将从CR出发分析Kubernetes apiExtensionsServer的内部逻辑以及原理
 
 ## Custom Resource
 
@@ -22,7 +32,7 @@ Table of Contents
 
 > > Custom resources can appear and disappear in a running cluster through dynamic registration, and cluster admins can update custom resources independently of the cluster itself. Once a custom resource is installed, users can create and access its objects using kubectl, just as they do for built-in resources like Pods.
 
-Custom Resource，简称CR，是Kubernetes自定义资源类型，与之相对应的就是Kubernetes内置的各种资源类型，例如Pod、Service等。利用CR我们可以定义任何想要的资源类型，例如这里TKE的`Project`等
+Custom Resource，简称CR，是Kubernetes自定义资源类型，与之相对应的就是Kubernetes内置的各种资源类型，例如Pod、Service等。利用CR我们可以定义任何想要的资源类型，例如TKE的`Project`等
 
 而对于如何使用CR，官方也给出了两种方式：
 
@@ -45,11 +55,11 @@ Custom Resource，简称CR，是Kubernetes自定义资源类型，与之相对�
 
 ## CRD
 
-CRD通过yaml文件的形式向Kubernetes注册CR实现api-resource，属于第二种扩展Kubernetes API资源的方式(相比aggregated apiserver)，同时也是普遍使用的一种。这里我们将从源码角度剖析CRD的内部原理
+CRD通过yaml文件的形式向Kubernetes注册CR实现自定义api-resources，属于第二种扩展Kubernetes API资源的方式(相比aggregated apiserver)，同时也是普遍使用的一种
 
 首先我们会创建一个CRD，例子如下：
 
-```go
+```yaml
 apiVersion: apiextensions.k8s.io/v1beta1
 kind: CustomResourceDefinition
 metadata:
@@ -242,7 +252,7 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 }
 ```
 
-APIExtensionServer 作为 Delegation 链的最后一层，是处理所有用户通过 Custom Resource Definition 定义的资源服务器。核心代码是：
+这里createAPIExtensionsServer通过`s.GenericAPIServer.InstallAPIGroup`注册了CRD这种资源(Group: apiextensions.k8s.io; Version: v1beta1 or v1; Kind: CustomResourceDefinition)的路由和处理函数，核心代码是：
 
 ```go
 ...
@@ -354,7 +364,7 @@ status:
     type: Available
 ```
 
-`crdRegistrationController`：负责将 CRD GroupVersions 自动注册到 APIServices 中，下面我们进行分析：
+这里aggregatorServer的`crdRegistrationController`负责将CRD GroupVersions自动注册到APIServices中，下面我们进行分析：
 
 ```go
 func createAggregatorServer(aggregatorConfig *aggregatorapiserver.Config, delegateAPIServer genericapiserver.DelegationTarget, apiExtensionInformers apiextensionsinformers.SharedInformerFactory) (*aggregatorapiserver.APIAggregator, error) {
@@ -443,7 +453,7 @@ func NewCRDRegistrationController(crdinformer crdinformers.CustomResourceDefinit
 }
 ```
 
-下面是crdRegistrationController的核心逻辑：
+crdRegistrationController核心逻辑如下：
 
 ```go
 func (c *crdRegistrationController) Run(threadiness int, stopCh <-chan struct{}) {
@@ -581,157 +591,28 @@ func (c *autoRegisterController) RemoveAPIServiceToSync(name string) {
 }
 ```
 
-这里会枚举所有CRDs，然后根据CRD定义的crd.Spec.Group以及crd.Spec.Versions字段构建APIService，并添加到autoRegisterController.apiServicesToSync中，由autoRegisterController进行创建以及维护操作。这也是为什么创建完CRD后会产生对应的APIService对象
+这里会枚举所有CRDs，然后根据CRD定义的crd.Spec.Group以及crd.Spec.Versions字段构建APIService，并添加到autoRegisterController.apiServicesToSync中，由autoRegisterController进行创建以及维护操作。这也是为什么创建完CRD后会产生对应的APIService对象(关于APIService的作用可参考[kubernetes aggregated-apiserver源码分析](https://github.com/duyanghao/kubernetes-reading-notes/blob/master/core/api-server/extension/aggregated-apiserver.md))
 
 ### CRD相关controller功能
 
-APIExtensionServer 作为 Delegation 链的最后一层，是处理所有用户通过 Custom Resource Definition 定义的资源服务器
-
-其中包含的 controller 以及功能如下所示：
+apiExtensionsServer包含的controller以及功能列表如下：
 
 - `openapiController`：将 crd 资源的变化同步至提供的 OpenAPI 文档，可通过访问 `/openapi/v2` 进行查看；
-- `crdController`：负责将 crd 信息注册到 apiVersions 和 apiResources 中，两者的信息可通过 `$ kubectl api-versions` 和 `$ kubectl api-resources` 查看；
+- `crdController`：负责将 crd 信息注册到 apiVersions 和 apiResources 中，两者的信息可通过 `kubectl api-versions` 和 `kubectl api-resources` 查看；
 - `namingController`：检查 crd obj 中是否有命名冲突，可在 crd `.status.conditions` 中查看；
 - `establishingController`：检查 crd 是否处于正常状态，可在 crd `.status.conditions` 中查看；
 - `nonStructuralSchemaController`：检查 crd obj 结构是否正常，可在 crd `.status.conditions` 中查看；
 - `apiApprovalController`：检查 crd 是否遵循 Kubernetes API 声明策略，可在 crd `.status.conditions` 中查看；
 - `finalizingController`：类似于 finalizes 的功能，与 CRs 的删除有关；
 
-这里我们对核心controller功能做解析：
+接下来会对上述crdController以及establishingController功能进行分析
 
 #### crdController
 
 ```go
-// New returns a new instance of CustomResourceDefinitions from the given config.
-func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*CustomResourceDefinitions, error) {
-	genericServer, err := c.GenericConfig.New("apiextensions-apiserver", delegationTarget)
-	if err != nil {
-		return nil, err
-	}
-
-	s := &CustomResourceDefinitions{
-		GenericAPIServer: genericServer,
-	}
-
-	apiResourceConfig := c.GenericConfig.MergedResourceConfig
-	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(apiextensions.GroupName, Scheme, metav1.ParameterCodec, Codecs)
-	if apiResourceConfig.VersionEnabled(v1beta1.SchemeGroupVersion) {
-		storage := map[string]rest.Storage{}
-		// customresourcedefinitions
-		customResourceDefintionStorage := customresourcedefinition.NewREST(Scheme, c.GenericConfig.RESTOptionsGetter)
-		storage["customresourcedefinitions"] = customResourceDefintionStorage
-		storage["customresourcedefinitions/status"] = customresourcedefinition.NewStatusREST(Scheme, customResourceDefintionStorage)
-
-		apiGroupInfo.VersionedResourcesStorageMap[v1beta1.SchemeGroupVersion.Version] = storage
-	}
-	if apiResourceConfig.VersionEnabled(v1.SchemeGroupVersion) {
-		storage := map[string]rest.Storage{}
-		// customresourcedefinitions
-		customResourceDefintionStorage := customresourcedefinition.NewREST(Scheme, c.GenericConfig.RESTOptionsGetter)
-		storage["customresourcedefinitions"] = customResourceDefintionStorage
-		storage["customresourcedefinitions/status"] = customresourcedefinition.NewStatusREST(Scheme, customResourceDefintionStorage)
-
-		apiGroupInfo.VersionedResourcesStorageMap[v1.SchemeGroupVersion.Version] = storage
-	}
-
-	if err := s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo); err != nil {
-		return nil, err
-	}
-
-	crdClient, err := clientset.NewForConfig(s.GenericAPIServer.LoopbackClientConfig)
-	if err != nil {
-		// it's really bad that this is leaking here, but until we can fix the test (which I'm pretty sure isn't even testing what it wants to test),
-		// we need to be able to move forward
-		return nil, fmt.Errorf("failed to create clientset: %v", err)
-	}
-	s.Informers = externalinformers.NewSharedInformerFactory(crdClient, 5*time.Minute)
-
-	delegateHandler := delegationTarget.UnprotectedHandler()
-	if delegateHandler == nil {
-		delegateHandler = http.NotFoundHandler()
-	}
-
-	versionDiscoveryHandler := &versionDiscoveryHandler{
-		discovery: map[schema.GroupVersion]*discovery.APIVersionHandler{},
-		delegate:  delegateHandler,
-	}
-	groupDiscoveryHandler := &groupDiscoveryHandler{
-		discovery: map[string]*discovery.APIGroupHandler{},
-		delegate:  delegateHandler,
-	}
-	establishingController := establish.NewEstablishingController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
-	crdHandler, err := NewCustomResourceDefinitionHandler(
-		versionDiscoveryHandler,
-		groupDiscoveryHandler,
-		s.Informers.Apiextensions().V1().CustomResourceDefinitions(),
-		delegateHandler,
-		c.ExtraConfig.CRDRESTOptionsGetter,
-		c.GenericConfig.AdmissionControl,
-		establishingController,
-		c.ExtraConfig.ServiceResolver,
-		c.ExtraConfig.AuthResolverWrapper,
-		c.ExtraConfig.MasterCount,
-		s.GenericAPIServer.Authorizer,
-		c.GenericConfig.RequestTimeout,
-		time.Duration(c.GenericConfig.MinRequestTimeout)*time.Second,
-		apiGroupInfo.StaticOpenAPISpec,
-		c.GenericConfig.MaxRequestBodyBytes,
-	)
-	if err != nil {
-		return nil, err
-	}
-	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", crdHandler)
-	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/apis/", crdHandler)
-
-	crdController := NewDiscoveryController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), versionDiscoveryHandler, groupDiscoveryHandler)
-	namingController := status.NewNamingConditionController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
-	nonStructuralSchemaController := nonstructuralschema.NewConditionController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
-	apiApprovalController := apiapproval.NewKubernetesAPIApprovalPolicyConformantConditionController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
-	finalizingController := finalizer.NewCRDFinalizer(
-		s.Informers.Apiextensions().V1().CustomResourceDefinitions(),
-		crdClient.ApiextensionsV1(),
-		crdHandler,
-	)
-	openapiController := openapicontroller.NewController(s.Informers.Apiextensions().V1().CustomResourceDefinitions())
-
-	s.GenericAPIServer.AddPostStartHookOrDie("start-apiextensions-informers", func(context genericapiserver.PostStartHookContext) error {
-		s.Informers.Start(context.StopCh)
-		return nil
-	})
-	s.GenericAPIServer.AddPostStartHookOrDie("start-apiextensions-controllers", func(context genericapiserver.PostStartHookContext) error {
-		// OpenAPIVersionedService and StaticOpenAPISpec are populated in generic apiserver PrepareRun().
-		// Together they serve the /openapi/v2 endpoint on a generic apiserver. A generic apiserver may
-		// choose to not enable OpenAPI by having null openAPIConfig, and thus OpenAPIVersionedService
-		// and StaticOpenAPISpec are both null. In that case we don't run the CRD OpenAPI controller.
-		if s.GenericAPIServer.OpenAPIVersionedService != nil && s.GenericAPIServer.StaticOpenAPISpec != nil {
-			go openapiController.Run(s.GenericAPIServer.StaticOpenAPISpec, s.GenericAPIServer.OpenAPIVersionedService, context.StopCh)
-		}
-
-		go crdController.Run(context.StopCh)
-		go namingController.Run(context.StopCh)
-		go establishingController.Run(context.StopCh)
-		go nonStructuralSchemaController.Run(5, context.StopCh)
-		go apiApprovalController.Run(5, context.StopCh)
-		go finalizingController.Run(5, context.StopCh)
-		return nil
-	})
-	// we don't want to report healthy until we can handle all CRDs that have already been registered.  Waiting for the informer
-	// to sync makes sure that the lister will be valid before we begin.  There may still be races for CRDs added after startup,
-	// but we won't go healthy until we can handle the ones already present.
-	s.GenericAPIServer.AddPostStartHookOrDie("crd-informer-synced", func(context genericapiserver.PostStartHookContext) error {
-		return wait.PollImmediateUntil(100*time.Millisecond, func() (bool, error) {
-			return s.Informers.Apiextensions().V1().CustomResourceDefinitions().Informer().HasSynced(), nil
-		}, context.StopCh)
-	})
-
-	return s, nil
-}
-```
-
-负责将 crd 信息注册到 apiVersions 和 apiResources 中，两者的信息可通过 `$ kubectl api-versions` 和 `$ kubectl api-resources` 查看：
-
-```go
+...
 crdController := NewDiscoveryController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), versionDiscoveryHandler, groupDiscoveryHandler)
+...
 
 func NewDiscoveryController(crdInformer informers.CustomResourceDefinitionInformer, versionHandler *versionDiscoveryHandler, groupHandler *groupDiscoveryHandler) *DiscoveryController {
 	c := &DiscoveryController{
@@ -838,7 +719,7 @@ func (c *DiscoveryController) enqueue(obj *apiextensionsv1.CustomResourceDefinit
 }
 ```
 
-这里看核心逻辑：
+核心逻辑如下：
 
 ```go
 // k8s.io/kubernetes/staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/customresource_discovery_controller.go:77
@@ -968,7 +849,7 @@ func (c *DiscoveryController) sync(version schema.GroupVersion) error {
 }
 ```
 
-这里对CRD构造了apiGroup和APIResource列表，并注册了apiGroup和apiVersion的路由：
+sync枚举CRD，根据CRD构建Custom Resource对应apiResource(apiResourcesForDiscovery)以及apiVersions(apiVersionsForDiscovery)
 
 ```go
 // k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/discovery/group.go:38
@@ -1019,44 +900,40 @@ func (s *APIGroupHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 ```
 
-1、**上述代码注册了apiGroup的路由，返回某个api group下所有版本信息**，如下：
+1、**上述代码注册了Custom Resource apiGroup的路由，返回某个api group下所有版本信息**
 
 ```go
 apiGroup := metav1.APIGroup{
-		Name:     version.Group,
-		Versions: apiVersionsForDiscovery,
-		// the preferred versions for a group is the first item in
-		// apiVersionsForDiscovery after it put in the right ordered
-		PreferredVersion: apiVersionsForDiscovery[0],
-	}
+    Name:     version.Group,
+    Versions: apiVersionsForDiscovery,
+    // the preferred versions for a group is the first item in
+    // apiVersionsForDiscovery after it put in the right ordered
+    PreferredVersion: apiVersionsForDiscovery[0],
+}
 ```
 
 返回如下：
 
 ```bash
-$ curl http://localhost:8080/apis/apiextensions.k8s.io     
+$ curl http://localhost:8080/apis/duyanghao.example.com
 {
   "kind": "APIGroup",
   "apiVersion": "v1",
-  "name": "apiextensions.k8s.io",
+  "name": "duyanghao.example.com",
   "versions": [
     {
-      "groupVersion": "apiextensions.k8s.io/v1",
+      "groupVersion": "duyanghao.example.com/v1",
       "version": "v1"
-    },
-    {
-      "groupVersion": "apiextensions.k8s.io/v1beta1",
-      "version": "v1beta1"
     }
   ],
   "preferredVersion": {
-    "groupVersion": "apiextensions.k8s.io/v1",
+    "groupVersion": "duyanghao.example.com/v1",
     "version": "v1"
   }
 }
 ```
 
-2、**而如果要返回所有Kubernetes集群资源的版本信息**，则可以使用kubectl api-versions命令，对应代码如下：
+2、**而如果要返回所有Kubernetes集群资源的版本信息**，则可以使用`kubectl api-versions`命令，对应代码如下：
 
 ```go
 // New creates a new server which logically combines the handling chain with the passed server.
@@ -1311,10 +1188,10 @@ func (s *legacyRootAPIHandler) handle(req *restful.Request, resp *restful.Respon
 }
 ```
 
-注意这里会注册两种api versions路径路由：core group(/api)以及named groups(/apis)，如下：
+注意这里会注册两种api versions路径路由：`core group(/api)`以及`named groups(/apis)`，如下：
 
-```go
-# kubectl -v=8 api-versions 
+```bash
+$ kubectl -v=8 api-versions 
 I1211 11:44:50.276446   22493 loader.go:375] Config loaded from file:  /root/.kube/config
 I1211 11:44:50.277005   22493 round_trippers.go:420] GET https://127.0.0.1:6443/api?timeout=32s
 I1211 11:44:50.277026   22493 round_trippers.go:427] Request Headers:
@@ -1355,22 +1232,9 @@ storage.k8s.io/v1beta1
 v1
 ```
 
-可以看到对于kubectl api-versions命令，这里发出了两个请求，分别是https://127.0.0.1:6443/api以及https://127.0.0.1:6443/apis，并在最后将两个请求的返回结果进行了合并，如下：
+可以看到对于`kubectl api-versions`命令，发出了两个请求，分别是`https://127.0.0.1:6443/api`以及`https://127.0.0.1:6443/apis`，并在最后将两个请求的返回结果进行了合并
 
-```bash
-$ kubectl api-versions
-admissionregistration.k8s.io/v1
-admissionregistration.k8s.io/v1beta1
-apiextensions.k8s.io/v1
-apiextensions.k8s.io/v1beta1
-apiregistration.k8s.io/v1
-apiregistration.k8s.io/v1beta1
-apps/v1
-...
-v1
-```
-
-注意v1是/api接口的返回(metav1.APIVersions)；其它则是/apis的返回(metav1.APIGroup)
+注意上述结果中`v1`是`/api`接口的返回(`metav1.APIVersions`)；其它则是`/apis`的返回(`metav1.APIGroup`)，如下：
 
 ```go
 // APIGroup contains the name, the supported versions, and the preferred version
@@ -1416,7 +1280,7 @@ type APIVersions struct {
 }
 ```
 
-3、**如果要查询某个版本下的所有资源类型**，则需要看apiVersion的注册代码：
+3、**如果要查询某个版本下的所有资源类型**，则需要看apiResources的注册代码：
 
 ```go
 // k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/discovery/version.go:50
@@ -1495,7 +1359,7 @@ func (s staticLister) ListAPIResources() []metav1.APIResource {
 
 获取某个version下的所有apiResources：
 
-```go
+```bash
 $ GET http://127.0.0.1:8080/apis/apps/v1|python -m json.tool
 {
     "apiVersion": "v1",
@@ -1576,124 +1440,7 @@ $ GET http://127.0.0.1:8080/apis/apps/v1|python -m json.tool
                 "watch"
             ]
         },
-        {
-            "group": "autoscaling",
-            "kind": "Scale",
-            "name": "deployments/scale",
-            "namespaced": true,
-            "singularName": "",
-            "verbs": [
-                "get",
-                "patch",
-                "update"
-            ],
-            "version": "v1"
-        },
-        {
-            "kind": "Deployment",
-            "name": "deployments/status",
-            "namespaced": true,
-            "singularName": "",
-            "verbs": [
-                "get",
-                "patch",
-                "update"
-            ]
-        },
-        {
-            "categories": [
-                "all"
-            ],
-            "kind": "ReplicaSet",
-            "name": "replicasets",
-            "namespaced": true,
-            "shortNames": [
-                "rs"
-            ],
-            "singularName": "",
-            "storageVersionHash": "P1RzHs8/mWQ=",
-            "verbs": [
-                "create",
-                "delete",
-                "deletecollection",
-                "get",
-                "list",
-                "patch",
-                "update",
-                "watch"
-            ]
-        },
-        {
-            "group": "autoscaling",
-            "kind": "Scale",
-            "name": "replicasets/scale",
-            "namespaced": true,
-            "singularName": "",
-            "verbs": [
-                "get",
-                "patch",
-                "update"
-            ],
-            "version": "v1"
-        },
-        {
-            "kind": "ReplicaSet",
-            "name": "replicasets/status",
-            "namespaced": true,
-            "singularName": "",
-            "verbs": [
-                "get",
-                "patch",
-                "update"
-            ]
-        },
-        {
-            "categories": [
-                "all"
-            ],
-            "kind": "StatefulSet",
-            "name": "statefulsets",
-            "namespaced": true,
-            "shortNames": [
-                "sts"
-            ],
-            "singularName": "",
-            "storageVersionHash": "H+vl74LkKdo=",
-            "verbs": [
-                "create",
-                "delete",
-                "deletecollection",
-                "get",
-                "list",
-                "patch",
-                "update",
-                "watch"
-            ]
-        },
-        {
-            "group": "autoscaling",
-            "kind": "Scale",
-            "name": "statefulsets/scale",
-            "namespaced": true,
-            "singularName": "",
-            "verbs": [
-                "get",
-                "patch",
-                "update"
-            ],
-            "version": "v1"
-        },
-        {
-            "kind": "StatefulSet",
-            "name": "statefulsets/status",
-            "namespaced": true,
-            "singularName": "",
-            "verbs": [
-                "get",
-                "patch",
-                "update"
-            ]
-        }
+        ...
     ]
 }
 
@@ -1838,6 +1585,7 @@ $ curl http://127.0.0.1:8080/api/v1?timeout=32
 4、**kubectl api-resources命令就是先获取所有API版本信息，然后对每一个版本调用上述接口获取该版本下的所有API资源类型**
 
 ```bash
+$ kubectl -v=8 api-resources
 5077 loader.go:375] Config loaded from file:  /root/.kube/config
 I1211 15:19:47.593450   15077 round_trippers.go:420] GET https://127.0.0.1:6443/api?timeout=32s
 I1211 15:19:47.593470   15077 round_trippers.go:427] Request Headers:
@@ -1945,56 +1693,8 @@ volumeattachments                              storage.k8s.io                 fa
 
 #### establishingController
 
-`establishingController`：检查 crd 是否处于正常状态，可在 crd `.status.conditions` 中查看：
-
 ```go
-// New returns a new instance of CustomResourceDefinitions from the given config.
-func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*CustomResourceDefinitions, error) {
-	genericServer, err := c.GenericConfig.New("apiextensions-apiserver", delegationTarget)
-	if err != nil {
-		return nil, err
-	}
-
-	...
-
-	if err := s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo); err != nil {
-		return nil, err
-	}
-
-	crdClient, err := clientset.NewForConfig(s.GenericAPIServer.LoopbackClientConfig)
-	if err != nil {
-		// it's really bad that this is leaking here, but until we can fix the test (which I'm pretty sure isn't even testing what it wants to test),
-		// we need to be able to move forward
-		return nil, fmt.Errorf("failed to create clientset: %v", err)
-	}
-	s.Informers = externalinformers.NewSharedInformerFactory(crdClient, 5*time.Minute)
-
-	...
-	establishingController := establish.NewEstablishingController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
-		
-	...
-	s.GenericAPIServer.AddPostStartHookOrDie("start-apiextensions-controllers", func(context genericapiserver.PostStartHookContext) error {
-		// OpenAPIVersionedService and StaticOpenAPISpec are populated in generic apiserver PrepareRun().
-		// Together they serve the /openapi/v2 endpoint on a generic apiserver. A generic apiserver may
-		// choose to not enable OpenAPI by having null openAPIConfig, and thus OpenAPIVersionedService
-		// and StaticOpenAPISpec are both null. In that case we don't run the CRD OpenAPI controller.
-		if s.GenericAPIServer.OpenAPIVersionedService != nil && s.GenericAPIServer.StaticOpenAPISpec != nil {
-			go openapiController.Run(s.GenericAPIServer.StaticOpenAPISpec, s.GenericAPIServer.OpenAPIVersionedService, context.StopCh)
-		}
-
-		go crdController.Run(context.StopCh)
-		go namingController.Run(context.StopCh)
-		go establishingController.Run(context.StopCh)
-		go nonStructuralSchemaController.Run(5, context.StopCh)
-		go apiApprovalController.Run(5, context.StopCh)
-		go finalizingController.Run(5, context.StopCh)
-		return nil
-	})  
-	...
-
-	return s, nil
-}
-
+...
 // sync is used to turn CRDs into the Established state.
 func (ec *EstablishingController) sync(key string) error {
 	cachedCRD, err := ec.crdLister.Get(key)
@@ -2033,7 +1733,7 @@ func (ec *EstablishingController) sync(key string) error {
 }
 ```
 
-设置CRD status.Conditions，如下：
+establishingController会检查CRD是否处于正常状态，若不正常则设置CRD status.Conditions，如下：
 
 ```yaml
 apiVersion: apiextensions.k8s.io/v1
@@ -2110,7 +1810,7 @@ I1211 16:46:39.609812   32666 round_trippers.go:431]     Accept: application/jso
 No resources found in default namespace.
 ```
 
-对应CR的CRUD API server在哪里呢？比如这里，哪个apiserver处理Student CR资源的请求呢？
+对应CR的CRUD API server在哪里呢？比如这里，哪个apiserver处理Student CR资源的List请求呢？
 
 ![](../images/crd-apiserver-1.png)
 
@@ -2204,8 +1904,6 @@ func NewCustomResourceDefinitionHandler(
 
 	return ret, nil
 }
-
-
 ```
 
 这里看crdHandler的ServeHTTP处理逻辑：
@@ -2428,7 +2126,7 @@ func (r *crdHandler) serveResource(w http.ResponseWriter, req *http.Request, req
 	}
 ```
 
-最终执行ListResource如下：
+最终执行ListResource，如下：
 
 ```go
 // k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/endpoints/handlers/get.go:166
@@ -2548,7 +2246,7 @@ func ListResource(r rest.Lister, rw rest.Watcher, scope *RequestScope, forceWatc
 }
 ```
 
-该函数会调用List，如下：
+该函数会调用rest.List，如下：
 
 ```go
 // k8s.io/kubernetes/staging/src/k8s.io/apiextensions-apiserver/pkg/registry/customresource/etcd.go:114
@@ -2598,7 +2296,7 @@ func (e *Store) List(ctx context.Context, options *metainternalversion.ListOptio
 
 ![](../images/crd-apiserver-4.png)
 
-之后会执行transformResponseObject，如下：
+之后会执行`transformResponseObject`，如下：
 
 ```go
 // transformResponseObject takes an object loaded from storage and performs any necessary transformations.
@@ -2621,7 +2319,7 @@ func transformResponseObject(ctx context.Context, scope *RequestScope, trace *ut
 
 ![](../images/crd-apiserver-5.png)
 
-这里我们再重点分析一下`crdInfo, err := r.getOrCreateServingInfoFor(crd.UID, crd.Name)`：
+这里我们再回过头来重点分析一下`crdInfo, err := r.getOrCreateServingInfoFor(crd.UID, crd.Name)`：
 
 ```go
 // crdInfo stores enough information to serve the storage for the custom resource
@@ -2659,11 +2357,11 @@ type CustomResourceStorage struct {
 }
 ```
 
-其中spec是CRD定义内容，storages存放该CRD对应CR的后端存储处理函数，如下：
+其中spec是CRD定义内容，storages存放该CRD对应CR的后端存储，每个CR版本对应一项，如下：
 
 ![](../images/crd-apiserver-6.png)
 
-这里也即对student CR进行处理的后端为customresource.REST：
+也即对student CR进行处理的后端存储为`customresource.REST`：
 
 ```go
 // getOrCreateServingInfoFor gets the CRD serving info for the given CRD UID if the key exists in the storage map.
@@ -2753,21 +2451,19 @@ func (r *crdHandler) getOrCreateServingInfoFor(uid types.UID, name string) (*crd
 }
 ```
 
-这里会先获取crd，然后遍历crd.Spec.Version为该CR的每个版本设置storages，而具体kind如下：
+这里会先获取crd，然后遍历crd.Spec.Version为该CR的每个版本设置rest.Storage，而具体kind信息如下：
 
-Group：duyanghao.example.com
+* Group：duyanghao.example.com
+* Version：v1
+* Kind：Student
 
-Version：v1
+具体resource信息如下：
 
-Kind：Student
+* Group：duyanghao.example.com
+* Version：v1
+* Resource：students
 
-具体resource如下：
-
-Group：duyanghao.example.com
-
-Version：v1
-
-Resource：students
+在设置了CR对应的crdInfo之后，会将crdInfo存放于crdHandler.customStorage中，以便后续访问直接获取
 
 回到newREST，创建CR存储的地方，如下：
 
@@ -2808,28 +2504,7 @@ func newREST(resource schema.GroupResource, kind, listKind schema.GroupVersionKi
 }
 ```
 
-重点看NewFunc以及NewListFunc函数，如下：
-
-```go
-// Unstructured allows objects that do not have Golang structs registered to be manipulated
-// generically. This can be used to deal with the API objects from a plug-in. Unstructured
-// objects still have functioning TypeMeta features-- kind, version, etc.
-//
-// WARNING: This object has accessors for the v1 standard metadata. You *MUST NOT* use this
-// type if you are dealing with objects that are not in the server meta v1 schema.
-//
-// TODO: make the serialization part of this type distinct from the field accessors.
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-// +k8s:deepcopy-gen=true
-type Unstructured struct {
-	// Object is a JSON compatible map with string, float, int, bool, []interface{}, or
-	// map[string]interface{}
-	// children.
-	Object map[string]interface{}
-}
-```
-
-对与NewFunc函数来说，该函数功能是返回CR实例，由于CR在Kubernetes代码中并没有具体结构体定义，所以这里会先初始化一个范型结构体Unstructured，并对该结构题进行SetGroupVersionKind操作，如下：
+对于NewFunc函数来说，该函数功能是返回CR实例，由于CR在Kubernetes代码中并没有具体结构体定义，所以这里会先初始化一个范型结构体Unstructured(可以存储所有类型的CR)，并对该结构体设置CR对应的apiVersion(Group/Version)以及kind(资源类型)字段，如下：
 
 ```go
 func (u *Unstructured) SetGroupVersionKind(gvk schema.GroupVersionKind) {
@@ -2904,7 +2579,6 @@ func setNestedFieldNoCopy(obj map[string]interface{}, value interface{}, fields 
 总结CR CRUD APIServer处理逻辑如下：
 
 * createAPIExtensionsServer=>NewCustomResourceDefinitionHandler=>crdHandler=>注册CR CRUD API接口：
-
   ```go
   // New returns a new instance of CustomResourceDefinitions from the given config.
   func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*CustomResourceDefinitions, error) {
@@ -2935,167 +2609,31 @@ func setNestedFieldNoCopy(obj map[string]interface{}, value interface{}, fields 
   	return s, nil
   }
   ```
-
 * crdHandler处理逻辑如下：
   * 解析req(GET /apis/duyanghao.example.com/v1/namespaces/default/students)，根据请求路径中的group(duyanghao.example.com)，version(v1)，以及resource字段(students)获取对应CRD内容(crd, err := r.crdLister.Get(crdName))
   * 通过crd.UID以及crd.Name获取crdInfo，若不存在则创建对应的crdInfo(crdInfo, err := r.getOrCreateServingInfoFor(crd.UID, crd.Name))。crdInfo中包含了CRD定义以及该CRD对应Custom Resource的customresource.REST storage
-  * customresource.REST storage由CR对应的Group(duyanghao.example.com)，Version(v1)，Kind(Student)，Resource(students)等创建完成，由于CR在Kubernetes代码中并没有具体结构体定义，所以这里会先初始化一个范型结构体Unstructured(用户保存所有类型的Custom Resource)，并对该结构题进行SetGroupVersionKind操作(设置具体Custom Resource Type)
-  * 从customresource.REST storage获取Unstructured后会对该结构体进行转换然后返回 
+  * customresource.REST storage由CR对应的Group(duyanghao.example.com)，Version(v1)，Kind(Student)，Resource(students)等创建完成，由于CR在Kubernetes代码中并没有具体结构体定义，所以这里会先初始化一个范型结构体Unstructured(用于保存所有类型的Custom Resource)，并对该结构体进行SetGroupVersionKind操作(设置具体Custom Resource Type)
+  * 从customresource.REST storage获取Unstructured结构体后会对其进行相应转换然后返回 
 
 ## 总结
 
 * Custom Resource，简称CR，是Kubernetes自定义资源类型，与之相对应的就是Kubernetes内置的各种资源类型，例如Pod、Service等。利用CR我们可以定义任何想要的资源类型
-
-* CRD通过yaml文件的形式向Kubernetes注册CR实现api-resource，属于第二种扩展Kubernetes API资源的方式，也是普遍使用的一种
-
-* APIExtensionServer 作为 kube-apiserver Delegation 链的最后一层，是处理所有用户通过 Custom Resource Definition 定义的资源服务器
-
-* `crdRegistrationController`负责将 CRD GroupVersions 自动注册到 APIServices 中。具体逻辑：枚举所有CRDs，然后根据CRD定义的crd.Spec.Group以及crd.Spec.Versions字段构建APIService，并添加到autoRegisterController.apiServicesToSync中，由autoRegisterController进行创建以及维护操作。这也是为什么创建完CRD后会产生对应的APIService对象
-
-* APIExtensionServer包含的 controller 以及功能如下所示：
-
+* CRD通过yaml文件的形式向Kubernetes注册CR实现自定义api-resources，属于第二种扩展Kubernetes API资源的方式，也是普遍使用的一种
+* APIExtensionServer负责CustomResourceDefinition（CRD）apiResources以及apiVersions的注册，同时处理CRD以及相应CustomResource（CR）的REST请求(如果对应CR不能被处理的话则会返回404)，也是apiserver Delegation的最后一环
+* `crdRegistrationController`负责将CRD GroupVersions自动注册到APIServices中。具体逻辑为：枚举所有CRDs，然后根据CRD定义的crd.Spec.Group以及crd.Spec.Versions字段构建APIService，并添加到autoRegisterController.apiServicesToSync中，由autoRegisterController进行创建以及维护操作。这也是为什么创建完CRD后会产生对应的APIService对象
+* APIExtensionServer包含的controller以及功能如下所示：
   - `openapiController`：将 crd 资源的变化同步至提供的 OpenAPI 文档，可通过访问 `/openapi/v2` 进行查看；
-
-  - `crdController`：负责将 crd 信息注册到 apiVersions 和 apiResources 中，两者的信息可通过 `$ kubectl api-versions` 和 `$ kubectl api-resources` 查看；
-
-    * kubectl api-versions命令返回所有Kubernetes集群资源的版本信息(对于kubectl api-versions命令，这里发出了两个请求，分别是https://127.0.0.1:6443/api以及https://127.0.0.1:6443/apis，并在最后将两个请求的返回结果进行了合并)
-
-      ```bash
-      $ kubectl api-versions
-      admissionregistration.k8s.io/v1
-      admissionregistration.k8s.io/v1beta1
-      apiextensions.k8s.io/v1
-      apiextensions.k8s.io/v1beta1
-      apiregistration.k8s.io/v1
-      apiregistration.k8s.io/v1beta1
-      apps/v1
-      ...
-      v1
-      ```
-
-    * kubectl api-resources命令就是先获取所有API版本信息，然后对每一个版本调用上述接口获取该版本下的所有API资源类型
-
-      ```bash
-      5077 loader.go:375] Config loaded from file:  /root/.kube/config
-      I1211 15:19:47.593450   15077 round_trippers.go:420] GET https://127.0.0.1:6443/api?timeout=32s
-      I1211 15:19:47.593470   15077 round_trippers.go:427] Request Headers:
-      I1211 15:19:47.593480   15077 round_trippers.go:431]     Accept: application/json, */*
-      I1211 15:19:47.593489   15077 round_trippers.go:431]     User-Agent: kubectl/v1.18.3 (linux/amd64) kubernetes/2e7996e
-      I1211 15:19:47.593522   15077 round_trippers.go:431]     Authorization: Bearer <masked>
-      I1211 15:19:47.598055   15077 round_trippers.go:446] Response Status: 200 OK in 4 milliseconds
-      I1211 15:19:47.598077   15077 round_trippers.go:449] Response Headers:
-      I1211 15:19:47.598088   15077 round_trippers.go:452]     Cache-Control: no-cache, private
-      I1211 15:19:47.598120   15077 round_trippers.go:452]     Content-Type: application/json
-      I1211 15:19:47.598131   15077 round_trippers.go:452]     Content-Length: 135
-      I1211 15:19:47.598147   15077 round_trippers.go:452]     Date: Fri, 11 Dec 2020 07:19:47 GMT
-      I1211 15:19:47.602273   15077 request.go:1068] Response Body: {"kind":"APIVersions","versions":["v1"],"serverAddressByClientCIDRs":[{"clientCIDR":"0.0.0.0/0","serverAddress":"x.x.x.x:6443"}]}
-      I1211 15:19:47.606279   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis?timeout=32s
-      I1211 15:19:47.606299   15077 round_trippers.go:427] Request Headers:
-      I1211 15:19:47.606334   15077 round_trippers.go:431]     Accept: application/json, */*
-      I1211 15:19:47.606343   15077 round_trippers.go:431]     User-Agent: kubectl/v1.18.3 (linux/amd64) kubernetes/2e7996e
-      I1211 15:19:47.606362   15077 round_trippers.go:431]     Authorization: Bearer <masked>
-      I1211 15:19:47.607007   15077 round_trippers.go:446] Response Status: 200 OK in 0 milliseconds
-      I1211 15:19:47.607028   15077 round_trippers.go:449] Response Headers:
-      I1211 15:19:47.607058   15077 round_trippers.go:452]     Date: Fri, 11 Dec 2020 07:19:47 GMT
-      I1211 15:19:47.607070   15077 round_trippers.go:452]     Cache-Control: no-cache, private
-      I1211 15:19:47.607089   15077 round_trippers.go:452]     Content-Type: application/json
-      I1211 15:19:47.610333   15077 request.go:1068] Response Body: {"kind":"APIGroupList","apiVersion":"v1","groups":[{"name":"apiregistration.k8s.io","versions":[{"groupVersion":"apiregistration.k8s.io/v1","version":"v1"},{"groupVersion":"apiregistration.k8s.io/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"apiregistration.k8s.io/v1","version":"v1"}},{"name":"extensions","versions":[{"groupVersion":"extensions/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"extensions/v1beta1","version":"v1beta1"}},{"name":"apps","versions":[{"groupVersion":"apps/v1","version":"v1"}],"preferredVersion":{"groupVersion":"apps/v1","version":"v1"}},{"name":"events.k8s.io","versions":[{"groupVersion":"events.k8s.io/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"events.k8s.io/v1beta1","version":"v1beta1"}},{"name":"authentication.k8s.io","versions":[{"groupVersion":"authentication.k8s.io/v1","version":"v1"},{"groupVersion":"authentication.k8s.io/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"authentication.k8s.io/v1"," [truncated 4985 chars]
-      I1211 15:19:47.614700   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/batch/v1?timeout=32s
-      I1211 15:19:47.614804   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/authentication.k8s.io/v1?timeout=32s
-      I1211 15:19:47.615687   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/auth.tkestack.io/v1?timeout=32s
-      https://127.0.0.1:6443/apis/authentication.k8s.io/v1beta1?timeout=32s
-      I1211 15:19:47.616794   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/coordination.k8s.io/v1?timeout=32s
-      I1211 15:19:47.616863   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/apps/v1?timeout=32s
-      I1211 15:19:47.616877   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/scheduling.k8s.io/v1beta1?timeout=32s
-      I1211 15:19:47.617128   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/networking.k8s.io/v1beta1?timeout=32s
-      ...
-      I1211 15:19:47.617555   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/monitor.tkestack.io/v1?timeout=32s
-      I1211 15:19:47.616542   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/networking.k8s.io/v1?timeout=32s
-      I1211 15:19:47.617327   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/coordination.k8s.io/v1beta1?timeout=32s
-      I1211 15:19:47.617412   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/monitoring.coreos.com/v1?timeout=32s
-      I1211 15:19:47.617385   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/autoscaling/v2beta2?timeout=32s
-      I1211 15:19:47.617852   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/discovery.k8s.io/v1beta1?timeout=32s
-      I1211 15:19:47.618032   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/admissionregistration.k8s.io/v1?timeout=32s
-      I1211 15:19:47.618125   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/apiregistration.k8s.io/v1?timeout=32s
-      I1211 15:19:47.618317   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/authorization.k8s.io/v1beta1?timeout=32s
-      I1211 15:19:47.616968   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/policy/v1beta1?timeout=32s
-      I1211 15:19:47.617138   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/configuration.konghq.com/v1?timeout=32s
-      I1211 15:19:47.616526   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/metrics.k8s.io/v1beta1?timeout=32s
-      I1211 15:19:47.616789   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/events.k8s.io/v1beta1?timeout=32s
-      I1211 15:19:47.618075   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/storage.k8s.io/v1beta1?timeout=32s
-      I1211 15:19:47.618612   15077 round_trippers.go:420] GET https://127.0.0.1:6443/api/v1?timeout=32s
-      I1211 15:19:47.618268   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/notify.tkestack.io/v1?timeout=32s
-      I1211 15:19:47.618631   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/apiextensions.k8s.io/v1beta1?timeout=32s
-      I1211 15:19:47.616594   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/node.k8s.io/v1beta1?timeout=32s
-      I1211 15:19:47.616595   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/storage.k8s.io/v1?timeout=32s
-      I1211 15:19:47.619458   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/apiregistration.k8s.io/v1beta1?timeout=32s
-      I1211 15:19:47.619586   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/platform.tkestack.io/v1?timeout=32s
-      I1211 15:19:47.616973   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/authorization.k8s.io/v1?timeout=32s
-      ...
-      I1211 15:19:47.617240   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/duyanghao.example.com/v1?timeout=32s
-      I1211 15:19:47.617305   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/autoscaling/v2beta1?timeout=32s
-      I1211 15:19:47.617321   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/rbac.authorization.k8s.io/v1beta1?timeout=32s
-      I1211 15:19:47.617428   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/admissionregistration.k8s.io/v1beta1?timeout=32s
-      I1211 15:19:47.617362   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/extensions/v1beta1?timeout=32s
-      I1211 15:19:47.616554   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/scheduling.k8s.io/v1?timeout=32s
-      I1211 15:19:47.618275   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/rbac.authorization.k8s.io/v1?timeout=32s
-      I1211 15:19:47.618349   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/batch/v1beta1?timeout=32s
-      I1211 15:19:47.618724   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/apiextensions.k8s.io/v1?timeout=32s
-      I1211 15:19:47.618903   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/certificates.k8s.io/v1beta1?timeout=32s
-      I1211 15:19:47.616721   15077 round_trippers.go:420] GET https://127.0.0.1:6443/apis/autoscaling/v1?timeout=32s
-      ...
-      NAME                              SHORTNAMES   APIGROUP                       NAMESPACED   KIND
-      bindings                                                                      true         Binding
-      componentstatuses                 cs                                          false        ComponentStatus
-      configmaps                        cm                                          true         ConfigMap
-      endpoints                         ep                                          true         Endpoints
-      events                            ev                                          true         Event
-      limitranges                       limits                                      true         LimitRange
-      namespaces                        ns                                          false        Namespace
-      nodes                             no                                          false        Node
-      persistentvolumeclaims            pvc                                         true         PersistentVolumeClaim
-      persistentvolumes                 pv                                          false        PersistentVolume
-      pods                              po                                          true         Pod
-      podtemplates                                                                  true         PodTemplate
-      replicationcontrollers            rc                                          true         ReplicationController
-      resourcequotas                    quota                                       true         ResourceQuota
-      secrets                                                                       true         Secret
-      serviceaccounts                   sa                                          true         ServiceAccount
-      services                          svc                                         true         Service
-      customresourcedefinitions         crd,crds     apiextensions.k8s.io           false        CustomResourceDefinition
-      apiservices                                    apiregistration.k8s.io         false        APIService
-      controllerrevisions                            apps                           true         ControllerRevision
-      daemonsets                        ds           apps                           true         DaemonSet
-      deployments                       deploy       apps                           true         Deployment
-      replicasets                       rs           apps                           true         ReplicaSet
-      statefulsets                      sts          apps                           true         StatefulSet
-      HorizontalPodAutoscaler
-      cronjobs                          cj           batch                          true         CronJob
-      jobs                                           batch                          true         Job
-      leases                                         coordination.k8s.io            true         Lease
-      endpointslices                                 discovery.k8s.io               true         EndpointSlice
-      projects                                       duyanghao.example.com          true         Project
-      ...
-      csinodes                                       storage.k8s.io                 false        CSINode
-      storageclasses                    sc           storage.k8s.io                 false        StorageClass
-      volumeattachments                              storage.k8s.io                 false        VolumeAttachment
-      ```
-
+  - `crdController`：负责将 crd 信息注册到 apiVersions 和 apiResources 中，两者的信息可通过 `kubectl api-versions` 和 `kubectl api-resources` 查看：
+    * `kubectl api-versions`命令返回所有Kubernetes集群资源的版本信息(实际发出了两个请求，分别是`https://127.0.0.1:6443/api`以及`https://127.0.0.1:6443/apis`，并在最后将两个请求的返回结果进行了合并)
+    * `kubectl api-resources`命令就是先获取所有API版本信息，然后对每一个API版本调用接口获取该版本下的所有API资源类型
   - `namingController`：检查 crd obj 中是否有命名冲突，可在 crd `.status.conditions` 中查看；
-
   - `establishingController`：检查 crd 是否处于正常状态，可在 crd `.status.conditions` 中查看；
-
   - `nonStructuralSchemaController`：检查 crd obj 结构是否正常，可在 crd `.status.conditions` 中查看；
-
   - `apiApprovalController`：检查 crd 是否遵循 Kubernetes API 声明策略，可在 crd `.status.conditions` 中查看；
-
   - `finalizingController`：类似于 finalizes 的功能，与 CRs 的删除有关；
-
 * 总结CR CRUD APIServer处理逻辑如下：
-
   - createAPIExtensionsServer=>NewCustomResourceDefinitionHandler=>crdHandler=>注册CR CRUD API接口：
-
-    ```
+    ```go
     // New returns a new instance of CustomResourceDefinitions from the given config.
     func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*CustomResourceDefinitions, error) {
     	...
@@ -3125,11 +2663,8 @@ func setNestedFieldNoCopy(obj map[string]interface{}, value interface{}, fields 
     	return s, nil
     }
     ```
-
   - crdHandler处理逻辑如下：
-
     - 解析req(GET /apis/duyanghao.example.com/v1/namespaces/default/students)，根据请求路径中的group(duyanghao.example.com)，version(v1)，以及resource字段(students)获取对应CRD内容(crd, err := r.crdLister.Get(crdName))
     - 通过crd.UID以及crd.Name获取crdInfo，若不存在则创建对应的crdInfo(crdInfo, err := r.getOrCreateServingInfoFor(crd.UID, crd.Name))。crdInfo中包含了CRD定义以及该CRD对应Custom Resource的customresource.REST storage
-    - customresource.REST storage由CR对应的Group(duyanghao.example.com)，Version(v1)，Kind(Student)，Resource(students)等创建完成，由于CR在Kubernetes代码中并没有具体结构体定义，所以这里会先初始化一个范型结构体Unstructured(用户保存所有类型的Custom Resource)，并对该结构题进行SetGroupVersionKind操作(设置具体Custom Resource Type)
-    - 从customresource.REST storage获取Unstructured后会对该结构体进行转换然后返回
-
+    - customresource.REST storage由CR对应的Group(duyanghao.example.com)，Version(v1)，Kind(Student)，Resource(students)等创建完成，由于CR在Kubernetes代码中并没有具体结构体定义，所以这里会先初始化一个范型结构体Unstructured(用于保存所有类型的Custom Resource)，并对该结构体进行SetGroupVersionKind操作(设置具体Custom Resource Type)
+    - 从customresource.REST storage获取Unstructured结构体后会对其进行相应转换然后返回

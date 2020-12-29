@@ -1,7 +1,7 @@
-tke-edge源码分析
+superedge源码分析
 ===============
 
-tke-edge reading notes based on main branch of [superedge/superedge](https://github.com/superedge/superedge)
+superedge reading notes based on main branch of [superedge/superedge](https://github.com/superedge/superedge)
 
 **Stay tuned as this evolves!**
 

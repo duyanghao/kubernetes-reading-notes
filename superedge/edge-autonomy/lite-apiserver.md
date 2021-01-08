@@ -1482,3 +1482,22 @@ func (c *RequestCacheController) DeleteRequest(req *http.Request, userAgent stri
 
 ## 总结
 
+* superedge是以lite-apiserver机制为基础，并结合分布式健康检查等机制，保证了边缘容器集群在弱网环境下的网络可靠性
+
+* 对于边缘节点的组件，lite-apiserver提供的功能就是kube-apiserver，但是一方面lite-apiserver只对本节点有效，另一方面资源占用很少。在网络通畅的情况下，lite-apiserver组件对于节点组件来说是透明的；而当网络异常情况，lite-apiserver组件会把本节点需要的数据返回给节点上组件，保证节点组件不会受网络异常情况影响
+
+  ![img](https://github.com/superedge/superedge/raw/main/docs/img/lite-apiserver.png)
+
+* EdgeServerHandler是lite-apiserver请求入口，在EdgeServerHandler.ServeHTTP中会对每个请求生成相应的EdgeReverseProxy负责该请求的具体处理
+
+* EdgeReverseProxy用来反向代理请求，将请求发送给云端kube-apiserver，并将回应转发给client，关键字段含义如下：
+
+  * Director：用来对原始请求(对lite-apiserver的请求)进行修改(对URL Host以及Scheme替换了)，转化为对云端kube-apiserver的请求
+
+  * Transport：对云端kube-apiserver进行实际请求的http.RoundTripper
+  * FlushInterval：指定了EdgeReverseProxy返回Response的flush周期
+  * ModifyResponse：ModifyResponse对从云端kube-apiserver返回后的Response进行修改，无论Response status code是什么值，具体来说就是将从云端kube-apiserver返回的Response进行了cache；只有当云端kube-apiserver不可访问时(backend is unreachable)，ModifyResponse不会进行调用，转用ErrorHandler进行处理。另外，如果ModifyResponse执行失败，返回错误了，也会调用ErrorHandler对该错误进行处理
+  * ErrorHandler：用来当backend server不可达以及ModifyResponse执行失败时调用，如果没有设置，默认处理行为是打印error并返回502 Status Bad Gateway response。这里的逻辑是：根据请求从本地cache对应的文件中读取内容，转化为EdgeResponseDataHolder格式，并将EdgeResponseDataHolder中记录的内容写入http.Response相应字段，也即从cache读取Response并返回给client端
+
+* RequestCacheController.listRequestMap用于存放所有资源的List请求，而RequestCacheController.watchRequestMap用于存放所有资源的Watch请求。RequestCacheController的作用就是不断同步List-Watch请求返回，保持List请求返回是最新的；而handlerError中如果遇到Watch请求失败，则会执行DeleteRequest删除RequestCacheController.listRequestMap以及RequestCacheController.watchRequestMap中相应请求的记录，因为如果Watch失败，则可以认为云端kube-apiserver访问出现问题，没有必要再进行同步了，同时也同步不了，还是读的缓存
+

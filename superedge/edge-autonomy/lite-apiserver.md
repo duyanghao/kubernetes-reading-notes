@@ -345,6 +345,33 @@ func(w http.ResponseWriter, req *http.Request) {
 		handler.ServeHTTP(w, req)
 }
 
+// github.com/superedge/superedge/vendor/k8s.io/apiserver/pkg/endpoints/request/requestinfo.go:41
+// RequestInfo holds information parsed from the http.Request
+type RequestInfo struct {
+	// IsResourceRequest indicates whether or not the request is for an API resource or subresource
+	IsResourceRequest bool
+	// Path is the URL path of the request
+	Path string
+	// Verb is the kube verb associated with the request for API requests, not the http verb.  This includes things like list and watch.
+	// for non-resource requests, this is the lowercase http verb
+	Verb string
+
+	APIPrefix  string
+	APIGroup   string
+	APIVersion string
+	Namespace  string
+	// Resource is the name of the resource being requested.  This is not the kind.  For example: pods
+	Resource string
+	// Subresource is the name of the subresource being requested.  This is a different resource, scoped to the parent resource, but it may have a different kind.
+	// For instance, /pods has the resource "pods" and the kind "Pod", while /pods/foo/status has the resource "pods", the sub resource "status", and the kind "Pod"
+	// (because status operates on pods). The binding resource for a pod though may be /pods/foo/binding, which has resource "pods", subresource "binding", and kind "Binding".
+	Subresource string
+	// Name is empty for some verbs, but if the request directly indicates a name (not in body content) then this field is filled in.
+	Name string
+	// Parts are the path parts for the request, always starting with /{resource}/{name}
+	Parts []string
+}
+
 // TODO write an integration test against the swagger doc to test the RequestInfo and match up behavior to responses
 // NewRequestInfo returns the information from the http request.  If error is not nil, RequestInfo holds the information as best it is known before the failure
 // It handles both resource and non-resource requests and fills in all the pertinent information for each.
@@ -505,9 +532,34 @@ func (r *RequestInfoFactory) NewRequestInfo(req *http.Request) (*RequestInfo, er
 
 	return &requestInfo, nil
 }
+
+...
+// github.com/superedge/superedge/pkg/lite-apiserver/proxy/proxy.go:287
+func getRequestProperties(r *http.Request) (isList bool, isWatch bool, needCache bool) {
+	info, ok := apirequest.RequestInfoFrom(r.Context())
+	if ok {
+		isList = info.Verb == VerbList
+		isWatch = info.Verb == VerbWatch
+
+		klog.V(4).Infof("request resourceInfo=%+v", info)
+
+		// only cache resource request
+		if info.IsResourceRequest {
+			needCache = true
+			if isWatch || r.Method != http.MethodGet {
+				needCache = false
+			} else if info.Subresource == "log" {
+				// do not cache logs
+				needCache = false
+			}
+		}
+	}
+
+	return isList, isWatch, needCache
+}
 ```
 
-最终转发给EdgeServerHandler.ServeHTTP处理，如下：
+这里会先解析Request构建Kubernetes RequestInfo，然后通过context.WithValue将RequestInfo填入req.ctx，目的是后续请求处理过程中会使用RequestInfo(proxy.getRequestProperties)，并最终转发给EdgeServerHandler.ServeHTTP处理，如下：
 
 ```go
 func (h *EdgeServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -940,3 +992,419 @@ func (holder *EdgeResponseDataHolder) Input(in []byte) error {
 
 可以看到根据请求从cache对应的文件中读取内容，转化为EdgeResponseDataHolder格式，并将EdgeResponseDataHolder中记录的内容写入http.Response相应字段，也即从cache读取Response并返回给client端
 
+总结：EdgeServerHandler负责所有lite-apiserver请求入口，在EdgeServerHandler.ServeHTTP中会对每个请求生成相应的EdgeReverseProxy负责请求具体处理逻辑
+
+### RequestCacheController
+
+接下来分析流程图中上面的一个部分RequestCacheController：
+
+![](images/lite-apiserver-cache.png)
+
+回到lite-apiserver启动总入口：
+
+```go
+func (s *LiteServer) Run() error {
+
+	...
+	cacher := proxy.NewRequestCacheController(s.ServerConfig, certManager)
+	go cacher.Run(s.stopCh)
+	...
+	//select {
+	//case <-s.stopCh:
+	//	klog.Info("Received a program exit signal")
+	//	return nil
+	//}
+	<-s.stopCh
+	klog.Info("Received a program exit signal")
+	return nil
+}
+```
+
+可以看到这里起了一个goroutine跑RequestCacheController，下面分析RequestCacheController：
+
+```go
+// github.com/superedge/superedge/pkg/lite-apiserver/proxy/controller.go:98
+// RequestCacheController caches all 'get request' and 'watch request' info.
+type RequestCacheController struct {
+	listRequestMap  map[string][]*holder
+	watchRequestMap map[string]*http.Request
+
+	syncTime time.Duration
+	url      string
+
+	lock sync.Mutex
+
+	requestCh   chan *http.Request
+	certManager *cert.CertManager
+}
+
+func NewRequestCacheController(config *config.LiteServerConfig, certManager *cert.CertManager) *RequestCacheController {
+	c := &RequestCacheController{
+		listRequestMap:  make(map[string][]*holder),
+		watchRequestMap: make(map[string]*http.Request),
+		syncTime:        config.SyncDuration,
+		url:             fmt.Sprintf("https://127.0.0.1:%d", config.Port),
+		certManager:     certManager,
+	}
+	c.requestCh = make(chan *http.Request, 100)
+	return c
+}
+
+func (c *RequestCacheController) Run(stopCh <-chan struct{}) {
+	klog.Infof("Request cache controller begin run")
+	go c.runGC(stopCh)
+	for {
+		select {
+		case <-stopCh:
+			klog.Infof("Receive stop channel, exit request cache controller")
+			return
+		case r := <-c.requestCh:
+			klog.V(2).Infof("Update list request, url %s", r.URL.String())
+			go c.doRequest(r)
+		}
+	}
+}
+```
+
+RequestCacheController主逻辑是从requestCh channel中获取http请求，然后调用doRequest进行处理，这里我们先看看requestCh channel的请求从哪里来？
+
+```go
+// Get:
+// Path /api/v1/services
+// RawQuery limit=500&resourceVersion=0
+//
+// Watch:
+// Path /api/v1/services
+// RawQuery allowWatchBookmarks=true&resourceVersion=1886882&timeout=8m1s&timeoutSeconds=481&watch=true
+//
+// we check request pair by url.path
+func (c *RequestCacheController) AddRequest(r *http.Request, userAgent string, list bool, watch bool) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if watch {
+		klog.V(4).Infof("Receive watch request (%s, %s)", userAgent, r.URL)
+		c.addWatchRequest(r, userAgent)
+		return
+	}
+
+	if list {
+		klog.V(4).Infof("Receive list request (%s, %s)", userAgent, r.URL)
+		c.addListRequest(r, userAgent)
+		return
+	}
+}
+
+...
+func NewEdgeReverseProxy(r *http.Request, manager *cert.CertManager, backendUrl string, backendPort int, timeout int, s storage.Storage, cacher *RequestCacheController) *EdgeReverseProxy {
+	isList, isWatch, needCache := getRequestProperties(r)
+	p := &EdgeReverseProxy{
+		certManager: manager,
+		backendPort: backendPort,
+		backendUrl:  backendUrl,
+		timeout:     timeout,
+		method:      r.Method,
+		urlString:   r.URL.String(),
+		storage:     s,
+		cacher:      cacher,
+
+		watch:     isWatch,
+		list:      isList,
+		needCache: needCache,
+	}  
+	...
+  
+	val := r.Header.Get(EdgeUpdateHeader)
+	if len(val) != 0 {
+		p.selfUpdate = true
+		klog.V(4).Infof("Receive self update request, url->%s, time %s", r.URL.String(), val)
+		r.Header.Del(EdgeUpdateHeader)
+	}
+
+	if (p.list || p.watch) && !p.selfUpdate {
+		p.cacher.AddRequest(r, p.userAgent, p.list, p.watch)
+	}
+
+	klog.V(2).Infof("Create new reverse proxy, userAgent->%s, method->%s, url->%s", p.userAgent, p.method, p.urlString)
+	return p
+}
+```
+
+对于每个lite-apiserver接受到的请求，如果是List或者Watch请求，则调用AddRequest将请求添加到RequestCacheController.requestCh中，如下：
+
+```go
+func (c *RequestCacheController) addListRequest(req *http.Request, userAgent string) {
+	key := c.key(userAgent, req.URL.Path)
+
+	_, e := c.listRequestMap[key]
+	if !e {
+		klog.Infof("Add new list request %s", key)
+		h := newHolder(req, key, c.syncTime, c.requestCh)
+		c.listRequestMap[key] = []*holder{h}
+		return
+	}
+}
+
+func (c *RequestCacheController) addWatchRequest(req *http.Request, userAgent string) {
+	key := c.key(userAgent, req.URL.Path)
+
+	holderList, e := c.listRequestMap[key]
+	if !e {
+		klog.Infof("Only watch request, ignore it %s", key)
+		return
+	}
+
+	for i := range holderList {
+		holderList[i].start()
+	}
+
+	klog.V(2).Infof("Create or update watch request %s", key)
+	c.watchRequestMap[key] = req
+}
+
+func (c *RequestCacheController) key(userAgent string, path string) string {
+	return fmt.Sprintf("%s_%s", userAgent, path)
+}
+```
+
+这里addListRequest会根据List请求创建holder，并存放于listRequestMap中，key由Request.UserAgent以及Request.URL.Path拼接而成，eg：`xxx_api/v1/namespaces/default/pods`，value为[]*holder{h}，实际只有一个元素
+
+而addWatchRequest会先判断该Watch请求是否有对应的List请求，如果有，则执行holder.start；并将Watch请求添加到watchRequestMap中，接下来看holder.start逻辑：
+
+```go
+func (h *holder) start() {
+	if h.isStart {
+		return
+	}
+	klog.V(2).Infof("Start holder %s", h.key)
+	h.isStart = true
+	h.ticker = time.NewTicker(h.syncTime)
+	go h.run()
+}
+
+func (h *holder) run() {
+	klog.V(4).Infof("Begin to run holder %s", h.key)
+	for {
+		select {
+		case <-h.stopCh:
+			klog.Infof("Stop holder %s loop", h.key)
+			return
+		case <-h.ticker.C:
+			h.requestCh <- h.request
+		}
+	}
+}
+```
+
+holder.run会每隔syncTime时间将请求塞到RequestCacheController.requestCh，下面看RequestCacheController.doRequest逻辑：
+
+```go
+func (c *RequestCacheController) doRequest(r *http.Request) {
+	var commonName string
+	var tr *http.Transport
+	if r.TLS != nil {
+		for _, cert := range r.TLS.PeerCertificates {
+			if !cert.IsCA {
+				commonName = cert.Subject.CommonName
+				break
+			}
+		}
+	}
+
+	if len(commonName) == 0 {
+		tr = c.certManager.DefaultTransport()
+	} else {
+		tr = c.certManager.Load(commonName)
+		if tr == nil {
+			tr = c.certManager.DefaultTransport()
+		}
+	}
+	client := http.Client{
+		Transport: tr,
+	}
+
+	newReq, err := http.NewRequest(r.Method, fmt.Sprintf("%s%s", c.url, r.URL.String()), bytes.NewReader([]byte{}))
+	if err != nil {
+		klog.Errorf("parse path error %v", err)
+		return
+	}
+	CopyHeader(newReq.Header, r.Header)
+	newReq.Header.Set(EdgeUpdateHeader, time.Now().String())
+	defer newReq.Body.Close()
+
+	resp, err := client.Do(newReq)
+	if err != nil {
+		klog.Errorf("auto update request do err %v", err)
+	}
+	defer func() {
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
+	if _, err := io.Copy(ioutil.Discard, resp.Body); err != nil {
+		klog.Errorf("io copy err: %s", err.Error())
+	}
+}
+```
+
+doRequest会根据http.Request构建对lite-apiserver的请求，并添加报头：`EdgeUpdateHeader: time.Now().String()`标识是RequestCacheController发出的请求，用于更新缓存(注意这里p.selfUpdate为true)：
+
+```go
+func NewEdgeReverseProxy(r *http.Request, manager *cert.CertManager, backendUrl string, backendPort int, timeout int, s storage.Storage, cacher *RequestCacheController) *EdgeReverseProxy {
+	isList, isWatch, needCache := getRequestProperties(r)
+	p := &EdgeReverseProxy{
+		certManager: manager,
+		backendPort: backendPort,
+		backendUrl:  backendUrl,
+		timeout:     timeout,
+		method:      r.Method,
+		urlString:   r.URL.String(),
+		storage:     s,
+		cacher:      cacher,
+
+		watch:     isWatch,
+		list:      isList,
+		needCache: needCache,
+	}
+
+	h, exist := r.Header[UserAgent]
+	if !exist {
+		p.userAgent = DefaultUserAgent
+	} else {
+		p.userAgent = strings.Split(h[0], " ")[0]
+	}
+
+	if r.TLS != nil {
+		for _, cert := range r.TLS.PeerCertificates {
+			if !cert.IsCA {
+				p.commonName = cert.Subject.CommonName
+				break
+			}
+		}
+	}
+	p.transport = p.newTransport()
+
+	// set timeout for request, if overtime, we think request failed, and read cache
+	if p.timeout > 0 {
+		p.transport.tr.DialContext = (&net.Dialer{
+			Timeout: time.Duration(p.timeout) * time.Second,
+		}).DialContext
+	}
+
+	reverseProxy := &httputil.ReverseProxy{
+		Director:       p.makeDirector,
+		Transport:      p.transport,
+		ModifyResponse: p.modifyResponse,
+		ErrorHandler:   p.handlerError,
+	}
+
+	reverseProxy.FlushInterval = -1
+
+	p.backendProxy = reverseProxy
+
+	val := r.Header.Get(EdgeUpdateHeader)
+	if len(val) != 0 {
+		p.selfUpdate = true
+		klog.V(4).Infof("Receive self update request, url->%s, time %s", r.URL.String(), val)
+		r.Header.Del(EdgeUpdateHeader)
+	}
+
+	if (p.list || p.watch) && !p.selfUpdate {
+		p.cacher.AddRequest(r, p.userAgent, p.list, p.watch)
+	}
+
+	klog.V(2).Infof("Create new reverse proxy, userAgent->%s, method->%s, url->%s", p.userAgent, p.method, p.urlString)
+	return p
+}
+```
+
+在RequestCacheController.Run函数中会起goroutine跑runGC，如下：
+
+```go
+func (c *RequestCacheController) runGC(stopCh <-chan struct{}) {
+	watchGCTicker := time.NewTicker(time.Second)
+	listGCTicker := time.NewTicker(5 * time.Second)
+
+	for {
+		select {
+		case <-stopCh:
+			klog.Infof("receive stop channel, exit request gc controller")
+			return
+		case <-listGCTicker.C:
+			c.lock.Lock()
+			for k, l := range c.listRequestMap {
+				if _, e := c.watchRequestMap[k]; !e {
+					var newList = []*holder{}
+					for i := range l {
+						h := l[i]
+						if h.expired() {
+							klog.Infof("request key %s, url %s has expired, delete it", k, h.request.URL.Path)
+						} else {
+							newList = append(newList, h)
+						}
+					}
+					if len(newList) == 0 {
+						delete(c.listRequestMap, k)
+					} else {
+						c.listRequestMap[k] = newList
+					}
+				}
+			}
+			c.lock.Unlock()
+		case <-watchGCTicker.C:
+			c.lock.Lock()
+			for k, r := range c.watchRequestMap {
+				req := r
+				select {
+				case <-req.Context().Done():
+					klog.V(4).Infof("Watch %s connection closed.", k)
+					holderList, e := c.listRequestMap[k]
+					if e {
+						for i := range holderList {
+							holderList[i].close()
+						}
+					}
+					delete(c.watchRequestMap, k)
+				default:
+				}
+			}
+			c.lock.Unlock()
+		}
+	}
+}
+
+func (h *holder) close() {
+	klog.V(4).Infof("Close holder %s", h.key)
+	if !h.isStart {
+		return
+	}
+	h.isStart = false
+	h.recordTime = time.Now()
+	h.stopCh <- struct{}{}
+}
+
+func (h *holder) run() {
+	klog.V(4).Infof("Begin to run holder %s", h.key)
+	for {
+		select {
+		case <-h.stopCh:
+			klog.Infof("Stop holder %s loop", h.key)
+			return
+		case <-h.ticker.C:
+			h.requestCh <- h.request
+		}
+	}
+}
+```
+
+主要逻辑为：
+
+* 每隔5秒遍历listRequestMap，若相应请求在watchRequestMap中存在，则表明这个请求正常同步cache中，不做处理；否则检查holder是否过期了(30s)，如果过期了还没有同步cache，则将该请求从listRequestMap中移除，否则不变，依旧保留在listRequestMap中
+* 每隔1秒遍历watchRequestMap，对于watchRequestMap中存放的Request，如果发现这个请求已经结束了(req.Context().Done())，则关闭以及删除listRequestMap中对应请求holder，并在最后从watchRequestMap中删除该key
+
+上述的逻辑主要用于对Watch请求的同步处理。由于lite-apiserver只对Get以及List资源请求返回进行本地缓存，不对Watch请求返回cache，因此RequestCacheController的作用就是通过不断同步List请求返回来间接缓存Watch请求返回；RequestCacheController.listRequestMap用于存放所有资源的List请求，而RequestCacheController.watchRequestMap用于存放所有资源的Watch请求
+
+总结来说就是：
+
+* EdgeServerHandler只缓存资源的Get以及Watch请求返回；不缓存Watch请求返回
+* RequestCacheController通过不断同步资源Watch请求对应的List请求Response缓存，来达到缓存Watch请求返回的目的

@@ -7,5 +7,5 @@ superedge reading notes based on main branch of [superedge/superedge](https://gi
 
 ## Contents
 
-* [DeploymentGrid](DeploymentGrid.md)
-* [ServiceGrid](ServiceGrid.md)
+* [DeploymentGrid](deploymentgrid.md)
+* [ServiceGrid](servicegrid.md)

@@ -1402,9 +1402,75 @@ func (h *holder) run() {
 * 每隔5秒遍历listRequestMap，若相应请求在watchRequestMap中存在，则表明这个请求正常同步cache中，不做处理；否则检查holder是否过期了(30s)，如果过期了还没有同步cache，则将该请求从listRequestMap中移除，否则不变，依旧保留在listRequestMap中
 * 每隔1秒遍历watchRequestMap，对于watchRequestMap中存放的Request，如果发现这个请求已经结束了(req.Context().Done())，则关闭以及删除listRequestMap中对应请求holder，并在最后从watchRequestMap中删除该key
 
-上述的逻辑主要用于对Watch请求的同步处理。由于lite-apiserver只对Get以及List资源请求返回进行本地缓存，不对Watch请求返回cache，因此RequestCacheController的作用就是通过不断同步List请求返回来间接缓存Watch请求返回；RequestCacheController.listRequestMap用于存放所有资源的List请求，而RequestCacheController.watchRequestMap用于存放所有资源的Watch请求
+RequestCacheController.listRequestMap用于存放所有资源的List请求，而RequestCacheController.watchRequestMap用于存放所有资源的Watch请求。RequestCacheController的作用就是不断同步List-Watch请求返回，保持List请求返回是最新的
 
-总结来说就是：
+而handlerError中如果遇到Watch请求失败，则会执行DeleteRequest删除RequestCacheController.listRequestMap以及RequestCacheController.watchRequestMap中相应请求的记录，因为如果Watch失败，则可以认为apiserver访问出现问题，没有必要再进行同步了，同时也同步不了，还是读的缓存：
 
-* EdgeServerHandler只缓存资源的Get以及Watch请求返回；不缓存Watch请求返回
-* RequestCacheController通过不断同步资源Watch请求对应的List请求Response缓存，来达到缓存Watch请求返回的目的
+```go
+func (p *EdgeReverseProxy) handlerError(rw http.ResponseWriter, req *http.Request, err error) {
+	klog.Warningf("Request url %s, %s error %v", req.URL.Host, req.URL, err)
+	defer func() {
+		if p.watch {
+			p.cacher.DeleteRequest(req, p.userAgent)
+		}
+	}()
+
+	// filter error, if not ECONNREFUSED or ETIMEDOUT, not read cache and ignore
+	if p.filterErrorToIgnore(err) {
+		klog.V(4).Infof("Receive not syscall error %v", err)
+		rw.WriteHeader(http.StatusBadGateway)
+		_, err := rw.Write([]byte(err.Error()))
+		if err != nil {
+			klog.Errorf("Write error response err: %v", err)
+		}
+		return
+	}
+
+	klog.V(4).Infof("Request error, need read data from cache")
+
+	// read cache when request error
+	data, cacheErr := p.readCache()
+	if cacheErr != nil {
+		klog.Errorf("Read cache error %v, write though error", cacheErr)
+		rw.WriteHeader(http.StatusBadGateway)
+		_, err := rw.Write([]byte(err.Error()))
+		if err != nil {
+			klog.Errorf("Write read cache error: %v", err)
+		}
+		return
+	}
+
+	for k, v := range data.Header {
+		for i := range v {
+			rw.Header().Set(k, v[i])
+		}
+	}
+
+	CopyHeader(rw.Header(), data.Header)
+	rw.WriteHeader(data.Code)
+	_, err = rw.Write(data.Body)
+	if err != nil {
+		klog.Errorf("Write cache response err: %v", err)
+	}
+}
+
+func (c *RequestCacheController) DeleteRequest(req *http.Request, userAgent string) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	key := c.key(userAgent, req.URL.Path)
+	klog.Infof("Receive delete watch request %s. Stop list in background", key)
+
+	holderList, e := c.listRequestMap[key]
+	if e {
+		for i := range holderList {
+			holderList[i].close()
+		}
+	}
+	delete(c.listRequestMap, key)
+	delete(c.watchRequestMap, key)
+}
+```
+
+## 总结
+

@@ -1,5 +1,5 @@
-superedge servicegroup deploymentgrid源码分析
-============================================
+SuperEdge ServiceGroup功能简介
+=============================
 
 ## 功能
 
@@ -162,6 +162,4 @@ $ curl 192.168.6.139|grep "node name"
   - NodeGroup是具有相同label key的一组NodeUnit(不同value)
   - ServiceGroup具体由两种CRD构成：DepolymentGrid以及ServiceGrid，具备相同的gridUniqKey
   - gridUniqKey值与NodeGroup的label key对应，也即ServiceGroup是与NodeGroup一一对应，而NodeGroup对应多个NodeUnit，同时NodeGroup中的每一个NodeUnit都会部署ServiceGroup对应deployment，这些deployment(deploymentgridName-NodeUnit命名)通过nodeSelector亲和性固定某个NodeUnit上，并通过服务拓扑感知限制在该NodeUnit内访问
-
-## 源码分析
 

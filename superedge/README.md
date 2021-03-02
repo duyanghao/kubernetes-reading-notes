@@ -9,6 +9,6 @@ superedge reading notes based on main branch of [superedge/superedge](https://gi
 
 * [原理概览](arch_principle.md)
 * [边缘自治](edge-autonomy/README.md)
-* [serviceGroup](service-group/README.md)
+* [service group](service-group/README.md)
 * [分布式健康检查](edge-health/README.md)
 * [network tunneling](network-tunnel/READMD.md)

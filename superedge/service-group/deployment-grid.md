@@ -458,6 +458,39 @@ func (dgc *DeploymentGridController) reconcile(dg *crdv1.DeploymentGrid, dpList 
 
 	return dgc.syncStatus(dg, dpList, gridValues)
 }
+
+func KeepConsistence(dg *crdv1.DeploymentGrid, dp *appsv1.Deployment, gridValue string) *appsv1.Deployment {
+	// NEVER modify objects from the store. It's a read-only, local cache.
+	// You can use DeepCopy() to make a deep copy of original object and modify this copy
+	// Or create a copy manually for better performance
+	copyObj := dp.DeepCopy()
+	// Append existed DeploymentGrid labels to deployment to be checked
+	if dg.Labels != nil {
+		copyObj.Labels = dg.Labels
+		copyObj.Labels[common.GridSelectorName] = dg.Name
+		copyObj.Labels[common.GridSelectorUniqKeyName] = dg.Spec.GridUniqKey
+	} else {
+		copyObj.Labels = map[string]string{
+			common.GridSelectorName:        dg.Name,
+			common.GridSelectorUniqKeyName: dg.Spec.GridUniqKey,
+		}
+	}
+	copyObj.Spec.Replicas = dg.Spec.Template.Replicas
+	// Spec.selector field is immutable
+	// copyObj.Spec.Selector = dg.Spec.Template.Selector
+	// TODO: this line will cause DeepEqual fails always since actual generated deployment.Spec.Template is definitely different with ones of relevant deploymentGrid
+	copyObj.Spec.Template = dg.Spec.Template.Template
+	// Append existed DeploymentGrid NodeSelector to deployment to be checked
+	if dg.Spec.Template.Template.Spec.NodeSelector != nil {
+		copyObj.Spec.Template.Spec.NodeSelector[dg.Spec.GridUniqKey] = gridValue
+	} else {
+		copyObj.Spec.Template.Spec.NodeSelector = map[string]string{
+			dg.Spec.GridUniqKey: gridValue,
+		}
+	}
+
+	return copyObj
+}
 ```
 
 展开reconcile具体细节如下：

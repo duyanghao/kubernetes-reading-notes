@@ -336,6 +336,578 @@ func (s *interceptorServer) interceptEventRequest(handler http.Handler) http.Han
 * service：接受kube-proxy service List&Watch(/api/v1/services)请求，并根据storageCache内容返回(GetServices)
 * endpoint：接受kube-proxy endpoint List&Watch(/api/v1/endpoints)请求，并根据storageCache内容返回(GetEndpoints)
 
+下面先重点分析cache部分的逻辑，然后再回过头来分析具体的http handler List&Watch处理逻辑
 
+wrapper为了实现拓扑感知，自己维护了一个cache，包括：node，service，endpoint。可以看到在setupInformers中注册了这三类资源的处理函数：
+
+```go
+type storageCache struct {
+	// hostName is the nodeName of node which application-grid-wrapper deploys on
+	hostName         string
+	wrapperInCluster bool
+
+	// mu lock protect the following map structure
+	mu           sync.RWMutex
+	servicesMap  map[types.NamespacedName]*serviceContainer
+	endpointsMap map[types.NamespacedName]*endpointsContainer
+	nodesMap     map[types.NamespacedName]*nodeContainer
+
+	// service watch channel
+	serviceChan chan<- watch.Event
+	// endpoints watch channel
+	endpointsChan chan<- watch.Event
+}
+...
+func NewStorageCache(hostName string, wrapperInCluster bool, serviceNotifier, endpointsNotifier chan watch.Event) *storageCache {
+	msc := &storageCache{
+		hostName:         hostName,
+		wrapperInCluster: wrapperInCluster,
+		servicesMap:      make(map[types.NamespacedName]*serviceContainer),
+		endpointsMap:     make(map[types.NamespacedName]*endpointsContainer),
+		nodesMap:         make(map[types.NamespacedName]*nodeContainer),
+		serviceChan:      serviceNotifier,
+		endpointsChan:    endpointsNotifier,
+	}
+
+	return msc
+}
+...
+func (s *interceptorServer) Run(debug bool, bindAddress string, insecure bool, caFile, certFile, keyFile string) error {
+    ...
+	if err := s.setupInformers(ctx.Done()); err != nil {
+		return err
+	}
+
+	klog.Infof("Start to run interceptor server")
+	/* filter
+	 */
+	server := &http.Server{Addr: bindAddress, Handler: s.buildFilterChains(debug)}
+    ...
+	return server.ListenAndServeTLS("", "")
+}
+
+func (s *interceptorServer) setupInformers(stop <-chan struct{}) error {
+	klog.Infof("Start to run service and endpoints informers")
+	noProxyName, err := labels.NewRequirement(apis.LabelServiceProxyName, selection.DoesNotExist, nil)
+	if err != nil {
+		klog.Errorf("can't parse proxy label, %v", err)
+		return err
+	}
+
+	noHeadlessEndpoints, err := labels.NewRequirement(v1.IsHeadlessService, selection.DoesNotExist, nil)
+	if err != nil {
+		klog.Errorf("can't parse headless label, %v", err)
+		return err
+	}
+
+	labelSelector := labels.NewSelector()
+	labelSelector = labelSelector.Add(*noProxyName, *noHeadlessEndpoints)
+
+	resyncPeriod := time.Minute * 5
+	client := kubernetes.NewForConfigOrDie(s.restConfig)
+	nodeInformerFactory := informers.NewSharedInformerFactory(client, resyncPeriod)
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(client, resyncPeriod,
+		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = labelSelector.String()
+		}))
+
+	nodeInformer := nodeInformerFactory.Core().V1().Nodes().Informer()
+	serviceInformer := informerFactory.Core().V1().Services().Informer()
+	endpointsInformer := informerFactory.Core().V1().Endpoints().Informer()
+
+	/*
+	 */
+	nodeInformer.AddEventHandlerWithResyncPeriod(s.cache.NodeEventHandler(), resyncPeriod)
+	serviceInformer.AddEventHandlerWithResyncPeriod(s.cache.ServiceEventHandler(), resyncPeriod)
+	endpointsInformer.AddEventHandlerWithResyncPeriod(s.cache.EndpointsEventHandler(), resyncPeriod)
+
+	go nodeInformer.Run(stop)
+	go serviceInformer.Run(stop)
+	go endpointsInformer.Run(stop)
+
+	if !cache.WaitForNamedCacheSync("node", stop,
+		nodeInformer.HasSynced,
+		serviceInformer.HasSynced,
+		endpointsInformer.HasSynced) {
+		return fmt.Errorf("can't sync informers")
+	}
+
+	return nil
+}
+
+func (sc *storageCache) NodeEventHandler() cache.ResourceEventHandler {
+	return &nodeHandler{cache: sc}
+}
+
+func (sc *storageCache) ServiceEventHandler() cache.ResourceEventHandler {
+	return &serviceHandler{cache: sc}
+}
+
+func (sc *storageCache) EndpointsEventHandler() cache.ResourceEventHandler {
+	return &endpointsHandler{cache: sc}
+}
+```
+
+这里依次分析NodeEventHandler，ServiceEventHandler以及EndpointsEventHandler，如下：
+
+1. NodeEventHandler
+
+NodeEventHandler负责监听node资源相关event，并将node以及node Labels添加到storageCache.nodesMap中(key为nodeName，value为node以及node labels)
+
+```go
+func (nh *nodeHandler) add(node *v1.Node) {
+	sc := nh.cache
+
+	sc.mu.Lock()
+
+	nodeKey := types.NamespacedName{Namespace: node.Namespace, Name: node.Name}
+	klog.Infof("Adding node %v", nodeKey)
+	sc.nodesMap[nodeKey] = &nodeContainer{
+		node:   node,
+		labels: node.Labels,
+	}
+	// update endpoints
+	changedEps := sc.rebuildEndpointsMap()
+
+	sc.mu.Unlock()
+
+	for _, eps := range changedEps {
+		sc.endpointsChan <- eps
+	}
+}
+
+func (nh *nodeHandler) update(node *v1.Node) {
+	sc := nh.cache
+
+	sc.mu.Lock()
+
+	nodeKey := types.NamespacedName{Namespace: node.Namespace, Name: node.Name}
+	klog.Infof("Updating node %v", nodeKey)
+	nodeContainer, found := sc.nodesMap[nodeKey]
+	if !found {
+		sc.mu.Unlock()
+		klog.Errorf("Updating non-existed node %v", nodeKey)
+		return
+	}
+
+	nodeContainer.node = node
+	// return directly when labels of node stay unchanged
+	if reflect.DeepEqual(node.Labels, nodeContainer.labels) {
+		sc.mu.Unlock()
+		return
+	}
+	nodeContainer.labels = node.Labels
+
+	// update endpoints
+	changedEps := sc.rebuildEndpointsMap()
+
+	sc.mu.Unlock()
+
+	for _, eps := range changedEps {
+		sc.endpointsChan <- eps
+	}
+}
+...
+```
+
+同时由于node的改变会影响endpoint，因此会调用rebuildEndpointsMap刷新storageCache.endpointsMap
+
+```go
+// rebuildEndpointsMap updates all endpoints stored in storageCache.endpointsMap dynamically and constructs relevant modified events
+func (sc *storageCache) rebuildEndpointsMap() []watch.Event {
+	evts := make([]watch.Event, 0)
+	for name, endpointsContainer := range sc.endpointsMap {
+		newEps := pruneEndpoints(sc.hostName, sc.nodesMap, sc.servicesMap, endpointsContainer.endpoints, sc.wrapperInCluster)
+		if apiequality.Semantic.DeepEqual(newEps, endpointsContainer.modified) {
+			continue
+		}
+		sc.endpointsMap[name].modified = newEps
+		evts = append(evts, watch.Event{
+			Type:   watch.Modified,
+			Object: newEps,
+		})
+	}
+	return evts
+}
+```
+
+rebuildEndpointsMap是cache的核心函数，同时也是拓扑感知的算法实现：
+
+```go
+// pruneEndpoints filters endpoints using serviceTopology rules combined by services topologyKeys and node labels
+func pruneEndpoints(hostName string,
+	nodes map[types.NamespacedName]*nodeContainer,
+	services map[types.NamespacedName]*serviceContainer,
+	eps *v1.Endpoints, wrapperInCluster bool) *v1.Endpoints {
+
+	epsKey := types.NamespacedName{Namespace: eps.Namespace, Name: eps.Name}
+
+	if wrapperInCluster {
+		eps = genLocalEndpoints(eps)
+	}
+
+	// dangling endpoints
+	svc, ok := services[epsKey]
+	if !ok {
+		klog.V(4).Infof("Dangling endpoints %s, %+#v", eps.Name, eps.Subsets)
+		return eps
+	}
+
+	// normal service
+	if len(svc.keys) == 0 {
+		klog.V(4).Infof("Normal endpoints %s, %+#v", eps.Name, eps.Subsets)
+		return eps
+	}
+
+	// topology endpoints
+	newEps := eps.DeepCopy()
+	for si := range newEps.Subsets {
+		subnet := &newEps.Subsets[si]
+		subnet.Addresses = filterConcernedAddresses(svc.keys, hostName, nodes, subnet.Addresses)
+		subnet.NotReadyAddresses = filterConcernedAddresses(svc.keys, hostName, nodes, subnet.NotReadyAddresses)
+	}
+	klog.V(4).Infof("Topology endpoints %s: subnets from %+#v to %+#v", eps.Name, eps.Subsets, newEps.Subsets)
+
+	return newEps
+}
+
+// filterConcernedAddresses aims to filter out endpoints addresses within the same node unit
+func filterConcernedAddresses(topologyKeys []string, hostName string, nodes map[types.NamespacedName]*nodeContainer,
+	addresses []v1.EndpointAddress) []v1.EndpointAddress {
+	hostNode, found := nodes[types.NamespacedName{Name: hostName}]
+	if !found {
+		return nil
+	}
+
+	filteredEndpointAddresses := make([]v1.EndpointAddress, 0)
+	for i := range addresses {
+		addr := addresses[i]
+		if nodeName := addr.NodeName; nodeName != nil {
+			epsNode, found := nodes[types.NamespacedName{Name: *nodeName}]
+			if !found {
+				continue
+			}
+			if hasIntersectionLabel(topologyKeys, hostNode.labels, epsNode.labels) {
+				filteredEndpointAddresses = append(filteredEndpointAddresses, addr)
+			}
+		}
+	}
+
+	return filteredEndpointAddresses
+}
+
+func hasIntersectionLabel(keys []string, n1, n2 map[string]string) bool {
+	if n1 == nil || n2 == nil {
+		return false
+	}
+
+	for _, key := range keys {
+		val1, v1found := n1[key]
+		val2, v2found := n2[key]
+
+		if v1found && v2found && val1 == val2 {
+			return true
+		}
+	}
+
+	return false
+}
+```
+
+算法逻辑如下：
+
+* 判断endpoint是否为default kubernetes service，如果是，则将该endpoint转化为wrapper所在边缘节点的lite-apiserver地址(127.0.0.1)和端口(51003)
+
+```yaml
+apiVersion: v1
+kind: Endpoints
+metadata:
+  annotations:
+    superedge.io/local-endpoint: 127.0.0.1
+    superedge.io/local-port: "51003"
+  name: kubernetes
+  namespace: default
+subsets:
+- addresses:
+  - ip: 172.31.0.60
+  ports:
+  - name: https
+    port: xxx
+    protocol: TCP
+```
+
+```go
+func genLocalEndpoints(eps *v1.Endpoints) *v1.Endpoints {
+	if eps.Namespace != metav1.NamespaceDefault || eps.Name != MasterEndpointName {
+		return eps
+	}
+
+	klog.V(4).Infof("begin to gen local ep %v", eps)
+	ipAddress, e := eps.Annotations[EdgeLocalEndpoint]
+	if !e {
+		return eps
+	}
+
+	portStr, e := eps.Annotations[EdgeLocalPort]
+	if !e {
+		return eps
+	}
+
+	klog.V(4).Infof("get local endpoint %s:%s", ipAddress, portStr)
+	port, err := strconv.ParseInt(portStr, 10, 32)
+	if err != nil {
+		klog.Errorf("parse int %s err %v", portStr, err)
+		return eps
+	}
+
+	ip := net.ParseIP(ipAddress)
+	if ip == nil {
+		klog.Warningf("parse ip %s nil", ipAddress)
+		return eps
+	}
+
+	nep := eps.DeepCopy()
+	nep.Subsets = []v1.EndpointSubset{
+		{
+			Addresses: []v1.EndpointAddress{
+				{
+					IP: ipAddress,
+				},
+			},
+			Ports: []v1.EndpointPort{
+				{
+					Protocol: v1.ProtocolTCP,
+					Port:     int32(port),
+					Name:     "https",
+				},
+			},
+		},
+	}
+
+	klog.V(4).Infof("gen new endpoint complete %v", nep)
+	return nep
+}
+```
+
+**这样做的目的是使边缘节点上的服务采用集群内(InCluster)方式访问的apiserver为本地的lite-apiserver，而不是云端的apiserver**
+
+* 从storageCache.servicesMap cache中根据endpoint名称(namespace/name)取出对应service，如果该service没有topologyKeys则无需做拓扑转化(非service group)
+
+```go
+func getTopologyKeys(objectMeta *metav1.ObjectMeta) []string {
+	if !hasTopologyKey(objectMeta) {
+		return nil
+	}
+
+	var keys []string
+	keyData := objectMeta.Annotations[TopologyAnnotationsKey]
+	if err := json.Unmarshal([]byte(keyData), &keys); err != nil {
+		klog.Errorf("can't parse topology keys %s, %v", keyData, err)
+		return nil
+	}
+
+	return keys
+}
+```
+
+* 调用filterConcernedAddresses过滤endpoint.Subsets Addresses以及NotReadyAddresses，只保留同一个service topologyKeys中的endpoint
+
+```go
+// filterConcernedAddresses aims to filter out endpoints addresses within the same node unit
+func filterConcernedAddresses(topologyKeys []string, hostName string, nodes map[types.NamespacedName]*nodeContainer,
+	addresses []v1.EndpointAddress) []v1.EndpointAddress {
+	hostNode, found := nodes[types.NamespacedName{Name: hostName}]
+	if !found {
+		return nil
+	}
+
+	filteredEndpointAddresses := make([]v1.EndpointAddress, 0)
+	for i := range addresses {
+		addr := addresses[i]
+		if nodeName := addr.NodeName; nodeName != nil {
+			epsNode, found := nodes[types.NamespacedName{Name: *nodeName}]
+			if !found {
+				continue
+			}
+			if hasIntersectionLabel(topologyKeys, hostNode.labels, epsNode.labels) {
+				filteredEndpointAddresses = append(filteredEndpointAddresses, addr)
+			}
+		}
+	}
+
+	return filteredEndpointAddresses
+}
+
+func hasIntersectionLabel(keys []string, n1, n2 map[string]string) bool {
+	if n1 == nil || n2 == nil {
+		return false
+	}
+
+	for _, key := range keys {
+		val1, v1found := n1[key]
+		val2, v2found := n2[key]
+
+		if v1found && v2found && val1 == val2 {
+			return true
+		}
+	}
+
+	return false
+}
+```
+
+**注意：如果wrapper所在边缘节点没有service topologyKeys标签，则也无法访问该service**
+
+回到rebuildEndpointsMap，在调用pruneEndpoints刷新了同一个拓扑域内的endpoint后，会将修改后的endpoints赋值给storageCache.endpointsMap[endpoint].modified(该字段记录了拓扑感知后修改的endpoints)
+
+```go
+func (nh *nodeHandler) add(node *v1.Node) {
+	sc := nh.cache
+
+	sc.mu.Lock()
+
+	nodeKey := types.NamespacedName{Namespace: node.Namespace, Name: node.Name}
+	klog.Infof("Adding node %v", nodeKey)
+	sc.nodesMap[nodeKey] = &nodeContainer{
+		node:   node,
+		labels: node.Labels,
+	}
+	// update endpoints
+	changedEps := sc.rebuildEndpointsMap()
+
+	sc.mu.Unlock()
+
+	for _, eps := range changedEps {
+		sc.endpointsChan <- eps
+	}
+}
+
+// rebuildEndpointsMap updates all endpoints stored in storageCache.endpointsMap dynamically and constructs relevant modified events
+func (sc *storageCache) rebuildEndpointsMap() []watch.Event {
+	evts := make([]watch.Event, 0)
+	for name, endpointsContainer := range sc.endpointsMap {
+		newEps := pruneEndpoints(sc.hostName, sc.nodesMap, sc.servicesMap, endpointsContainer.endpoints, sc.wrapperInCluster)
+		if apiequality.Semantic.DeepEqual(newEps, endpointsContainer.modified) {
+			continue
+		}
+		sc.endpointsMap[name].modified = newEps
+		evts = append(evts, watch.Event{
+			Type:   watch.Modified,
+			Object: newEps,
+		})
+	}
+	return evts
+}
+```
+
+另外，如果endpoints(拓扑感知后修改的endpoints)发生改变，会构建watch event，传递给endpoints handler(interceptEndpointsRequest)处理
+
+2. ServiceEventHandler
+
+storageCache.servicesMap结构体key为service名称(namespace/name)，value为serviceContainer，包含如下数据：
+
+* svc：service对象
+* keys：service topologyKeys
+
+对于service资源的改动，这里用Update event说明：
+
+```go
+func (sh *serviceHandler) update(service *v1.Service) {
+	sc := sh.cache
+
+	sc.mu.Lock()
+	serviceKey := types.NamespacedName{Namespace: service.Namespace, Name: service.Name}
+	klog.Infof("Updating service %v", serviceKey)
+	newTopologyKeys := getTopologyKeys(&service.ObjectMeta)
+	serviceContainer, found := sc.servicesMap[serviceKey]
+	if !found {
+		sc.mu.Unlock()
+		klog.Errorf("update non-existed service, %v", serviceKey)
+		return
+	}
+
+	sc.serviceChan <- watch.Event{
+		Type:   watch.Modified,
+		Object: service,
+	}
+
+	serviceContainer.svc = service
+	// return directly when topologyKeys of service stay unchanged
+	if reflect.DeepEqual(serviceContainer.keys, newTopologyKeys) {
+		sc.mu.Unlock()
+		return
+	}
+
+	serviceContainer.keys = newTopologyKeys
+
+	// update endpoints
+	changedEps := sc.rebuildEndpointsMap()
+	sc.mu.Unlock()
+
+	for _, eps := range changedEps {
+		sc.endpointsChan <- eps
+	}
+}
+```
+
+逻辑如下：
+
+* 获取service topologyKeys
+* 构建service event.Modified event
+* 比较service topologyKeys与已经存在的是否有差异
+* 如果有差异则更新topologyKeys，且调用rebuildEndpointsMap刷新该service对应的endpoints，如果endpoints发生变化，则构建endpoints watch event，传递给endpoints handler(interceptEndpointsRequest)处理
+
+3. EndpointsEventHandler
+
+storageCache.endpointsMap结构体key为endpoints名称(namespace/name)，value为endpointsContainer，包含如下数据：
+
+* endpoints：拓扑修改前的endpoints
+* modified：拓扑修改后的endpoints
+
+对于endpoints资源的改动，这里用Update event说明：
+
+```go
+func (eh *endpointsHandler) update(endpoints *v1.Endpoints) {
+	sc := eh.cache
+
+	sc.mu.Lock()
+	endpointsKey := types.NamespacedName{Namespace: endpoints.Namespace, Name: endpoints.Name}
+	klog.Infof("Updating endpoints %v", endpointsKey)
+
+	endpointsContainer, found := sc.endpointsMap[endpointsKey]
+	if !found {
+		sc.mu.Unlock()
+		klog.Errorf("Updating non-existed endpoints %v", endpointsKey)
+		return
+	}
+	endpointsContainer.endpoints = endpoints
+	newEps := pruneEndpoints(sc.hostName, sc.nodesMap, sc.servicesMap, endpoints, sc.wrapperInCluster)
+	changed := !apiequality.Semantic.DeepEqual(endpointsContainer.modified, newEps)
+	if changed {
+		endpointsContainer.modified = newEps
+	}
+	sc.mu.Unlock()
+
+	if changed {
+		sc.endpointsChan <- watch.Event{
+			Type:   watch.Modified,
+			Object: newEps,
+		}
+	}
+}
+```
+
+逻辑如下：
+
+* 更新endpointsContainer.endpoint为新的endpoints对象
+* 调用pruneEndpoints获取拓扑刷新后的endpoints
+* 比较endpointsContainer.modified与新刷新后的endpoints
+* 如果有差异则更新endpointsContainer.modified，则构建endpoints watch event，传递给endpoints handler(interceptEndpointsRequest)处理
+
+在分析完NodeEventHandler，ServiceEventHandler以及EndpointsEventHandler之后，我们回到具体的http handler List&Watch处理逻辑上，这里以endpoints为例：
+
+```go
+
+```
 
 ## 总结

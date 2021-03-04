@@ -907,7 +907,118 @@ func (eh *endpointsHandler) update(endpoints *v1.Endpoints) {
 在分析完NodeEventHandler，ServiceEventHandler以及EndpointsEventHandler之后，我们回到具体的http handler List&Watch处理逻辑上，这里以endpoints为例：
 
 ```go
+func (s *interceptorServer) interceptEndpointsRequest(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/api/v1/endpoints") {
+			handler.ServeHTTP(w, r)
+			return
+		}
 
+		queries := r.URL.Query()
+		acceptType := r.Header.Get("Accept")
+		info, found := s.parseAccept(acceptType, s.mediaSerializer)
+		if !found {
+			klog.Errorf("can't find %s serializer", acceptType)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		encoder := scheme.Codecs.EncoderForVersion(info.Serializer, v1.SchemeGroupVersion)
+		// list request
+		if queries.Get("watch") == "" {
+			w.Header().Set("Content-Type", info.MediaType)
+			allEndpoints := s.cache.GetEndpoints()
+			epsItems := make([]v1.Endpoints, 0, len(allEndpoints))
+			for _, eps := range allEndpoints {
+				epsItems = append(epsItems, *eps)
+			}
+
+			epsList := &v1.EndpointsList{
+				Items: epsItems,
+			}
+
+			err := encoder.Encode(epsList, w)
+			if err != nil {
+				klog.Errorf("can't marshal endpoints list, %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			return
+		}
+
+		// watch request
+		timeoutSecondsStr := r.URL.Query().Get("timeoutSeconds")
+		timeout := time.Minute
+		if timeoutSecondsStr != "" {
+			timeout, _ = time.ParseDuration(fmt.Sprintf("%ss", timeoutSecondsStr))
+		}
+
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			klog.Errorf("unable to start watch - can't get http.Flusher: %#v", w)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		e := restclientwatch.NewEncoder(
+			streaming.NewEncoder(info.StreamSerializer.Framer.NewFrameWriter(w),
+				scheme.Codecs.EncoderForVersion(info.StreamSerializer, v1.SchemeGroupVersion)),
+			encoder)
+		if info.MediaType == runtime.ContentTypeProtobuf {
+			w.Header().Set("Content-Type", runtime.ContentTypeProtobuf+";stream=watch")
+		} else {
+			w.Header().Set("Content-Type", runtime.ContentTypeJSON)
+		}
+		w.Header().Set("Transfer-Encoding", "chunked")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-timer.C:
+				return
+			case evt := <-s.endpointsWatchCh:
+				klog.V(4).Infof("Send endpoint watch event: %+#v", evt)
+				err := e.Encode(&evt)
+				if err != nil {
+					klog.Errorf("can't encode watch event, %v", err)
+					return
+				}
+
+				if len(s.endpointsWatchCh) == 0 {
+					flusher.Flush()
+				}
+			}
+		}
+	})
+}
 ```
 
+逻辑如下：
+
+* 如果为List请求，则调用GetEndpoints获取拓扑修改后的endpoints列表，并返回
+
+```go
+func (sc *storageCache) GetEndpoints() []*v1.Endpoints {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+
+	epList := make([]*v1.Endpoints, 0, len(sc.endpointsMap))
+	for _, v := range sc.endpointsMap {
+		epList = append(epList, v.modified)
+	}
+	return epList
+}
+```
+
+* 如果为Watch请求，则不断从storageCache.endpointsWatchCh管道中接受watch event，并返回
+
+interceptServiceRequest逻辑与interceptEndpointsRequest一致，这里不再赘述
+
 ## 总结
+

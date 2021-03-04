@@ -116,7 +116,7 @@ servicegrid-demo-svc   ClusterIP   192.168.21.99   <none>        80/TCP    21h
 
 除了采用service访问statefulset负载，StatefulSetGrid还支持使用headless service的方式进行访问，如下所示：
 
-![](../img/statefulsetgrid.png)
+![](images/statefulset-grid-access.png)
 
 StatefulSetGrid提供屏蔽NodeUnit的统一headless service访问形式，如下：
 

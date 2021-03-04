@@ -129,6 +129,7 @@ ServiceGrid Controller逻辑和DeploymentGrid Controller整体一致，如下：
 
 * 一个ServiceGrid对象只产生一个service
 * 只需额外监听service event，无需监听node事件。因为node的CRUD与ServiceGrid无关
+* ServiceGrid对应产生的service，命名为：`{ServiceGrid}-svc`
 
 ```go
 func (sgc *ServiceGridController) syncServiceGrid(key string) error {

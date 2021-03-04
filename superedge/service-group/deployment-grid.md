@@ -92,6 +92,8 @@ deployment-grid-controller是典型的operator开发模式，CRD为DeploymentGri
 * 2、监听DeploymentGrid event，并填充DeploymentGrid到工作队列中；循环从队列中取出DeploymentGrid并 创建&维护 各nodeunit对应的deployment
 * 3、监听deployment以及node event，并将相关的DeploymentGrid塞到工作队列中进行上述处理
 
+注意各nodeunit创建的deployment以`{DeploymentGrid}-{nodeunit}`命名，同时添加了nodeSelector限制(`GridUniqKey: nodeunit`)
+
 下面依次对上述环节进行介绍：
 
 ### crdPreparator - 创建并维护service group对应的若干CRDs

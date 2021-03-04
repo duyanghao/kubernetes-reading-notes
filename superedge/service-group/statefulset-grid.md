@@ -174,9 +174,9 @@ StatefulSetGrid包括两部分组件：
 
 StatefulSetGrid Controller逻辑和DeploymentGrid Controller整体一致，如下：
 
-1、创建并维护service group需要的若干CRDs(包括：StatefulSetGrid)
-2、监听StatefulSetGrid event，并填充StatefulSetGrid到工作队列中；循环从队列中取出StatefulSetGrid进行解析，创建并且维护各nodeunit对应的statefulset
-3、监听statefulset以及node event，并将相关的StatefulSetGrid塞到工作队列中进行上述处理，协助上述逻辑达到整体reconcile效果
+* 1、创建并维护service group需要的若干CRDs(包括：StatefulSetGrid)
+* 2、监听StatefulSetGrid event，并填充StatefulSetGrid到工作队列中；循环从队列中取出StatefulSetGrid进行解析，创建并且维护各nodeunit对应的statefulset
+* 3、监听statefulset以及node event，并将相关的StatefulSetGrid塞到工作队列中进行上述处理，协助上述逻辑达到整体reconcile效果
 
 注意各nodeunit创建的statefulset以`{StatefulSetGrid}-{nodeunit}`命名，同时添加了nodeSelector限制(`GridUniqKey: nodeunit`)
 

@@ -61,11 +61,11 @@ spec:
 
 **注意：template中的serviceName设置成即将创建的service名称**
 
-2、部署StatefulSetGrid
+2、部署ServiceGrid
 
 ```yaml
 apiVersion: superedge.io/v1
-kind: StatefulSetGrid
+kind: ServiceGrid
 metadata:
   name: servicegrid-demo
   namespace: default

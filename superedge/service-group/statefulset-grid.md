@@ -698,10 +698,10 @@ func (ssgdc *StatefulSetGridDaemonController) syncDnsHostsAsWhole() {
 
 处理逻辑如下：
 
-* 获取节点名获取本边缘节点node
-* 从node中解析出有效labels key列表，并构建labels.Selector gridUniqKeyLabels(`GridSelectorUniqKeyName, selection.In`)
-* 根据gridUniqKeyLabels查询statefulset列表，获取本边缘节点上所有可以访问的statefulset
-* 利用IsConcernedStatefulSet过滤出实际可以访问的有效statefulset列表
+* 根据节点名获取本边缘节点node
+* 从node中解析出有效labels key列表，并构建labels.Selector gridUniqKeyLabels(`superedge.io/grid-uniq-key, selection.In`)
+* 根据gridUniqKeyLabels查询statefulset列表，获取本边缘节点上所有可以访问的service group statefulset
+* 利用IsConcernedStatefulSet过滤出实际可以访问的有效service group statefulset列表
 ```go
 func (ssgdc *StatefulSetGridDaemonController) IsConcernedStatefulSet(set *appsv1.StatefulSet) (bool, error) {
 	// Check statefulset controllerRef
@@ -824,10 +824,10 @@ func (h *Hosts) parseHostsToFile() string {
     * 将实际的statefulset pod FQDN(`statefulsetgrid-demo-nodeunit1-xxx.servicegrid-demo-svc.default.svc.cluster.local`)转化为service group对应的statefulset pod FQDN(`statefulsetgrid-demo-xxx.servicegrid-demo-svc.default.svc.cluster.local`)，并构建PodDomainInfoToHosts map(key为转化后的FQDN，value为podIp)
     * 调用CheckOrUpdateHosts检查并更新hosts文件内容
   * syncDnsHostsAsWhole(全量更新)：作为syncDnsHosts的补充，弥补syncDnsHosts在某些场景下(例如：删除statefulsetgrid)更新逻辑上的缺失，每隔syncPeriodAsWhole(默认30s)运行一次，会全量更新StatefulSetGrid的相关域名，保障域名的最终一致性。处理逻辑如下：
-    * 获取节点名获取本边缘节点node
-    * 从node中解析出有效labels key列表，并构建labels.Selector gridUniqKeyLabels(`GridSelectorUniqKeyName, selection.In`)
-    * 根据gridUniqKeyLabels查询statefulset列表，获取本边缘节点上所有可以访问的statefulset
-    * 利用IsConcernedStatefulSet过滤出实际可以访问的有效statefulset列表
+    * 根据节点名获取本边缘节点node
+    * 从node中解析出有效labels key列表，并构建labels.Selector gridUniqKeyLabels(`superedge.io/grid-uniq-key, selection.In`)
+    * 根据gridUniqKeyLabels查询statefulset列表，获取本边缘节点上所有可以访问的service group statefulset
+    * 利用IsConcernedStatefulSet过滤出实际可以访问的有效service group statefulset列表
     * 遍历上述列表，对每一个statefulset对应pods FQDN进行转化，构建hostsMap
     * 利用hostsMap调用SetHostsByMap重置host cache
     

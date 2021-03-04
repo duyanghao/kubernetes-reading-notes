@@ -166,7 +166,7 @@ StatefulSetGrid提供屏蔽NodeUnit的统一headless service访问形式，如�
 StatefulSetGrid包括两部分组件：
 
 * StatefulSetGrid Controller(云端)：负责根据StatefulSetGrid CR(custom resource) 创建&维护 各nodeunit对应的statefulset
-* statefulset-grid-daemon(边缘)：负责生成各nodeunit对应statefulset负载的域名hosts记录((A records))，以便用户屏蔽nodeunit，通过`{StatefulSetGrid}-{0..N-1}.{StatefulSetGrid}-svc.ns.svc.cluster.local`形式访问有状态服务
+* statefulset-grid-daemon(边缘)：负责生成各nodeunit对应statefulset负载的域名hosts记录(A records)，以便屏蔽nodeunit，通过统一的FQDN：`{StatefulSetGrid}-{0..N-1}.{StatefulSetGrid}-svc.ns.svc.cluster.local`访问有状态服务
 
 这里依次对上述组件进行分析：
 
@@ -800,13 +800,37 @@ func (h *Hosts) parseHostsToFile() string {
 
 ## 总结
 
-
-
+* StatefulSetGrid由本人在官方提出方案[SEP: ServiceGroup StatefulSetGrid Design Specification](https://github.com/superedge/superedge/issues/26)，最终与[chenkaiyue](https://github.com/chenkaiyue)合作开发完成。初衷是为了补充service group对有状态服务的支持
+* StatefulSetGrid目前支持两种访问方式：
+  * 通过统一的service name进行访问，会路由到本组内的服务(要求service.Spec.clusterIP不能设置成None，也即非headless service)
+  * 通过statefulset pod FDQN进行访问。采用屏蔽NodeUnit的统一FQDN访问形式：`{StatefulSetGrid}-{0..N-1}.{StatefulSetGrid}-svc.ns.svc.cluster.local`，实际转化为各个NodeUnit内的statefulset pod：`{StatefulSetGrid}-{NodeUnit}-{0..N-1}.{StatefulSetGrid}-svc.ns.svc.cluster.local`
+* StatefulSetGrid包括两部分组件：
+  * StatefulSetGrid Controller(云端)：负责根据StatefulSetGrid CR(custom resource) 创建&维护 各nodeunit对应的statefulset
+  * statefulset-grid-daemon(边缘)：负责生成各nodeunit对应statefulset负载的域名hosts记录(A records)，以便屏蔽nodeunit，通过统一的FQDN：`{StatefulSetGrid}-{0..N-1}.{StatefulSetGrid}-svc.ns.svc.cluster.local`访问有状态服务
+* StatefulSetGrid Controller逻辑和DeploymentGrid Controller整体一致，如下：
+  * 创建并维护service group需要的若干CRDs(包括：StatefulSetGrid)
+  * 监听StatefulSetGrid event，并填充StatefulSetGrid到工作队列中；循环从队列中取出StatefulSetGrid进行解析，创建并且维护各nodeunit对应的statefulset(注意各nodeunit创建的statefulset以`{StatefulSetGrid}-{nodeunit}`命名，同时添加了nodeSelector限制(`GridUniqKey: nodeunit`))
+  * 监听statefulset以及node event，并将相关的StatefulSetGrid塞到工作队列中进行上述处理，协助上述逻辑达到整体reconcile效果
+* statefulset-grid-daemon会根据statefulset构建对应的`{StatefulSetGrid}-{0..N-1}.{StatefulSetGrid}-svc.ns.svc.cluster.local` dns A record，并更新到本地挂载文件中。而该挂载文件实际上就是coredns host plugins使用的文件。通过这个文件将两者联系起来，使得statefulset-grid-daemon可以添加原来coredns不存在的domain record，并且生效
+  ![](images/statefulset-grid-daemon.png)
+* StatefulSetGrid域名刷新逻辑有如下两部分组成：
+  * syncDnsHosts(部分更新)：从workqueue中取出statefulset，并对该statefulset执行域名增删改操作，处理逻辑如下：
+    * 调用needClearStatefulSetDomains判断该statefulset对应域名是否应该删除，满足如下条件则需要删除：
+      * 如果statefulset对应service不存在
+      * 如果statefulset不存在 `superedge.io/grid-uniq-key` gridUniqKey标签(StatefulSetGrid Controller在创建statefulset时会添加该标签表明StatefulSetGrid的gridUniqKey)或者对应gridUniqKey与service对应gridUniqKey不一致
+    * 如果确认需要删除，则会构建空PodDomainInfoToHosts，调用CheckOrUpdateHosts对hosts文件进行删除操作
+    * 获取该statefulset namespace下的所有pod列表，并调用IsMemberOf过滤出属于该statefulset的pods
+    * 获取产生该statefulset的父StatefulSetGrid名称，并根据父StatefulSetGrid.Name(statefulsetgrid-demo)以及statefulset.Name(statefulsetgrid-demo-nodeunit1)解析出该statefulset所对应nodeunit(nodeunit1)
+    * 将实际的statefulset pod FQDN(`statefulsetgrid-demo-nodeunit1-xxx.servicegrid-demo-svc.default.svc.cluster.local`)转化为service group对应的statefulset pod FQDN(`statefulsetgrid-demo-xxx.servicegrid-demo-svc.default.svc.cluster.local`)，并构建PodDomainInfoToHosts map(key为转化后的FQDN，value为podIp)
+    * 调用CheckOrUpdateHosts检查并更新hosts文件内容
+  * syncDnsHostsAsWhole(全量更新)：作为syncDnsHosts的补充，弥补syncDnsHosts在某些场景下(例如：删除statefulsetgrid)更新逻辑上的缺失，每隔syncPeriodAsWhole(默认30s)运行一次，会全量更新StatefulSetGrid的相关域名，保障域名的最终一致性。处理逻辑如下：
+    * 获取节点名获取本边缘节点node
+    * 从node中解析出有效labels key列表，并构建labels.Selector gridUniqKeyLabels(`GridSelectorUniqKeyName, selection.In`)
+    * 根据gridUniqKeyLabels查询statefulset列表，获取本边缘节点上所有可以访问的statefulset
+    * 利用IsConcernedStatefulSet过滤出实际可以访问的有效statefulset列表
+    * 遍历上述列表，对每一个statefulset对应pods FQDN进行转化，构建hostsMap
+    * 利用hostsMap调用SetHostsByMap重置host cache
+    
 ## 展望 
 
-
-
- 
-
-
-
+目前SuperEdge service group StatefulSetGrid实现了 通过service以及statefulset pod FQDN 屏蔽nodeunit访问statefulset负载的能力。但是还缺少对headless service场景下的支持，这块需要未来根据项目需求进行补充

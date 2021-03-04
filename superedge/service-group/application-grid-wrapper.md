@@ -115,7 +115,7 @@ $ curl 192.168.6.139|grep "node name"
         node name:      node1        
 ```
 
-在创建完ServiceGrid CR后，ServiceGrid Controller负责根据ServiceGrid产生对应的service；而application-grid-wrapper根据service实现拓扑感知，下面依次分析
+在创建完ServiceGrid CR后，ServiceGrid Controller负责根据ServiceGrid产生对应的service(包含由serviceGrid.Spec.GridUniqKey构成的topologyKeys annotations)；而application-grid-wrapper根据service实现拓扑感知，下面依次分析
 
 ## ServiceGrid Controller分析
 
@@ -223,6 +223,38 @@ func (sgc *ServiceGridController) reconcile(g *crdv1.ServiceGrid, svcList []*cor
 	}
 
 	return sgc.syncService(adds, updates, deletes)
+}
+
+func CreateService(sg *crdv1.ServiceGrid) *corev1.Service {
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      GetServiceName(sg),
+			Namespace: sg.Namespace,
+			// Append existed ServiceGrid labels to service to be created
+			Labels: func() map[string]string {
+				if sg.Labels != nil {
+					newLabels := sg.Labels
+					newLabels[common.GridSelectorName] = sg.Name
+					newLabels[common.GridSelectorUniqKeyName] = sg.Spec.GridUniqKey
+					return newLabels
+				} else {
+					return map[string]string{
+						common.GridSelectorName:        sg.Name,
+						common.GridSelectorUniqKeyName: sg.Spec.GridUniqKey,
+					}
+				}
+			}(),
+			Annotations: make(map[string]string),
+		},
+		Spec: sg.Spec.Template,
+	}
+
+	keys := make([]string, 1)
+	keys[0] = sg.Spec.GridUniqKey
+	keyData, _ := json.Marshal(keys)
+	svc.Annotations[common.TopologyAnnotationsKey] = string(keyData)
+
+	return svc
 }
 ```
 
@@ -1022,3 +1054,21 @@ interceptServiceRequest逻辑与interceptEndpointsRequest一致，这里不再�
 
 ## 总结
 
+* SuperEdge service group利用application-grid-wrapper实现拓扑感知，完成了同一个nodeunit内服务的闭环访问
+* service group实现的拓扑感知和Kubernetes社区原生实现对比，有如下区别：
+  * service group拓扑key可以自定义，也即为gridUniqKey，使用起来更加灵活；而社区实现目前只有三种选择："kubernetes.io/hostname"，"topology.kubernetes.io/zone"以及"topology.kubernetes.io/region"
+  * service group只能填写一个拓扑key，也即只能访问本拓扑域内有效的endpoint，无法访问其它拓扑域的endpoint；而社区可以通过topologyKey列表以及"*"实现其它备选拓扑域endpoint的访问
+* ServiceGrid Controller负责根据ServiceGrid产生对应的service(包含由serviceGrid.Spec.GridUniqKey构成的topologyKeys annotations)，逻辑和DeploymentGrid Controller整体一致，如下：  
+  * 创建并维护service group需要的若干CRDs(包括：ServiceGrid)
+  * 监听ServiceGrid event，并填充ServiceGrid到工作队列中；循环从队列中取出ServiceGrid进行解析，创建并且维护对应的service
+  * 监听service event，并将相关的ServiceGrid塞到工作队列中进行上述处理，协助上述逻辑达到整体reconcile逻辑
+* 为了实现Kubernetes零侵入，需要在kube-proxy与apiserver通信之间添加一层wrapper，调用链路如下：`kube-proxy -> application-grid-wrapper -> lite-apiserver -> kube-apiserver`
+* application-grid-wrapper是一个http server，接受来自kube-proxy的请求，同时维护一个资源缓存，处理函数由外到内依次如下：
+  * debug：接受debug请求，返回wrapper pprof运行信息
+  * logger：打印请求日志
+  * node：接受kube-proxy node GET(/api/v1/nodes/{node})请求，并返回node信息
+  * event：接受kube-proxy events POST(/events)请求，并将请求转发给lite-apiserver
+  * service：接受kube-proxy service List&Watch(/api/v1/services)请求，并根据storageCache内容返回(GetServices)
+  * endpoint：接受kube-proxy endpoint List&Watch(/api/v1/endpoints)请求，并根据storageCache内容返回(GetEndpoints)
+* wrapper为了实现拓扑感知，维护了一个资源cache，包括：node，service，endpoint，同时注册了相关event处理函数。核心拓扑算法逻辑为：调用filterConcernedAddresses过滤endpoint.Subsets Addresses以及NotReadyAddresses，只保留同一个service topologyKeys中的endpoint。另外，如果wrapper所在边缘节点没有service topologyKeys标签，则也无法访问该service
+* wrapper接受来自kube-proxy对endpoints以及service的List&Watch请求，以endpoints为例：如果为List请求，则调用GetEndpoints获取拓扑修改后的endpoints列表，并返回；如果为Watch请求，则不断从storageCache.endpointsWatchCh管道中接受watch event，并返回。service逻辑与endpoints一致

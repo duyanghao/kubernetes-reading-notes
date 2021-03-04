@@ -1072,3 +1072,7 @@ interceptServiceRequest逻辑与interceptEndpointsRequest一致，这里不再�
   * endpoint：接受kube-proxy endpoint List&Watch(/api/v1/endpoints)请求，并根据storageCache内容返回(GetEndpoints)
 * wrapper为了实现拓扑感知，维护了一个资源cache，包括：node，service，endpoint，同时注册了相关event处理函数。核心拓扑算法逻辑为：调用filterConcernedAddresses过滤endpoint.Subsets Addresses以及NotReadyAddresses，只保留同一个service topologyKeys中的endpoint。另外，如果wrapper所在边缘节点没有service topologyKeys标签，则也无法访问该service
 * wrapper接受来自kube-proxy对endpoints以及service的List&Watch请求，以endpoints为例：如果为List请求，则调用GetEndpoints获取拓扑修改后的endpoints列表，并返回；如果为Watch请求，则不断从storageCache.endpointsWatchCh管道中接受watch event，并返回。service逻辑与endpoints一致
+
+## 展望
+
+目前SuperEdge service group实现的拓扑算法功能部分与社区重合，而且随着Kubernetes的发展，application-grid-wrapper的维护成本会越来越大，因此未来的发展方向一定是将SuperEdge拓扑算法推到社区，直接采用Kubernetes service topology awareness

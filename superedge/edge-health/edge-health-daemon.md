@@ -27,7 +27,76 @@ SuperEdge 分布式健康检查edge-health-daemon源码分析
 
 ![](images/edge-health-arch.png)
 
-从图中可以看到
+从图中可以看到分布式健康检查功能实现组件有两个：
+
+* edge-health-daemon(边缘)：负责对同区域边缘节点执行分布式健康检查，并向apiserver发送健康状态投票结果
+* edge-health-admission(云端)：[Kubernetes mutating admission webhook](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#mutatingadmissionwebhook)，负责在云端协助edge-health-daemon完成最终边缘节点状态的裁定
+
+本章将介绍edge-health-daemon原理。在深入源码之前先介绍一下edge-health-daemon相关数据结构：
+
+```go
+type EdgeHealthMetadata struct {
+	*NodeMetadata
+	*CheckMetadata
+}
+
+type NodeMetadata struct {
+	NodeList []v1.Node
+	sync.RWMutex
+}
+
+type CheckMetadata struct {
+	CheckInfo            map[string]map[string]CheckDetail // Checker ip:{Checked ip:Check detail}
+	CheckPluginScoreInfo map[string]map[string]float64     // Checked ip:{Plugin name:Check score}
+	sync.RWMutex
+}
+
+type CheckDetail struct {
+	Normal bool
+	Time   time.Time
+}
+
+type CommunInfo struct {
+	SourceIP    string                 // ClientIP，Checker ip
+	CheckDetail map[string]CheckDetail // Checked ip:Check detail
+	Hmac        string
+}
+```
+
+含义如下：
+
+* NodeMetadata：为了实现分区域分布式健康检查机制而维护的边缘节点cache，其中包含该区域内的所有边缘节点列表NodeList
+* CheckMetadata：存放健康检查的结果，具体来说包括两个数据结构：
+  * CheckPluginScoreInfo：为`Checked ip:{Plugin name:Check score}`组织形式。第一级key表示：被检查的ip；第二级key表示：检查插件的名称；value表示：检查分数
+  * CheckInfo：为`Checker ip:{Checked ip:Check detail}`组织形式。第一级key表示：执行检查的ip；第二级key表示：被检查的ip；value表示检查结果CheckDetail
+* CheckDetail：代表健康检查的结果
+  * Normal：Normal为true表示检查结果正常；false表示异常
+  * Time：表示得出该结果时的时间，用于结果有效性的判断(超过一段时间没有更新的结果将无效)
+* CommunInfo：边缘节点向其它节点发送健康检查结果时使用的数据，其中包括：
+  * SourceIP：表示执行检查的ip
+  * CheckDetail：为`Checked ip:Check detail`组织形式，包含被检查的ip以及检查结果
+  * Hmac：边缘节点通信过程中使用的密钥，用于判断数据的有效性(是否被篡改)
+
+edge-health-daemon主体逻辑包括四部分功能：
+
+* SyncNodeList：根据边缘节点所在的zone刷新node cache，同时更新CheckMetadata相关数据
+* ExecuteCheck：对每个边缘节点执行若干种类的健康检查插件(ping，kubelet等)，并将各插件检查分数汇总，根据用户设置的基准线得出节点是否健康的结果
+* Commun：将本节点对其它各节点健康检查的结果发送给其它节点
+* Vote：对所有节点健康检查的结果分类，如果某个节点被大多数(>1/2)节点判定为正常，则对该节点添加`superedgehealth/node-health：true` annotation，表明该节点分布式健康检查结果为正常；否则，对该节点添加`superedgehealth/node-health：false` annotation，表明该节点分布式健康检查结果为异常
+
+下面依次对上述功能进行源码分析：
+
+1、SyncNodeList
+
+
+
+2、ExecuteCheck
+
+3、Commun
+
+4、Vote
+
+
 
 ## 总结
 

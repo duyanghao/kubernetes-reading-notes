@@ -7,6 +7,5 @@ superedge reading notes based on main branch of [superedge/superedge](https://gi
 
 ## Contents
 
-* [edge-health介绍](introduction.md)
 * [edge-health-daemon分析](edge-health-daemon.md)
 * [edge-health-admission分析](edge-health-admission.md)

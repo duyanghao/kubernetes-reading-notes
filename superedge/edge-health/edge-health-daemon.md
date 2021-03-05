@@ -23,16 +23,42 @@ SuperEdge 分布式健康检查edge-health-daemon源码分析
 
 ## edge-health-daemon源码分析
 
-分布式健康检查架构图如下：
+在深入源码之前先介绍一下分布式健康检查的实现原理，其架构图如下所示：
 
 ![](images/edge-health-arch.png)
 
-从图中可以看到分布式健康检查功能实现组件有两个：
+Kubernetes每个node在kube-node-lease namespace下会对应一个Lease object，kubelet每隔node-status-update-frequency时间(默认10s)会更新对应node的Lease object
 
-* edge-health-daemon(边缘)：负责对同区域边缘节点执行分布式健康检查，并向apiserver发送健康状态投票结果
-* edge-health-admission(云端)：[Kubernetes mutating admission webhook](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#mutatingadmissionwebhook)，负责在云端协助edge-health-daemon完成最终边缘节点状态的裁定
+node-controller会每隔node-monitor-period时间(默认5s)检查Lease object是否更新，如果超过node-monitor-grace-period时间(默认40s)没有发生过更新，则认为这个node不健康，会更新NodeStatus(ConditionUnknown)
 
-本章将介绍edge-health-daemon原理。在深入源码之前先介绍一下edge-health-daemon相关数据结构：
+而当节点心跳超时(ConditionUnknown)之后，node controller会给该node添加如下taints：
+
+```yaml
+spec:
+  ...
+  taints:
+  - effect: NoSchedule
+    key: node.kubernetes.io/unreachable
+    timeAdded: "2020-07-02T03:50:47Z"
+  - effect: NoExecute
+    key: node.kubernetes.io/unreachable
+    timeAdded: "2020-07-02T03:50:53Z"
+```
+
+同时，endpoint controller会从endpoint backend中踢掉该母机上的所有pod
+
+对于打上NoSchedule taint的母机，Scheduler不会调度新的负载在该node上了；而对于打上NoExecute(node.kubernetes.io/unreachable) taint的母机，node controller会在节点心跳超时之后一段时间(默认5mins)驱逐该节点上的pod
+
+分布式健康检查边端的edge-health-daemon组件会对同区域边缘节点执行分布式健康检查，并向apiserver发送健康状态投票结果(给node打annotation)
+
+此外，为了实现在云边断连且分布式健康检查状态正常的情况下：
+
+* 失联的节点上的pod不会从Service的Endpoint列表中移除
+* 失联的节点上的pod不会被驱逐
+
+还需要在云端运行edge-health-admission([Kubernetes mutating admission webhook](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#mutatingadmissionwebhook))，不断根据node edge-health annotation调整kube-controller-manager设置的node taint(去掉NoExecute taint)以及endpoints(将失联节点上的pods从endpoint subsets notReadyAddresses移到addresses中)，从而实现云端和边端共同决定节点状态
+
+本章将主要介绍edge-health-daemon原理，如下为edge-health-daemon的相关数据结构：
 
 ```go
 type EdgeHealthMetadata struct {

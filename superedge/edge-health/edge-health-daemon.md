@@ -23,4 +23,13 @@ SuperEdge 分布式健康检查edge-health-daemon源码分析
 
 ## edge-health-daemon源码分析
 
+分布式健康检查架构图如下：
+
+![](images/edge-health-arch.png)
+
+从图中可以看到
+
+## 总结
+
+## 展望
 

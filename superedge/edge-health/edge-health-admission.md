@@ -25,9 +25,9 @@ SuperEdge分布式健康检查功能由边端的edge-health-daemon以及云端�
 
 >> Admission webhooks are HTTP callbacks that receive admission requests and do something with them. You can define two types of admission webhooks, validating admission webhook and mutating admission webhook. Mutating admission webhooks are invoked first, and can modify objects sent to the API server to enforce custom defaults. After all object modifications are complete, and after the incoming object is validated by the API server, validating admission webhooks are invoked and can reject requests to enforce custom policies.
 
-Kubernetes Admission Controllers是kube-apiserver的一部分功能，用于在api请求认证&鉴权之后，对象持久化之前进行调用，对请求进行校验或者修改(or both)
+Kubernetes Admission Controllers是kube-apiserver处理api请求的某个环节，用于在api请求认证&鉴权之后，对象持久化之前进行调用，对请求进行校验或者修改(or both)
 
-Kubernetes Admission Controllers包括多种admission，大多数都是内嵌代码中了。其中MutatingAdmissionWebhook以及ValidatingAdmissionWebhook controller比较特殊，它们分别会调用外部构造的mutating admission control webhooks以及validating admission control webhooks  
+Kubernetes Admission Controllers包括多种admission，大多数都内嵌在kube-apiserver代码中了。其中MutatingAdmissionWebhook以及ValidatingAdmissionWebhook controller比较特殊，它们分别会调用外部构造的mutating admission control webhooks以及validating admission control webhooks  
 
 Admission Webhooks是一个HTTP回调服务，接受AdmissionReview请求并进行处理，按照处理方式的不同，可以将Admission Webhooks分类如下：
 

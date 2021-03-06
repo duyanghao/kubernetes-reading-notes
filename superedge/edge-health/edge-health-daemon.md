@@ -101,7 +101,7 @@ type CommunInfo struct {
 * CommunInfo：边缘节点向其它节点发送健康检查结果时使用的数据，其中包括：
   * SourceIP：表示执行检查的ip
   * CheckDetail：为`Checked ip:Check detail`组织形式，包含被检查的ip以及检查结果
-  * Hmac：边缘节点通信过程中使用的密钥，用于判断数据的有效性(是否被篡改)
+  * Hmac：SourceIP以及CheckDetail进行hmac得到，用于边缘节点通信过程中判断传输数据的有效性(是否被篡改)
 
 edge-health-daemon主体逻辑包括四部分功能：
 
@@ -397,7 +397,7 @@ func (c *CommunEdge) Commun(checkMetadata *metadata.CheckMetadata, cmLister core
 }
 ```
 
-其中communSend负责发送本节点对其它各节点的检查结果；而communReceive负责接受其它边缘节点的检查结果。下面依次分析：
+其中communSend负责向其它节点发送本节点对它们的检查结果；而communReceive负责接受其它边缘节点的检查结果。下面依次分析：
 
 ```go
 func (c *CommunEdge) communSend(checkMetadata *metadata.CheckMetadata, cmLister corelisters.ConfigMapLister, localIp string) {
@@ -443,7 +443,129 @@ func (c *CommunEdge) communSend(checkMetadata *metadata.CheckMetadata, cmLister 
 }
 ```
 
+发送逻辑如下：
 
+* 构建CommunInfo结构体，包括：
+  * SourceIP：表示执行检查的ip
+  * CheckDetail：为Checked ip:Check detail组织形式，包含被检查的ip以及检查结果
+* 调用GenerateHmac构建Hmac：实际上是以kube-system下的hmac-config configmap hmackey字段为key，对SourceIP以及CheckDetail进行hmac得到，用于判断传输数据的有效性(是否被篡改)
+```go
+func GenerateHmac(communInfo metadata.CommunInfo, cmLister corelisters.ConfigMapLister) (string, error) {
+	addrBytes, err := json.Marshal(communInfo.SourceIP)
+	if err != nil {
+		return "", err
+	}
+	detailBytes, _ := json.Marshal(communInfo.CheckDetail)
+	if err != nil {
+		return "", err
+	}
+	hmacBefore := string(addrBytes) + string(detailBytes)
+	if hmacConf, err := cmLister.ConfigMaps(metav1.NamespaceSystem).Get(common.HmacConfig); err != nil {
+		return "", err
+	} else {
+		return GetHmacCode(hmacBefore, hmacConf.Data[common.HmacKey])
+	}
+}
+
+func GetHmacCode(s, key string) (string, error) {
+	h := hmac.New(sha256.New, []byte(key))
+	if _, err := io.WriteString(h, s); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+```
+* 发送上述构建的CommunInfo给其它边缘节点(DoRequestAndDiscard)
+
+communReceive逻辑也很清晰：
+
+```go
+// TODO: support changeable server listen port
+func (c *CommunEdge) communReceive(checkMetadata *metadata.CheckMetadata, cmLister corelisters.ConfigMapLister, stopCh <-chan struct{}) {
+	svr := &http.Server{Addr: ":" + strconv.Itoa(c.CommunServerPort)}
+	svr.ReadTimeout = time.Duration(c.CommunTimeout) * time.Second
+	svr.WriteTimeout = time.Duration(c.CommunTimeout) * time.Second
+	http.HandleFunc("/debug/flags/v", pkgutil.UpdateLogLevel)
+	http.HandleFunc("/result", func(w http.ResponseWriter, r *http.Request) {
+		var communInfo metadata.CommunInfo
+		if r.Body == nil {
+			http.Error(w, "Invalid commun information", http.StatusBadRequest)
+			return
+		}
+
+		err := json.NewDecoder(r.Body).Decode(&communInfo)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid commun information %+v", err), http.StatusBadRequest)
+			return
+		}
+		log.V(4).Infof("Received common information from %s : %+v", communInfo.SourceIP, communInfo.CheckDetail)
+
+		if _, err := io.WriteString(w, "Received!\n"); err != nil {
+			log.Errorf("communReceive: send response err %+v", err)
+			http.Error(w, fmt.Sprintf("Send response err %+v", err), http.StatusInternalServerError)
+			return
+		}
+		if hmac, err := util.GenerateHmac(communInfo, cmLister); err != nil {
+			log.Errorf("communReceive: server GenerateHmac err %+v", err)
+			http.Error(w, fmt.Sprintf("GenerateHmac err %+v", err), http.StatusInternalServerError)
+			return
+		} else {
+			if hmac != communInfo.Hmac {
+				log.Errorf("communReceive: Hmac not equal, hmac is %s but received commun info hmac is %s", hmac, communInfo.Hmac)
+				http.Error(w, "Hmac not match", http.StatusForbidden)
+				return
+			}
+		}
+		log.V(4).Infof("communReceive: Hmac match")
+
+		checkMetadata.SetByCommunInfo(communInfo)
+		log.V(4).Infof("After communicate, check info is %+v", checkMetadata.CheckInfo)
+	})
+
+	go func() {
+		if err := svr.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatalf("Server: exit with error %+v", err)
+		}
+	}()
+
+	for {
+		select {
+		case <-stopCh:
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := svr.Shutdown(ctx); err != nil {
+				log.Errorf("Server: program exit, server exit error %+v", err)
+			}
+			return
+		default:
+		}
+	}
+}
+```
+
+负责接受其它边缘节点的检查结果，并写入自身检查结果CheckInfo，流程如下：
+
+* 通过`/result`路由接受请求，并将请求内容解析成CommunInfo
+* 对CommunInfo执行GenerateHmac获取hmac值，并与CommunInfo.Hmac字段进行对比，检查接受数据的有效性
+* 最后将CommunInfo检查结果写入CheckInfo，注意：CheckDetail.Time设置为写入时的时间
+```go
+// CheckInfo relevant functions
+func (cm *CheckMetadata) SetByCommunInfo(c CommunInfo) {
+	cm.Lock()
+	defer cm.Unlock()
+
+	if _, existed := cm.CheckInfo[c.SourceIP]; !existed {
+		cm.CheckInfo[c.SourceIP] = make(map[string]CheckDetail)
+	}
+	for k, detail := range c.CheckDetail {
+		// Update time to local timestamp since different machines have different ones
+		detail.Time = time.Now()
+		c.CheckDetail[k] = detail
+	}
+	cm.CheckInfo[c.SourceIP] = c.CheckDetail
+}
+```
+* 最后在接受到stopCh信号时，通过svr.Shutdown平滑关闭服务
 
 4、Vote
 

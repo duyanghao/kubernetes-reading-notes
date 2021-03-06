@@ -23,7 +23,7 @@ SuperEdge 分布式健康检查edge-health-daemon源码分析
 
 ## edge-health-daemon源码分析
 
-在深入源码之前先介绍一下分布式健康检查的实现原理，其架构图如下所示：
+下面将基于我对edge-health的重构PR[Refactor edge-health and admission webhook for a better maintainability and extendibility](https://github.com/superedge/superedge/pull/46)进行分析，在深入源码之前先介绍一下分布式健康检查的实现原理，其架构图如下所示：
 
 ![](images/edge-health-arch.png)
 

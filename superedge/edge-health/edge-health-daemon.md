@@ -716,14 +716,37 @@ util.ParallelizeUntil(context.TODO(), 16, len(consVoteIpList), func(index int) {
 })
 ```
 
-在向apiserver发送边端健康结果后，云端运行edge-health-admission(Kubernetes mutating admission webhook)，会不断根据node edge-health annotation调整kube-controller-manager设置的node taint(去掉NoExecute taint)以及endpoints(将失联节点上的pods从endpoint subsets notReadyAddresses移到addresses中)，从而实现即便云边断连，但是分布式健康检查状态正常的情况下：
+在向apiserver发送边端健康结果后，云端运行edge-health-admission([Kubernetes mutating admission webhook](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#mutatingadmissionwebhook))，会不断根据node edge-health annotation调整kube-controller-manager设置的node taint(去掉NoExecute taint)以及endpoints(将失联节点上的pods从endpoint subsets notReadyAddresses移到addresses中)，从而实现即便云边断连，但是分布式健康检查状态正常的情况下：
 
 * 失联的节点上的pod不会从Service的Endpoint列表中移除
 * 失联的节点上的pod不会被驱逐
 
 ## 总结
 
-
+* 分布式健康检查对于云边断连情况的处理区别原生Kubernetes如下：
+  * 原生Kubernetes：
+    * 失联的节点被置为ConditionUnknown状态，并被添加NoSchedule和NoExecute的taints
+    * 失联的节点上的pod被驱逐，并在其他节点上进行重建
+    * 失联的节点上的pod从Service的Endpoint列表中移除
+  * 分布式健康检查：
+    ![](images/edge-health-effect.png)
+* 分布式健康检查主要通过如下三个层面增强节点状态判断的准确性：
+  * 每个节点定期探测其他节点健康状态
+  * 集群内所有节点定期投票决定各节点的状态
+  * 云端和边端节点共同决定节点状态    
+* 分布式健康检查功能由边端的edge-health-daemon以及云端的edge-health-admission组成，功能分别如下：
+  * edge-health-daemon：对同区域边缘节点执行分布式健康检查，并向apiserver发送健康状态投票结果(给node打annotation)，主体逻辑包括四部分功能：
+    * SyncNodeList：根据边缘节点所在的zone刷新node cache，同时更新CheckMetadata相关数据
+    * ExecuteCheck：对每个边缘节点执行若干种类的健康检查插件(ping，kubelet等)，并将各插件检查分数汇总，根据用户设置的基准线得出节点是否健康的结果
+    * Commun：将本节点对其它各节点健康检查的结果发送给其它节点
+    * Vote：对所有节点健康检查的结果分类，如果某个节点被大多数(>1/2)节点判定为正常，则对该节点添加superedgehealth/node-health：true annotation，表明该节点分布式健康检查结果为正常；否则，对该节点添加superedgehealth/node-health：false annotation，表明该节点分布式健康检查结果为异常
+  * edge-health-admission([Kubernetes mutating admission webhook](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#mutatingadmissionwebhook))：不断根据node edge-health annotation调整kube-controller-manager设置的node taint(去掉NoExecute taint)以及endpoints(将失联节点上的pods从endpoint subsets notReadyAddresses移到addresses中)，从而实现云端和边端共同决定节点状态
 
 ## 展望
 
+目前分布式健康检查还存在如下问题：
+
+* 同一个区域内边缘节点存在脑裂的情况
+* 目前算法中，每个边缘节点在整个投票过程中都属于master角色，而且每隔一段时间会向同区域其它所有节点发送检查结果，沟通信息传递过于频繁
+
+计划未来解决脑裂情况；同时改善分布式健康检查算法，减少信息传递量，降低edge-health-daemon的负载以及增加分布式健康检查成功率

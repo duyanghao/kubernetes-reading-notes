@@ -569,8 +569,161 @@ func (cm *CheckMetadata) SetByCommunInfo(c CommunInfo) {
 
 4、Vote
 
+在接受到其它节点的健康检查结果后，vote模块会对结果进行统计得出最终判决，并向apiserver报告：
+
+```go
+func (v *VoteEdge) Vote(edgeHealthMetadata *metadata.EdgeHealthMetadata, kubeclient clientset.Interface,
+	localIp string, stopCh <-chan struct{}) {
+	go wait.Until(func() {
+		v.vote(edgeHealthMetadata, kubeclient, localIp, stopCh)
+	}, time.Duration(v.VotePeriod)*time.Second, stopCh)
+}
+```
+
+首先根据检查结果统计出状态正常以及异常的节点名称：
+
+```go
+type votePair struct {
+	pros int
+	cons int
+}
+
+...
+var (
+    prosVoteIpList, consVoteIpList []string
+    // Init votePair since cannot assign to struct field voteCountMap[checkedIp].pros in map
+    vp votePair
+)
+voteCountMap := make(map[string]votePair) // {"127.0.0.1":{"pros":1,"cons":2}}
+copyCheckInfo := edgeHealthMetadata.CopyAll()
+// Note that voteThreshold should be calculated by checked instead of checker
+// since checked represents the total valid edge health nodes while checker may contain partly ones.
+voteThreshold := (edgeHealthMetadata.GetCheckedIpLen() + 1) / 2
+for _, checkedDetails := range copyCheckInfo {
+    for checkedIp, checkedDetail := range checkedDetails {
+        if !time.Now().After(checkedDetail.Time.Add(time.Duration(v.VoteTimeout) * time.Second)) {
+            if _, existed := voteCountMap[checkedIp]; !existed {
+                voteCountMap[checkedIp] = votePair{0, 0}
+            }
+            vp = voteCountMap[checkedIp]
+            if checkedDetail.Normal {
+                vp.pros++
+                if vp.pros >= voteThreshold {
+                    prosVoteIpList = append(prosVoteIpList, checkedIp)
+                }
+            } else {
+                vp.cons++
+                if vp.cons >= voteThreshold {
+                    consVoteIpList = append(consVoteIpList, checkedIp)
+                }
+            }
+            voteCountMap[checkedIp] = vp
+        }
+    }
+}
+log.V(4).Infof("Vote: voteCountMap is %+v", voteCountMap)
+...
+```
+
+其中状态判断的逻辑如下：
+
+* 如果超过一半(>)的节点对该节点的检查结果为正常，则认为该节点状态正常(注意时间差在VoteTimeout内)
+* 如果超过一半(>)的节点对该节点的检查结果为异常，则认为该节点状态异常(注意时间差在VoteTimeout内)
+* 除开上述情况，认为节点状态判断无效，对这些节点不做任何处理(可能存在脑裂的情况)
+
+对状态正常的节点做如下处理：
+
+```go
+...
+// Handle prosVoteIpList
+util.ParallelizeUntil(context.TODO(), 16, len(prosVoteIpList), func(index int) {
+    if node := edgeHealthMetadata.GetNodeByAddr(prosVoteIpList[index]); node != nil {
+        log.V(4).Infof("Vote: vote pros to edge node %s begin ...", node.Name)
+        nodeCopy := node.DeepCopy()
+        needUpdated := false
+        if nodeCopy.Annotations == nil {
+            nodeCopy.Annotations = map[string]string{
+                common.NodeHealthAnnotation: common.NodeHealthAnnotationPros,
+            }
+            needUpdated = true
+        } else {
+            if healthy, existed := nodeCopy.Annotations[common.NodeHealthAnnotation]; existed {
+                if healthy != common.NodeHealthAnnotationPros {
+                    nodeCopy.Annotations[common.NodeHealthAnnotation] = common.NodeHealthAnnotationPros
+                    needUpdated = true
+                }
+            } else {
+                nodeCopy.Annotations[common.NodeHealthAnnotation] = common.NodeHealthAnnotationPros
+                needUpdated = true
+            }
+        }
+        if index, existed := admissionutil.TaintExistsPosition(nodeCopy.Spec.Taints, common.UnreachableNoExecuteTaint); existed {
+            nodeCopy.Spec.Taints = append(nodeCopy.Spec.Taints[:index], nodeCopy.Spec.Taints[index+1:]...)
+            needUpdated = true
+        }
+        if needUpdated {
+            if _, err := kubeclient.CoreV1().Nodes().Update(context.TODO(), nodeCopy, metav1.UpdateOptions{}); err != nil {
+                log.Errorf("Vote: update pros vote to edge node %s error %+v ", nodeCopy.Name, err)
+            } else {
+                log.V(2).Infof("Vote: update pros vote to edge node %s successfully", nodeCopy.Name)
+            }
+        }
+    } else {
+        log.Warningf("Vote: edge node addr %s not found", prosVoteIpList[index])
+    }
+})
+...
+```
+
+* 添加或者更新"superedgehealth/node-health" annotation值为"true"，表明分布式健康检查判断该节点状态正常
+* 通过如果node存在NoExecute(node.kubernetes.io/unreachable) taint，则将其去掉，并更新node
+
+而对状态异常的节点会添加或者更新"superedgehealth/node-health" annotation值为"false"，表明分布式健康检查判断该节点状态异常：
+
+```go
+// Handle consVoteIpList
+util.ParallelizeUntil(context.TODO(), 16, len(consVoteIpList), func(index int) {
+    if node := edgeHealthMetadata.GetNodeByAddr(consVoteIpList[index]); node != nil {
+        log.V(4).Infof("Vote: vote cons to edge node %s begin ...", node.Name)
+        nodeCopy := node.DeepCopy()
+        needUpdated := false
+        if nodeCopy.Annotations == nil {
+            nodeCopy.Annotations = map[string]string{
+                common.NodeHealthAnnotation: common.NodeHealthAnnotationCons,
+            }
+            needUpdated = true
+        } else {
+            if healthy, existed := nodeCopy.Annotations[common.NodeHealthAnnotation]; existed {
+                if healthy != common.NodeHealthAnnotationCons {
+                    nodeCopy.Annotations[common.NodeHealthAnnotation] = common.NodeHealthAnnotationCons
+                    needUpdated = true
+                }
+            } else {
+                nodeCopy.Annotations[common.NodeHealthAnnotation] = common.NodeHealthAnnotationCons
+                needUpdated = true
+            }
+        }
+        if needUpdated {
+            if _, err := kubeclient.CoreV1().Nodes().Update(context.TODO(), nodeCopy, metav1.UpdateOptions{}); err != nil {
+                log.Errorf("Vote: update cons vote to edge node %s error %+v ", nodeCopy.Name, err)
+            } else {
+                log.V(2).Infof("Vote: update cons vote to edge node %s successfully", nodeCopy.Name)
+            }
+        }
+    } else {
+        log.Warningf("Vote: edge node addr %s not found", consVoteIpList[index])
+    }
+})
+```
+
+在向apiserver发送边端健康结果后，云端运行edge-health-admission(Kubernetes mutating admission webhook)，会不断根据node edge-health annotation调整kube-controller-manager设置的node taint(去掉NoExecute taint)以及endpoints(将失联节点上的pods从endpoint subsets notReadyAddresses移到addresses中)，从而实现即便云边断连，但是分布式健康检查状态正常的情况下：
+
+* 失联的节点上的pod不会从Service的Endpoint列表中移除
+* 失联的节点上的pod不会被驱逐
 
 ## 总结
+
+
 
 ## 展望
 

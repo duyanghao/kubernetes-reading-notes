@@ -114,14 +114,338 @@ edge-health-daemon主体逻辑包括四部分功能：
 
 1、SyncNodeList
 
+SyncNodeList每隔HealthCheckPeriod秒(health-check-period选项)执行一次，会按照如下情况分类刷新node cache：
 
+* 如果kube-system namespace下不存在名为edge-health-zone-config的configmap，则没有开启多地域探测，因此会获取所有边缘节点列表并刷新node cache
+* 否则，如果edge-health-zone-config的configmap数据部分TaintZoneAdmission为false，则没有开启多地域探测，因此会获取所有边缘节点列表并刷新node cache
+* 如果TaintZoneAdmission为true，且node有"superedgehealth/topology-zone"标签(标示区域)，则获取"superedgehealth/topology-zone" label value相同的节点列表并刷新node cache
+* 如果node没有"superedgehealth/topology-zone" label，则只会将边缘节点本身添加到分布式健康检查节点列表中并刷新node cache(only itself)
+
+```go
+func (ehd *EdgeHealthDaemon) SyncNodeList() {
+	// Only sync nodes when self-located found
+	var host *v1.Node
+	if host = ehd.metadata.GetNodeByName(ehd.cfg.Node.HostName); host == nil {
+		klog.Errorf("Self-hostname %s not found", ehd.cfg.Node.HostName)
+		return
+	}
+
+	// Filter cloud nodes and retain edge ones
+	masterRequirement, err := labels.NewRequirement(common.MasterLabel, selection.DoesNotExist, []string{})
+	if err != nil {
+		klog.Errorf("New masterRequirement failed %+v", err)
+		return
+	}
+	masterSelector := labels.NewSelector()
+	masterSelector = masterSelector.Add(*masterRequirement)
+
+	if mrc, err := ehd.cmLister.ConfigMaps(metav1.NamespaceSystem).Get(common.TaintZoneConfigMap); err != nil {
+		if apierrors.IsNotFound(err) { // multi-region configmap not found
+			if NodeList, err := ehd.nodeLister.List(masterSelector); err != nil {
+				klog.Errorf("Multi-region configmap not found and get nodes err %+v", err)
+				return
+			} else {
+				ehd.metadata.SetByNodeList(NodeList)
+			}
+		} else {
+			klog.Errorf("Get multi-region configmap err %+v", err)
+			return
+		}
+	} else { // multi-region configmap found
+		mrcv := mrc.Data[common.TaintZoneConfigMapKey]
+		klog.V(4).Infof("Multi-region value is %s", mrcv)
+		if mrcv == "false" { // close multi-region check
+			if NodeList, err := ehd.nodeLister.List(masterSelector); err != nil {
+				klog.Errorf("Multi-region configmap exist but disabled and get nodes err %+v", err)
+				return
+			} else {
+				ehd.metadata.SetByNodeList(NodeList)
+			}
+		} else { // open multi-region check
+			if hostZone, existed := host.Labels[common.TopologyZone]; existed {
+				klog.V(4).Infof("Host %s has HostZone %s", host.Name, hostZone)
+				zoneRequirement, err := labels.NewRequirement(common.TopologyZone, selection.Equals, []string{hostZone})
+				if err != nil {
+					klog.Errorf("New masterZoneRequirement failed: %+v", err)
+					return
+				}
+				masterZoneSelector := labels.NewSelector()
+				masterZoneSelector = masterZoneSelector.Add(*masterRequirement, *zoneRequirement)
+				if nodeList, err := ehd.nodeLister.List(masterZoneSelector); err != nil {
+					klog.Errorf("TopologyZone label for hostname %s but get nodes err: %+v", host.Name, err)
+					return
+				} else {
+					ehd.metadata.SetByNodeList(nodeList)
+				}
+			} else { // Only check itself if there is no TopologyZone label
+				klog.V(4).Infof("Only check itself since there is no TopologyZone label for hostname %s", host.Name)
+				ehd.metadata.SetByNodeList([]*v1.Node{host})
+			}
+		}
+	}
+
+	// Init check plugin score
+	ipList := make(map[string]struct{})
+	for _, node := range ehd.metadata.Copy() {
+		for _, addr := range node.Status.Addresses {
+			if addr.Type == v1.NodeInternalIP {
+				ipList[addr.Address] = struct{}{}
+				ehd.metadata.InitCheckPluginScore(addr.Address)
+			}
+		}
+	}
+
+	// Delete redundant check plugin score
+	for _, checkedIp := range ehd.metadata.CopyCheckedIp() {
+		if _, existed := ipList[checkedIp]; !existed {
+			ehd.metadata.DeleteCheckPluginScore(checkedIp)
+		}
+	}
+
+	// Delete redundant check info
+	for checkerIp := range ehd.metadata.CopyAll() {
+		if _, existed := ipList[checkerIp]; !existed {
+			ehd.metadata.DeleteByIp(ehd.cfg.Node.LocalIp, checkerIp)
+		}
+	}
+
+	klog.V(4).Infof("SyncNodeList check info %+v successfully", ehd.metadata)
+}
+```
+
+在按照如上逻辑更新node cache之后，会初始化CheckMetadata.CheckPluginScoreInfo，将节点ip赋值给CheckPluginScoreInfo key(`Checked ip`：被检查的ip)
+
+另外，会删除CheckMetadata.CheckPluginScoreInfo以及CheckMetadata.CheckInfo中多余的items(不属于该边缘节点检查范围)
 
 2、ExecuteCheck
 
+ExecuteCheck也是每隔HealthCheckPeriod秒(health-check-period选项)执行一次，会对每个边缘节点执行若干种类的健康检查插件(ping，kubelet等)，并将各插件检查分数汇总，根据用户设置的基准线HealthCheckScoreLine(health-check-scoreline选项)得出节点是否健康的结果
+
+```go
+func (ehd *EdgeHealthDaemon) ExecuteCheck() {
+	util.ParallelizeUntil(context.TODO(), 16, len(ehd.checkPlugin.Plugins), func(index int) {
+		ehd.checkPlugin.Plugins[index].CheckExecute(ehd.metadata.CheckMetadata)
+	})
+	klog.V(4).Infof("CheckPluginScoreInfo is %+v after health check", ehd.metadata.CheckPluginScoreInfo)
+
+	for checkedIp, pluginScores := range ehd.metadata.CopyCheckPluginScore() {
+		totalScore := 0.0
+		for _, score := range pluginScores {
+			totalScore += score
+		}
+		if totalScore >= ehd.cfg.Check.HealthCheckScoreLine {
+			ehd.metadata.SetByCheckDetail(ehd.cfg.Node.LocalIp, checkedIp, metadata.CheckDetail{Normal: true})
+		} else {
+			ehd.metadata.SetByCheckDetail(ehd.cfg.Node.LocalIp, checkedIp, metadata.CheckDetail{Normal: false})
+		}
+	}
+	klog.V(4).Infof("CheckInfo is %+v after health check", ehd.metadata.CheckInfo)
+}
+```
+
+这里会调用ParallelizeUntil并发执行各检查插件，edge-health目前支持ping以及kubelet两种检查插件，在checkplugin目录(github.com/superedge/superedge/pkg/edge-health/checkplugin)，通过Register注册到PluginInfo单例(plugin列表)中，如下：
+
+```go
+// TODO: handle flag parse errors
+func (pcp *PingCheckPlugin) Set(s string) error {
+	var err error
+	for _, para := range strings.Split(s, ",") {
+		if len(para) == 0 {
+			continue
+		}
+		arr := strings.Split(para, "=")
+		trimKey := strings.TrimSpace(arr[0])
+		switch trimKey {
+		case "timeout":
+			timeout, _ := strconv.Atoi(strings.TrimSpace(arr[1]))
+			pcp.HealthCheckoutTimeOut = timeout
+		case "retries":
+			retries, _ := strconv.Atoi(strings.TrimSpace(arr[1]))
+			pcp.HealthCheckRetries = retries
+		case "weight":
+			weight, _ := strconv.ParseFloat(strings.TrimSpace(arr[1]), 64)
+			pcp.Weight = weight
+		case "port":
+			port, _ := strconv.Atoi(strings.TrimSpace(arr[1]))
+			pcp.Port = port
+		}
+	}
+	PluginInfo = NewPlugin()
+	PluginInfo.Register(pcp)
+	return err
+}
+
+func (p *Plugin) Register(plugin CheckPlugin) {
+	p.Plugins = append(p.Plugins, plugin)
+	klog.V(4).Info("Register check plugin: %+v", plugin)
+}
+
+
+...
+var (
+	PluginOnce sync.Once
+	PluginInfo Plugin
+)
+
+type Plugin struct {
+	Plugins []CheckPlugin
+}
+
+func NewPlugin() Plugin {
+	PluginOnce.Do(func() {
+		PluginInfo = Plugin{
+			Plugins: []CheckPlugin{},
+		}
+	})
+	return PluginInfo
+}
+```
+
+每种插件具体执行健康检查的逻辑封装在CheckExecute中，这里以ping plugin为例：
+
+```go
+// github.com/superedge/superedge/pkg/edge-health/checkplugin/pingcheck.go
+func (pcp *PingCheckPlugin) CheckExecute(checkMetadata *metadata.CheckMetadata) {
+	copyCheckedIp := checkMetadata.CopyCheckedIp()
+	util.ParallelizeUntil(context.TODO(), 16, len(copyCheckedIp), func(index int) {
+		checkedIp := copyCheckedIp[index]
+		var err error
+		for i := 0; i < pcp.HealthCheckRetries; i++ {
+			if _, err := net.DialTimeout("tcp", checkedIp+":"+strconv.Itoa(pcp.Port), time.Duration(pcp.HealthCheckoutTimeOut)*time.Second); err == nil {
+				break
+			}
+		}
+		if err == nil {
+			klog.V(4).Infof("Edge ping health check plugin %s for ip %s succeed", pcp.Name(), checkedIp)
+			checkMetadata.SetByPluginScore(checkedIp, pcp.Name(), pcp.GetWeight(), common.CheckScoreMax)
+		} else {
+			klog.Warning("Edge ping health check plugin %s for ip %s failed, possible reason %s", pcp.Name(), checkedIp, err.Error())
+			checkMetadata.SetByPluginScore(checkedIp, pcp.Name(), pcp.GetWeight(), common.CheckScoreMin)
+		}
+	})
+}
+
+// CheckPluginScoreInfo relevant functions
+func (cm *CheckMetadata) SetByPluginScore(checkedIp, pluginName string, weight float64, score int) {
+	cm.Lock()
+	defer cm.Unlock()
+
+	if _, existed := cm.CheckPluginScoreInfo[checkedIp]; !existed {
+		cm.CheckPluginScoreInfo[checkedIp] = make(map[string]float64)
+	}
+	cm.CheckPluginScoreInfo[checkedIp][pluginName] = float64(score) * weight
+}
+```
+
+CheckExecute会对同区域每个节点执行ping探测(net.DialTimeout)，如果失败，则给该节点打CheckScoreMin分(0)；否则，打CheckScoreMax分(100)
+
+每种检查插件会有一个Weight参数，表示了该检查插件分数的权重值，所有权重参数之和应该为1，对应基准分数线HealthCheckScoreLine范围0-100。因此这里在设置分数时，会乘以权重
+
+回到ExecuteCheck函数，在调用各插件执行健康检查得出权重分数(CheckPluginScoreInfo)后，还需要将该分数与基准线HealthCheckScoreLine对比：如果高于(>=)分数线，则认为该节点本次检查正常；否则异常
+
+```go
+func (ehd *EdgeHealthDaemon) ExecuteCheck() {
+	util.ParallelizeUntil(context.TODO(), 16, len(ehd.checkPlugin.Plugins), func(index int) {
+		ehd.checkPlugin.Plugins[index].CheckExecute(ehd.metadata.CheckMetadata)
+	})
+	klog.V(4).Infof("CheckPluginScoreInfo is %+v after health check", ehd.metadata.CheckPluginScoreInfo)
+
+	for checkedIp, pluginScores := range ehd.metadata.CopyCheckPluginScore() {
+		totalScore := 0.0
+		for _, score := range pluginScores {
+			totalScore += score
+		}
+		if totalScore >= ehd.cfg.Check.HealthCheckScoreLine {
+			ehd.metadata.SetByCheckDetail(ehd.cfg.Node.LocalIp, checkedIp, metadata.CheckDetail{Normal: true})
+		} else {
+			ehd.metadata.SetByCheckDetail(ehd.cfg.Node.LocalIp, checkedIp, metadata.CheckDetail{Normal: false})
+		}
+	}
+	klog.V(4).Infof("CheckInfo is %+v after health check", ehd.metadata.CheckInfo)
+}
+```
+
 3、Commun
 
-4、Vote
+在对同区域各边缘节点执行健康检查后，需要将检查的结果传递给其它各节点，这也就是commun模块负责的事情：
 
+```go
+func (ehd *EdgeHealthDaemon) Run(stopCh <-chan struct{}) {
+	// Execute edge health prepare and check
+	ehd.PrepareAndCheck(stopCh)
+
+	// Execute vote
+	vote := vote.NewVoteEdge(&ehd.cfg.Vote)
+	go vote.Vote(ehd.metadata, ehd.cfg.Kubeclient, ehd.cfg.Node.LocalIp, stopCh)
+
+	// Execute communication
+	communEdge := commun.NewCommunEdge(&ehd.cfg.Commun)
+	communEdge.Commun(ehd.metadata.CheckMetadata, ehd.cmLister, ehd.cfg.Node.LocalIp, stopCh)
+
+	<-stopCh
+}
+```
+
+既然是互相传递结果给其它节点，则必然会有接受和发送模块：
+
+```go
+func (c *CommunEdge) Commun(checkMetadata *metadata.CheckMetadata, cmLister corelisters.ConfigMapLister, localIp string, stopCh <-chan struct{}) {
+	go c.communReceive(checkMetadata, cmLister, stopCh)
+	wait.Until(func() {
+		c.communSend(checkMetadata, cmLister, localIp)
+	}, time.Duration(c.CommunPeriod)*time.Second, stopCh)
+}
+```
+
+其中communSend负责发送本节点对其它各节点的检查结果；而communReceive负责接受其它边缘节点的检查结果。下面依次分析：
+
+```go
+func (c *CommunEdge) communSend(checkMetadata *metadata.CheckMetadata, cmLister corelisters.ConfigMapLister, localIp string) {
+	copyLocalCheckDetail := checkMetadata.CopyLocal(localIp)
+	var checkedIps []string
+	for checkedIp := range copyLocalCheckDetail {
+		checkedIps = append(checkedIps, checkedIp)
+	}
+	util.ParallelizeUntil(context.TODO(), 16, len(checkedIps), func(index int) {
+		// Only send commun information to other edge nodes(excluding itself)
+		dstIp := checkedIps[index]
+		if dstIp == localIp {
+			return
+		}
+		// Send commun information
+		communInfo := metadata.CommunInfo{SourceIP: localIp, CheckDetail: copyLocalCheckDetail}
+		if hmac, err := util.GenerateHmac(communInfo, cmLister); err != nil {
+			log.Errorf("communSend: generateHmac err %+v", err)
+			return
+		} else {
+			communInfo.Hmac = hmac
+		}
+		commonInfoBytes, err := json.Marshal(communInfo)
+		if err != nil {
+			log.Errorf("communSend: json.Marshal commun info err %+v", err)
+			return
+		}
+		commonInfoReader := bytes.NewReader(commonInfoBytes)
+		for i := 0; i < c.CommunRetries; i++ {
+			req, err := http.NewRequest("PUT", "http://"+dstIp+":"+strconv.Itoa(c.CommunServerPort)+"/result", commonInfoReader)
+			if err != nil {
+				log.Errorf("communSend: NewRequest for remote edge node %s err %+v", dstIp, err)
+				continue
+			}
+			if err = util.DoRequestAndDiscard(c.client, req); err != nil {
+				log.Errorf("communSend: DoRequestAndDiscard for remote edge node %s err %+v", dstIp, err)
+			} else {
+				log.V(4).Infof("communSend: put commun info %+v to remote edge node %s successfully", communInfo, dstIp)
+				break
+			}
+		}
+	})
+}
+```
+
+
+
+4、Vote
 
 
 ## 总结

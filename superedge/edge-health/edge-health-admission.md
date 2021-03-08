@@ -61,9 +61,107 @@ Admission Webhooks是一个HTTP回调服务，接受AdmissionReview请求并进�
   * None: calling the webhook will have no side effects.
   * NoneOnDryRun: calling the webhook will possibly have side effects, but if a request with dryRun: true is sent to the webhook, the webhook will suppress the side effects (the webhook is dryRun-aware).
     
-    
+kube-apiserver会发送AdmissionReview(API group: `admission.k8s.io`，version：`v1 or v1beta1`)给Webhooks，并封装成JSON格式，示例如下：
+
+```yaml
+# This example shows the data contained in an AdmissionReview object for a request to update the scale subresource of an apps/v1 Deployment
+{
+  "apiVersion": "admission.k8s.io/v1",
+  "kind": "AdmissionReview",
+  "request": {
+    # Random uid uniquely identifying this admission call
+    "uid": "705ab4f5-6393-11e8-b7cc-42010a800002",
+
+    # Fully-qualified group/version/kind of the incoming object
+    "kind": {"group":"autoscaling","version":"v1","kind":"Scale"},
+    # Fully-qualified group/version/kind of the resource being modified
+    "resource": {"group":"apps","version":"v1","resource":"deployments"},
+    # subresource, if the request is to a subresource
+    "subResource": "scale",
+
+    # Fully-qualified group/version/kind of the incoming object in the original request to the API server.
+    # This only differs from `kind` if the webhook specified `matchPolicy: Equivalent` and the
+    # original request to the API server was converted to a version the webhook registered for.
+    "requestKind": {"group":"autoscaling","version":"v1","kind":"Scale"},
+    # Fully-qualified group/version/kind of the resource being modified in the original request to the API server.
+    # This only differs from `resource` if the webhook specified `matchPolicy: Equivalent` and the
+    # original request to the API server was converted to a version the webhook registered for.
+    "requestResource": {"group":"apps","version":"v1","resource":"deployments"},
+    # subresource, if the request is to a subresource
+    # This only differs from `subResource` if the webhook specified `matchPolicy: Equivalent` and the
+    # original request to the API server was converted to a version the webhook registered for.
+    "requestSubResource": "scale",
+
+    # Name of the resource being modified
+    "name": "my-deployment",
+    # Namespace of the resource being modified, if the resource is namespaced (or is a Namespace object)
+    "namespace": "my-namespace",
+
+    # operation can be CREATE, UPDATE, DELETE, or CONNECT
+    "operation": "UPDATE",
+
+    "userInfo": {
+      # Username of the authenticated user making the request to the API server
+      "username": "admin",
+      # UID of the authenticated user making the request to the API server
+      "uid": "014fbff9a07c",
+      # Group memberships of the authenticated user making the request to the API server
+      "groups": ["system:authenticated","my-admin-group"],
+      # Arbitrary extra info associated with the user making the request to the API server.
+      # This is populated by the API server authentication layer and should be included
+      # if any SubjectAccessReview checks are performed by the webhook.
+      "extra": {
+        "some-key":["some-value1", "some-value2"]
+      }
+    },
+
+    # object is the new object being admitted.
+    # It is null for DELETE operations.
+    "object": {"apiVersion":"autoscaling/v1","kind":"Scale",...},
+    # oldObject is the existing object.
+    # It is null for CREATE and CONNECT operations.
+    "oldObject": {"apiVersion":"autoscaling/v1","kind":"Scale",...},
+    # options contains the options for the operation being admitted, like meta.k8s.io/v1 CreateOptions, UpdateOptions, or DeleteOptions.
+    # It is null for CONNECT operations.
+    "options": {"apiVersion":"meta.k8s.io/v1","kind":"UpdateOptions",...},
+
+    # dryRun indicates the API request is running in dry run mode and will not be persisted.
+    # Webhooks with side effects should avoid actuating those side effects when dryRun is true.
+    # See http://k8s.io/docs/reference/using-api/api-concepts/#make-a-dry-run-request for more details.
+    "dryRun": false
+  }
+}
+```
+
+而Webhooks需要向kube-apiserver回应具有相同版本的AdmissionReview，并封装成JSON格式，并且包含如下关键字段：
+
+* uid：拷贝发送给webhooks的AdmissionReview request.uid字段
+* allowed：true表示准许；false表示不准许
+* status：当不准许请求时，可以通过status给出相关原因(http code and message)
+* patch：base64编码，包含mutating admission webhook对请求对象的一系列[JSON patch操作](https://jsonpatch.com/)
+* patchType：目前只支持JSONPatch类型
+
+示例如下：
+
+```yaml
+# a webhook response to add that label would be：
+{
+  "apiVersion": "admission.k8s.io/v1",
+  "kind": "AdmissionReview",
+  "response": {
+    "uid": "<value from request.uid>",
+    "allowed": true,
+    "patchType": "JSONPatch",
+    "patch": "W3sib3AiOiAiYWRkIiwgInBhdGgiOiAiL3NwZWMvcmVwbGljYXMiLCAidmFsdWUiOiAzfV0="
+  }
+}
+```
+
+而这里的edge-health-admission实际上就是mutating admission webhook，下面详细分析其原理
 
 ## edge-health-admission源码分析
+
+
 
 ## 总结
 

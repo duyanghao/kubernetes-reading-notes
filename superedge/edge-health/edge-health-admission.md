@@ -17,17 +17,17 @@ SuperEdge分布式健康检查功能由边端的edge-health-daemon以及云端�
 * 失联的节点被置为ConditionUnknown状态，并被添加NoSchedule和NoExecute的taints
 * 失联的节点上的pod从Service的Endpoint列表中移除
 
-当edge-health-daemon在边端根据健康检查判断节点状态正常时，会更新node：去掉NoExecute taint。但是在node成功更新之后又会被kube-controller-manager给刷回去(再次添加NoExecute taint)，因此必须添加Kubernetes mutating admission webhook也即edge-health-admission将kube-controller-manager对node api resource的更改做调整，最终实现分布式健康检查效果
+当edge-health-daemon在边端根据健康检查判断节点状态正常时，会更新node：去掉NoExecute taint。但是在node成功更新之后又会被kube-controller-manager给刷回去(再次添加NoExecute taint)，因此必须添加Kubernetes mutating admission webhook也即edge-health-admission，将kube-controller-manager对node api resource的更改做调整，最终实现分布式健康检查效果
 
 本文将基于我对edge-health的重构PR [Refactor edge-health and admission webhook for a better maintainability and extendibility](https://github.com/superedge/superedge/pull/46) 分析edge-health-admission组件，在深入源码之前先介绍一下[Kubernetes Admission Controllers](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/)
 
 >> An admission controller is a piece of code that intercepts requests to the Kubernetes API server prior to persistence of the object, but after the request is authenticated and authorized. The controllers consist of the list below, are compiled into the kube-apiserver binary, and may only be configured by the cluster administrator. In that list, there are two special controllers: MutatingAdmissionWebhook and ValidatingAdmissionWebhook. These execute the mutating and validating (respectively) admission control webhooks which are configured in the API.
 
->> Admission webhooks are HTTP callbacks that receive admission requests and do something with them. You can define two types of admission webhooks, validating admission webhook and mutating admission webhook. Mutating admission webhooks are invoked first, and can modify objects sent to the API server to enforce custom defaults. After all object modifications are complete, and after the incoming object is validated by the API server, validating admission webhooks are invoked and can reject requests to enforce custom policies.
-
 Kubernetes Admission Controllers是kube-apiserver处理api请求的某个环节，用于在api请求认证&鉴权之后，对象持久化之前进行调用，对请求进行校验或者修改(or both)
 
 Kubernetes Admission Controllers包括多种admission，大多数都内嵌在kube-apiserver代码中了。其中MutatingAdmissionWebhook以及ValidatingAdmissionWebhook controller比较特殊，它们分别会调用外部构造的mutating admission control webhooks以及validating admission control webhooks  
+
+>> Admission webhooks are HTTP callbacks that receive admission requests and do something with them. You can define two types of admission webhooks, validating admission webhook and mutating admission webhook. Mutating admission webhooks are invoked first, and can modify objects sent to the API server to enforce custom defaults. After all object modifications are complete, and after the incoming object is validated by the API server, validating admission webhooks are invoked and can reject requests to enforce custom policies.
 
 Admission Webhooks是一个HTTP回调服务，接受AdmissionReview请求并进行处理，按照处理方式的不同，可以将Admission Webhooks分类如下：
 
@@ -36,7 +36,7 @@ Admission Webhooks是一个HTTP回调服务，接受AdmissionReview请求并进�
 
 两种类型的webhooks都需要定义如下Matching requests字段：
 
-* admissionReviewVersions：定义了apiserver所支持的AdmissionReview的版本列表(API servers send the first AdmissionReview version in the admissionReviewVersions list they support)
+* admissionReviewVersions：定义了apiserver所支持的AdmissionReview api resource的版本列表(API servers send the first AdmissionReview version in the admissionReviewVersions list they support)
 * name：webhook名称(如果一个WebhookConfiguration中定义了多个webhooks，需要保证名称的唯一性)
 * clientConfig：定义了webhook server的访问地址(url or service)以及CA bundle(optionally include a custom CA bundle to use to verify the TLS connection)
 * namespaceSelector：限定了匹配请求资源的命名空间labelSelector
@@ -123,7 +123,7 @@ webhooks:
     timeoutSeconds: 5
 ```
     
-kube-apiserver会发送AdmissionReview(API group: `admission.k8s.io`，version：`v1 or v1beta1`)给Webhooks，并封装成JSON格式，示例如下：
+kube-apiserver会发送AdmissionReview(apiGroup: `admission.k8s.io`，apiVersion：`v1 or v1beta1`)给Webhooks，并封装成JSON格式，示例如下：
 
 ```yaml
 # This example shows the data contained in an AdmissionReview object for a request to update the scale subresource of an apps/v1 Deployment
@@ -195,7 +195,7 @@ kube-apiserver会发送AdmissionReview(API group: `admission.k8s.io`，version�
 }
 ```
 
-而Webhooks需要向kube-apiserver回应具有相同版本的AdmissionReview，并封装成JSON格式，并且包含如下关键字段：
+而Webhooks需要向kube-apiserver回应具有相同版本的AdmissionReview，并封装成JSON格式，包含如下关键字段：
 
 * uid：拷贝发送给webhooks的AdmissionReview request.uid字段
 * allowed：true表示准许；false表示不准许
@@ -377,7 +377,7 @@ func (eha *EdgeHealthAdmission) mutateNodeTaint(ar admissionv1.AdmissionReview) 
 * 设置AdmissionReview.Response.Allowed为true，表示无论如何都准许该请求
 * 执行协助边端健康检查核心逻辑：在节点处于ConditionUnknown状态且分布式健康检查结果为正常的情况下，若节点存在NoExecute(node.kubernetes.io/unreachable) taint，则将其移除
 
-总都来说mutateNodeTaint的作用就是：不断修正被kube-controller-manager更新的节点状态，去掉NoExecute(node.kubernetes.io/unreachable) taint，让节点不会被驱逐
+总的来说，mutateNodeTaint的作用就是：不断修正被kube-controller-manager更新的节点状态，去掉NoExecute(node.kubernetes.io/unreachable) taint，让节点不会被驱逐
 
 2、mutateEndpoint
 
@@ -462,21 +462,21 @@ func (eha *EdgeHealthAdmission) mutateEndpoint(ar admissionv1.AdmissionReview) *
 * 检查AdmissionReview.Request.Resource是否为endpoints资源的group/version/kind
 * 将AdmissionReview.Request.Object.Raw转化为endpoints对象
 * 设置AdmissionReview.Response.Allowed为true，表示无论如何都准许该请求
-* 遍历endpoints.Subset.NotReadyAddresses，如果EndpointAddress所在节点处于ConditionUnknown状态且分布式健康检查结果为正常的情况下，则将该EndpointAddress从endpoints.Subset.NotReadyAddresses移到endpoints.Subset.Addresses
+* 遍历endpoints.Subset.NotReadyAddresses，如果EndpointAddress所在节点处于ConditionUnknown状态且分布式健康检查结果为正常，则将该EndpointAddress从endpoints.Subset.NotReadyAddresses移到endpoints.Subset.Addresses
 
-总都来说mutateEndpoint的作用就是：不断修正被kube-controller-manager更新的endpoints状态，将分布式健康检查正常节点上的负载从endpoints.Subset.NotReadyAddresses移到endpoints.Subset.Addresses中，让服务依旧可用
+总的来说，mutateEndpoint的作用就是：不断修正被kube-controller-manager更新的endpoints状态，将分布式健康检查正常节点上的负载从endpoints.Subset.NotReadyAddresses移到endpoints.Subset.Addresses中，让服务依旧可用
 
 ## 总结
 
 * SuperEdge分布式健康检查功能由边端的edge-health-daemon以及云端的edge-health-admission组成：
   * edge-health-daemon：对同区域边缘节点执行分布式健康检查，并向apiserver发送健康状态投票结果(给node打annotation)
   * edge-health-admission：不断根据node edge-health annotation调整kube-controller-manager设置的node taint(去掉NoExecute taint)以及endpoints(将失联节点上的pods从endpoint subsets notReadyAddresses移到addresses中)，从而实现云端和边端共同决定节点状态
-* 之所以创建edge-health-admission云端组件，是因为当云边断连时，kube-controller-manager会将失联的节点置为ConditionUnknown状态，并添加NoSchedule和NoExecute的taints，同时失联的节点上的pod从Service的Endpoint列表中移除。当edge-health-daemon在边端根据健康检查判断节点状态正常时，会更新node：去掉NoExecute taint。但是在node成功更新之后又会被kube-controller-manager给刷回去(再次添加NoExecute taint)，因此必须添加Kubernetes mutating admission webhook也即edge-health-admission将kube-controller-manager对node api resource的更改做调整，最终实现分布式健康检查效果  
+* 之所以创建edge-health-admission云端组件，是因为当云边断连时，kube-controller-manager会将失联的节点置为ConditionUnknown状态，并添加NoSchedule和NoExecute的taints；同时失联的节点上的pod从Service的Endpoint列表中移除。当edge-health-daemon在边端根据健康检查判断节点状态正常时，会更新node：去掉NoExecute taint。但是在node成功更新之后又会被kube-controller-manager给刷回去(再次添加NoExecute taint)，因此必须添加Kubernetes mutating admission webhook，也即edge-health-admission将kube-controller-manager对node api resource的更改做调整，最终实现分布式健康检查效果  
 * Kubernetes Admission Controllers是kube-apiserver处理api请求的某个环节，用于在api请求认证&鉴权之后，对象持久化之前进行调用，对请求进行校验或者修改(or both)；包括多种admission，大多数都内嵌在kube-apiserver代码中了。其中MutatingAdmissionWebhook以及ValidatingAdmissionWebhook controller比较特殊，它们分别会调用外部构造的mutating admission control webhooks以及validating admission control webhooks
 * Admission Webhooks是一个HTTP回调服务，接受AdmissionReview请求并进行处理，按照处理方式的不同，可以将Admission Webhooks分类如下：
   * [validating admission webhook](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#validatingadmissionwebhook)：通过ValidatingWebhookConfiguration配置，会对api请求进行准入校验，但是不能修改请求对象
   * [mutating admission webhook](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#mutatingadmissionwebhook)：通过MutatingWebhookConfiguration配置，会对api请求进行准入校验以及修改请求对象
-* kube-apiserver会发送AdmissionReview(API group: admission.k8s.io，version：v1 or v1beta1)给Webhooks，并封装成JSON格式；而Webhooks需要向kube-apiserver回应具有相同版本的AdmissionReview，并封装成JSON格式，并且包含如下关键字段：
+* kube-apiserver会发送AdmissionReview(apiGroup: `admission.k8s.io`，apiVersion：`v1 or v1beta1`)给Webhooks，并封装成JSON格式；而Webhooks需要向kube-apiserver回应具有相同版本的AdmissionReview，并封装成JSON格式，并且包含如下关键字段：
   * uid：拷贝发送给webhooks的AdmissionReview request.uid字段
   * allowed：true表示准许；false表示不准许
   * status：当不准许请求时，可以通过status给出相关原因(http code and message)

@@ -11,4 +11,4 @@ superedge reading notes based on main branch of [superedge/superedge](https://gi
 * [边缘自治](edge-autonomy/README.md)
 * [service group](service-group/README.md)
 * [分布式健康检查](edge-health/README.md)
-* [network tunneling](network-tunnel/READMD.md)
+* [network tunneling](network-tunnel/README.md)

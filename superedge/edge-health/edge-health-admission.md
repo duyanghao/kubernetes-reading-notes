@@ -223,8 +223,251 @@ edge-health-admission实际上就是一个mutating admission webhook，选择性
 
 ## edge-health-admission源码分析
 
+edge-health-admission完全参考[官方示例](https://github.com/kubernetes/kubernetes/blob/v1.13.0/test/images/webhook/main.go)编写，如下是监听入口：
 
+```go
+func (eha *EdgeHealthAdmission) Run(stopCh <-chan struct{}) {
+	if !cache.WaitForNamedCacheSync("edge-health-admission", stopCh, eha.cfg.NodeInformer.Informer().HasSynced) {
+		return
+	}
+
+	http.HandleFunc("/node-taint", eha.serveNodeTaint)
+	http.HandleFunc("/endpoint", eha.serveEndpoint)
+	server := &http.Server{
+		Addr: eha.cfg.Addr,
+	}
+
+	go func() {
+		if err := server.ListenAndServeTLS(eha.cfg.CertFile, eha.cfg.KeyFile); err != http.ErrServerClosed {
+			klog.Fatalf("ListenAndServeTLS err %+v", err)
+		}
+	}()
+
+	for {
+		select {
+		case <-stopCh:
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := server.Shutdown(ctx); err != nil {
+				klog.Errorf("Server: program exit, server exit error %+v", err)
+			}
+			return
+		default:
+		}
+	}
+}
+```
+
+这里会注册两种路由处理函数：
+
+* node-taint：对应处理函数serveNodeTaint，负责对node UPDATE请求进行更改
+* endpoint：对应处理函数serveEndpoint，负责对endpoints UPDATE请求进行更改
+
+而这两个函数都会调用serve函数，如下：
+
+```go
+// serve handles the http portion of a request prior to handing to an admit function
+func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
+	var body []byte
+	if r.Body != nil {
+		if data, err := ioutil.ReadAll(r.Body); err == nil {
+			body = data
+		}
+	}
+
+	// verify the content type is accurate
+	contentType := r.Header.Get("Content-Type")
+	if contentType != "application/json" {
+		klog.Errorf("contentType=%s, expect application/json", contentType)
+		return
+	}
+
+	klog.V(4).Info(fmt.Sprintf("handling request: %s", body))
+
+	// The AdmissionReview that was sent to the webhook
+	requestedAdmissionReview := admissionv1.AdmissionReview{}
+
+	// The AdmissionReview that will be returned
+	responseAdmissionReview := admissionv1.AdmissionReview{}
+
+	deserializer := codecs.UniversalDeserializer()
+	if _, _, err := deserializer.Decode(body, nil, &requestedAdmissionReview); err != nil {
+		klog.Error(err)
+		responseAdmissionReview.Response = toAdmissionResponse(err)
+	} else {
+		// pass to admitFunc
+		responseAdmissionReview.Response = admit(requestedAdmissionReview)
+	}
+
+	// Return the same UID
+	responseAdmissionReview.Response.UID = requestedAdmissionReview.Request.UID
+
+	klog.V(4).Info(fmt.Sprintf("sending response: %+v", responseAdmissionReview.Response))
+
+	respBytes, err := json.Marshal(responseAdmissionReview)
+	if err != nil {
+		klog.Error(err)
+	}
+	if _, err := w.Write(respBytes); err != nil {
+		klog.Error(err)
+	}
+}
+```
+
+serve逻辑如下所示：
+
+* 解析request.Body为AdmissionReview对象，并赋值给requestedAdmissionReview
+* 对AdmissionReview对象执行admit函数，并赋值给回responseAdmissionReview
+* 设置responseAdmissionReview.Response.UID为请求的AdmissionReview.Request.UID
+
+其中serveNodeTaint以及serveEndpoint对应的admit函数分别为：mutateNodeTaint以及mutateEndpoint，下面依次分析：
+
+1、mutateNodeTaint
+
+mutateNodeTaint会对node UPDATE请求按照分布式健康检查结果进行修改：
+
+```go
+func (eha *EdgeHealthAdmission) mutateNodeTaint(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
+	klog.V(4).Info("mutating node taint")
+	nodeResource := metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "nodes"}
+	if ar.Request.Resource != nodeResource {
+		klog.Errorf("expect resource to be %s", nodeResource)
+		return nil
+	}
+
+	var node corev1.Node
+	deserializer := codecs.UniversalDeserializer()
+	if _, _, err := deserializer.Decode(ar.Request.Object.Raw, nil, &node); err != nil {
+		klog.Error(err)
+		return toAdmissionResponse(err)
+	}
+
+	reviewResponse := admissionv1.AdmissionResponse{}
+	reviewResponse.Allowed = true
+
+	if index, condition := util.GetNodeCondition(&node.Status, v1.NodeReady); index != -1 && condition.Status == v1.ConditionUnknown {
+		if node.Annotations != nil {
+			var patches []*patch
+			if healthy, existed := node.Annotations[common.NodeHealthAnnotation]; existed && healthy == common.NodeHealthAnnotationPros {
+				if index, existed := util.TaintExistsPosition(node.Spec.Taints, common.UnreachableNoExecuteTaint); existed {
+					patches = append(patches, &patch{
+						OP:   "remove",
+						Path: fmt.Sprintf("/spec/taints/%d", index),
+					})
+					klog.V(4).Infof("UnreachableNoExecuteTaint: remove %d taints %s", index, node.Spec.Taints[index])
+				}
+			}
+			if len(patches) > 0 {
+				patchBytes, _ := json.Marshal(patches)
+				reviewResponse.Patch = patchBytes
+				pt := admissionv1.PatchTypeJSONPatch
+				reviewResponse.PatchType = &pt
+			}
+		}
+	}
+
+	return &reviewResponse
+}
+```
+
+主体逻辑如下：
+
+* 检查AdmissionReview.Request.Resource是否为node资源的group/version/kind
+* 将AdmissionReview.Request.Object.Raw转化为node对象
+* 设置AdmissionReview.Response.Allowed为true，表示无论如何都准许该请求
+* 执行协助边端健康检查核心逻辑：在节点处于ConditionUnknown状态且分布式健康检查结果为正常的情况下，若节点存在NoExecute(node.kubernetes.io/unreachable) taint，则将其移除
+
+总都来说mutateNodeTaint的作用就是：不断修正被kube-controller-manager更新的节点状态，去掉NoExecute(node.kubernetes.io/unreachable) taint，让节点不会被驱逐
+
+2、mutateEndpoint
+
+mutateEndpoint会对endpoints UPDATE请求按照分布式健康检查结果进行修改：
+
+```go
+func (eha *EdgeHealthAdmission) mutateEndpoint(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
+	klog.V(4).Info("mutating endpoint")
+	endpointResource := metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "endpoints"}
+	if ar.Request.Resource != endpointResource {
+		klog.Errorf("expect resource to be %s", endpointResource)
+		return nil
+	}
+
+	var endpoint corev1.Endpoints
+	deserializer := codecs.UniversalDeserializer()
+	if _, _, err := deserializer.Decode(ar.Request.Object.Raw, nil, &endpoint); err != nil {
+		klog.Error(err)
+		return toAdmissionResponse(err)
+	}
+
+	reviewResponse := admissionv1.AdmissionResponse{}
+	reviewResponse.Allowed = true
+
+	for epSubsetIndex, epSubset := range endpoint.Subsets {
+		for notReadyAddrIndex, EndpointAddress := range epSubset.NotReadyAddresses {
+			if node, err := eha.nodeLister.Get(*EndpointAddress.NodeName); err == nil {
+				if index, condition := util.GetNodeCondition(&node.Status, v1.NodeReady); index != -1 && condition.Status == v1.ConditionUnknown {
+					if node.Annotations != nil {
+						var patches []*patch
+						if healthy, existed := node.Annotations[common.NodeHealthAnnotation]; existed && healthy == common.NodeHealthAnnotationPros {
+							// TODO: handle readiness probes failure
+							// Remove address on node from endpoint notReadyAddresses
+							patches = append(patches, &patch{
+								OP:   "remove",
+								Path: fmt.Sprintf("/subsets/%d/notReadyAddresses/%d", epSubsetIndex, notReadyAddrIndex),
+							})
+
+							// Add address on node to endpoint readyAddresses
+							TargetRef := map[string]interface{}{}
+							TargetRef["kind"] = EndpointAddress.TargetRef.Kind
+							TargetRef["namespace"] = EndpointAddress.TargetRef.Namespace
+							TargetRef["name"] = EndpointAddress.TargetRef.Name
+							TargetRef["uid"] = EndpointAddress.TargetRef.UID
+							TargetRef["apiVersion"] = EndpointAddress.TargetRef.APIVersion
+							TargetRef["resourceVersion"] = EndpointAddress.TargetRef.ResourceVersion
+							TargetRef["fieldPath"] = EndpointAddress.TargetRef.FieldPath
+
+							patches = append(patches, &patch{
+								OP:   "add",
+								Path: fmt.Sprintf("/subsets/%d/addresses/0", epSubsetIndex),
+								Value: map[string]interface{}{
+									"ip":        EndpointAddress.IP,
+									"hostname":  EndpointAddress.Hostname,
+									"nodeName":  EndpointAddress.NodeName,
+									"targetRef": TargetRef,
+								},
+							})
+
+							if len(patches) != 0 {
+								patchBytes, _ := json.Marshal(patches)
+								reviewResponse.Patch = patchBytes
+								pt := admissionv1.PatchTypeJSONPatch
+								reviewResponse.PatchType = &pt
+							}
+						}
+					}
+				}
+			} else {
+				klog.Errorf("Get pod's node err %+v", err)
+			}
+		}
+
+	}
+
+	return &reviewResponse
+}
+```
+
+主体逻辑如下：
+
+* 检查AdmissionReview.Request.Resource是否为endpoints资源的group/version/kind
+* 将AdmissionReview.Request.Object.Raw转化为endpoints对象
+* 设置AdmissionReview.Response.Allowed为true，表示无论如何都准许该请求
+* 遍历endpoints.Subset.NotReadyAddresses，如果EndpointAddress所在节点处于ConditionUnknown状态且分布式健康检查结果为正常的情况下，则将该EndpointAddress从endpoints.Subset.NotReadyAddresses移到endpoints.Subset.Addresses
+
+总都来说mutateEndpoint的作用就是：不断修正被kube-controller-manager更新的endpoints状态，将分布式健康检查正常节点上的负载从endpoints.Subset.NotReadyAddresses移到endpoints.Subset.Addresses中
 
 ## 总结
+
+
 
 ## 展望

@@ -464,10 +464,33 @@ func (eha *EdgeHealthAdmission) mutateEndpoint(ar admissionv1.AdmissionReview) *
 * 设置AdmissionReview.Response.Allowed为true，表示无论如何都准许该请求
 * 遍历endpoints.Subset.NotReadyAddresses，如果EndpointAddress所在节点处于ConditionUnknown状态且分布式健康检查结果为正常的情况下，则将该EndpointAddress从endpoints.Subset.NotReadyAddresses移到endpoints.Subset.Addresses
 
-总都来说mutateEndpoint的作用就是：不断修正被kube-controller-manager更新的endpoints状态，将分布式健康检查正常节点上的负载从endpoints.Subset.NotReadyAddresses移到endpoints.Subset.Addresses中
+总都来说mutateEndpoint的作用就是：不断修正被kube-controller-manager更新的endpoints状态，将分布式健康检查正常节点上的负载从endpoints.Subset.NotReadyAddresses移到endpoints.Subset.Addresses中，让服务依旧可用
 
 ## 总结
 
-
+* SuperEdge分布式健康检查功能由边端的edge-health-daemon以及云端的edge-health-admission组成：
+  * edge-health-daemon：对同区域边缘节点执行分布式健康检查，并向apiserver发送健康状态投票结果(给node打annotation)
+  * edge-health-admission：不断根据node edge-health annotation调整kube-controller-manager设置的node taint(去掉NoExecute taint)以及endpoints(将失联节点上的pods从endpoint subsets notReadyAddresses移到addresses中)，从而实现云端和边端共同决定节点状态
+* 之所以创建edge-health-admission云端组件，是因为当云边断连时，kube-controller-manager会将失联的节点置为ConditionUnknown状态，并添加NoSchedule和NoExecute的taints，同时失联的节点上的pod从Service的Endpoint列表中移除。当edge-health-daemon在边端根据健康检查判断节点状态正常时，会更新node：去掉NoExecute taint。但是在node成功更新之后又会被kube-controller-manager给刷回去(再次添加NoExecute taint)，因此必须添加Kubernetes mutating admission webhook也即edge-health-admission将kube-controller-manager对node api resource的更改做调整，最终实现分布式健康检查效果  
+* Kubernetes Admission Controllers是kube-apiserver处理api请求的某个环节，用于在api请求认证&鉴权之后，对象持久化之前进行调用，对请求进行校验或者修改(or both)；包括多种admission，大多数都内嵌在kube-apiserver代码中了。其中MutatingAdmissionWebhook以及ValidatingAdmissionWebhook controller比较特殊，它们分别会调用外部构造的mutating admission control webhooks以及validating admission control webhooks
+* Admission Webhooks是一个HTTP回调服务，接受AdmissionReview请求并进行处理，按照处理方式的不同，可以将Admission Webhooks分类如下：
+  * [validating admission webhook](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#validatingadmissionwebhook)：通过ValidatingWebhookConfiguration配置，会对api请求进行准入校验，但是不能修改请求对象
+  * [mutating admission webhook](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#mutatingadmissionwebhook)：通过MutatingWebhookConfiguration配置，会对api请求进行准入校验以及修改请求对象
+* kube-apiserver会发送AdmissionReview(API group: admission.k8s.io，version：v1 or v1beta1)给Webhooks，并封装成JSON格式；而Webhooks需要向kube-apiserver回应具有相同版本的AdmissionReview，并封装成JSON格式，并且包含如下关键字段：
+  * uid：拷贝发送给webhooks的AdmissionReview request.uid字段
+  * allowed：true表示准许；false表示不准许
+  * status：当不准许请求时，可以通过status给出相关原因(http code and message)
+  * patch：base64编码，包含mutating admission webhook对请求对象的一系列JSON patch操作
+  * patchType：目前只支持JSONPatch类型
+* edge-health-admission实际上就是一个mutating admission webhook，选择性地对endpoints以及node UPDATE请求进行修改，包含如下处理逻辑：
+  * mutateNodeTaint：不断修正被kube-controller-manager更新的节点状态，去掉NoExecute(node.kubernetes.io/unreachable) taint，让节点不会被驱逐
+  * mutateEndpoint：不断修正被kube-controller-manager更新的endpoints状态，将分布式健康检查正常节点上的负载从endpoints.Subset.NotReadyAddresses移到endpoints.Subset.Addresses中，让服务依旧可用  
 
 ## 展望
+
+SuperEdge为了实现对Kubernetes完全无侵入，设计了edge-health-admission调整kube-controller-manager对node以及endpoints的更改，但是目前也存在如下问题：
+
+* 在edge-health-admission将kube-controller-manager对node api resource的更新请求调整之后，kube-controller-manager又会重新发出同样的更新请求，这样会造成对apiserver以及etcd一定的压力
+* 对于endpoints的调整工作，目前是粗暴地将分布式健康检查正常节点上的所有负载从endpoints.Subset.NotReadyAddresses移到endpoints.Subset.Addresses中，但是没有考虑到服务本身不可用的情况(readiness probes failure)
+
+后续会考虑优化这两点

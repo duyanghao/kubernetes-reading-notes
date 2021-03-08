@@ -7,5 +7,4 @@ superedge reading notes based on main branch of [superedge/superedge](https://gi
 
 ## Contents
 
-* [network-tunnel介绍](introduction.md)
-* [tunnel分析](tunnel.md)
+* [network-tunnel分析](network-tunnel.md)

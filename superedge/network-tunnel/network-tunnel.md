@@ -111,7 +111,7 @@ TunnelCloud包含如下结构：
 
 在介绍完tunnel的配置后，下面介绍tunnel使用的内部数据结构(github.com/superedge/superedge/pkg/tunnel/context)：
 
-1、StreamMsg
+1、StreamMsg(grpc隧道)
 
 StreamMsg为云边grpc隧道传输的数据格式：
 
@@ -129,7 +129,7 @@ message StreamMsg {
 * node：表示边缘节点名称
 * category：消息范畴
 * type：消息类型
-* topic：消息uid
+* topic：消息含义标示
 * data：消息数据内容
 * addr：相关地址
 
@@ -535,7 +535,7 @@ func Send(client proto.StreamClient, clictx ctx.Context) {
 
 stream.Send会向grpc连接对端，也即云端tunnel，发送空消息并等待对方回应
 
-相应的，云端tunnel会对该消息进行接受并回应，如下：
+相应的，云端tunnel会接受消息并回应，如下：
 
 ```go
 func StartServer() {
@@ -589,12 +589,259 @@ func (s *Server) TunnelStreaming(stream proto.Stream_TunnelStreamingServer) erro
 
 之后StartSendClient会每隔1s发送空消息给云端tunnel，并接受回应，来保持连接一直处于Ready状态
 
-2、tcpProxy
+这里重新回到StartClient函数：
 
+```go
+func StartClient() (*grpc.ClientConn, ctx.Context, ctx.CancelFunc, error) {
+	creds, err := credentials.NewClientTLSFromFile(conf.TunnelConf.TunnlMode.EDGE.StreamEdge.Client.Cert, conf.TunnelConf.TunnlMode.EDGE.StreamEdge.Client.Dns)
+	if err != nil {
+		klog.Errorf("failed to load credentials: %v", err)
+		return nil, nil, nil, err
+	}
+	opts := []grpc.DialOption{grpc.WithKeepaliveParams(kacp), grpc.WithStreamInterceptor(ClientStreamInterceptor), grpc.WithTransportCredentials(creds)}
+	conn, err := grpc.Dial(conf.TunnelConf.TunnlMode.EDGE.StreamEdge.Client.ServerName, opts...)
+	if err != nil {
+		klog.Error("edge start client fail !")
+		return nil, nil, nil, err
+	}
+	clictx, cancle := ctx.WithTimeout(ctx.Background(), time.Duration(math.MaxInt64))
+	return conn, clictx, cancle, nil
+}
 
+// WithStreamInterceptor returns a DialOption that specifies the interceptor for
+// streaming RPCs.
+func WithStreamInterceptor(f StreamClientInterceptor) DialOption {
+	return newFuncDialOption(func(o *dialOptions) {
+		o.streamInt = f
+	})
+}
+```
 
-3、https
+在调用grpc.Dial时会传递`grpc.WithStreamInterceptor(ClientStreamInterceptor)` DialOption，将ClientStreamInterceptor作为StreamClientInterceptor传递给grpc连接：
 
+```go
+func ClientStreamInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+	var credsConfigured bool
+	for _, o := range opts {
+		_, ok := o.(*grpc.PerRPCCredsCallOption)
+		if ok {
+			credsConfigured = true
+		}
+	}
+	if !credsConfigured {
+		opts = append(opts, grpc.PerRPCCredentials(oauth.NewOauthAccess(&oauth2.Token{
+			AccessToken: clientToken,
+		})))
+	}
+	s, err := streamer(ctx, desc, cc, method, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return newClientWrappedStream(s), nil
+}
+
+func newClientWrappedStream(s grpc.ClientStream) grpc.ClientStream {
+	return &wrappedClientStream{s, false}
+}
+
+type wrappedClientStream struct {
+	grpc.ClientStream
+	restart bool
+}
+```
+
+ClientStreamInterceptor会将边缘节点名称以及token构造成oauth2.Token.AccessToken进行认证传递，并构建wrappedClientStream，利用SendMsg以及RecvMsg分别进行发送以及接受操作，下面依次进行分析：
+
+```go
+func (w *wrappedClientStream) SendMsg(m interface{}) error {
+	if m != nil {
+		return w.ClientStream.SendMsg(m)
+	}
+	nodeName := os.Getenv(util.NODE_NAME_ENV)
+	node := ctx.GetContext().AddNode(nodeName)
+	klog.Infof("node added successfully node = %s", nodeName)
+	stopHeartbeat := make(chan struct{}, 1)
+	defer func() {
+		stopHeartbeat <- struct{}{}
+		ctx.GetContext().RemoveNode(nodeName)
+		klog.Infof("node removed successfully node = %s", nodeName)
+	}()
+	go func(hnode ctx.Node, hw *wrappedClientStream, heartbeatStop chan struct{}) {
+		count := 0
+		for {
+			select {
+			case <-time.After(60 * time.Second):
+				if w.restart {
+					klog.Errorf("streamClient failed to receive heartbeat message count:%v", count)
+					if count >= 1 {
+						klog.Error("streamClient receiving heartbeat timeout, container exits")
+						klog.Flush()
+						os.Exit(1)
+					}
+					hnode.Send2Node(&proto.StreamMsg{
+						Node:     os.Getenv(util.NODE_NAME_ENV),
+						Category: util.STREAM,
+						Type:     util.CLOSED,
+					})
+					count += 1
+				} else {
+					hnode.Send2Node(&proto.StreamMsg{
+						Node:     os.Getenv(util.NODE_NAME_ENV),
+						Category: util.STREAM,
+						Type:     util.STREAM_HEART_BEAT,
+						Topic:    os.Getenv(util.NODE_NAME_ENV) + util.STREAM_HEART_BEAT,
+					})
+					klog.V(8).Info("streamClient send heartbeat message")
+					w.restart = true
+					count = 0
+				}
+			case <-heartbeatStop:
+				klog.Error("streamClient exits heartbeat sending")
+				return
+			}
+		}
+	}(node, w, stopHeartbeat)
+	for {
+		msg := <-node.NodeRecv()
+		if msg.Category == util.STREAM && msg.Type == util.CLOSED {
+			klog.Error("streamClient turns off message sending")
+			return fmt.Errorf("streamClient stops sending messages to server node: %s", os.Getenv(util.NODE_NAME_ENV))
+		}
+		klog.V(8).Infof("streamClinet starts to send messages to the server node: %s uuid: %s", msg.Node, msg.Topic)
+		err := w.ClientStream.SendMsg(msg)
+		if err != nil {
+			klog.Errorf("streamClient failed to send message err = %v", err)
+			return err
+		}
+		klog.V(8).Infof("streamClinet successfully send a message to the server node: %s uuid: %s", msg.Node, msg.Topic)
+	}
+}
+```
+
+SendMsg会起goroutine每隔1分钟会构建心跳StreamMsg，并通过node.ch传递。同时不断从node.ch中获取StreamMsg，并调用ClientStream.SendMsg发送StreamMsg给云端tunnel
+
+而RecvMsg会一直接受云端tunnel的StreamMsg，如果StreamMsg为心跳消息，则重置restart参数，使得边端tunnel继续发送心跳；若为其它类型消息，则调用该消息对应的处理函数进行操作：
+
+```go
+func (w *wrappedClientStream) RecvMsg(m interface{}) error {
+	if m != nil {
+		return w.ClientStream.RecvMsg(m)
+	}
+	for {
+		msg := &proto.StreamMsg{}
+		err := w.ClientStream.RecvMsg(msg)
+		if err != nil {
+			klog.Error("streamClient failed to receive message")
+			node := ctx.GetContext().GetNode(os.Getenv(util.NODE_NAME_ENV))
+			if node != nil {
+				node.Send2Node(&proto.StreamMsg{
+					Node:     os.Getenv(util.NODE_NAME_ENV),
+					Category: util.STREAM,
+					Type:     util.CLOSED,
+				})
+			}
+			return err
+		}
+		klog.V(8).Infof("streamClient recv msg node: %s uuid: %s", msg.Node, msg.Topic)
+		if msg.Category == util.STREAM && msg.Type == util.STREAM_HEART_BEAT {
+			klog.V(8).Info("streamClient received heartbeat message")
+			w.restart = false
+			continue
+		}
+		ctx.GetContext().Handler(msg, msg.Type, msg.Category)
+	}
+}
+```
+
+相应的，后过头来看云端StartServer：
+
+```go
+func StartServer() {
+	creds, err := credentials.NewServerTLSFromFile(conf.TunnelConf.TunnlMode.Cloud.Stream.Server.Cert, conf.TunnelConf.TunnlMode.Cloud.Stream.Server.Key)
+	if err != nil {
+		klog.Errorf("failed to create credentials: %v", err)
+		return
+	}
+	opts := []grpc.ServerOption{grpc.KeepaliveEnforcementPolicy(kaep), grpc.KeepaliveParams(kasp), grpc.StreamInterceptor(ServerStreamInterceptor), grpc.Creds(creds)}
+	s := grpc.NewServer(opts...)
+	proto.RegisterStreamServer(s, &stream.Server{})
+
+	lis, err := net.Listen("tcp", "0.0.0.0:"+strconv.Itoa(conf.TunnelConf.TunnlMode.Cloud.Stream.Server.GrpcPort))
+	klog.Infof("the https server of the cloud tunnel  listen on %s", "0.0.0.0:"+strconv.Itoa(conf.TunnelConf.TunnlMode.Cloud.Stream.Server.GrpcPort))
+	if err != nil {
+		klog.Fatalf("failed to listen: %v", err)
+		return
+	}
+	if err := s.Serve(lis); err != nil {
+		klog.Fatalf("failed to serve: %v", err)
+		return
+	}
+}
+
+// StreamInterceptor returns a ServerOption that sets the StreamServerInterceptor for the
+// server. Only one stream interceptor can be installed.
+func StreamInterceptor(i StreamServerInterceptor) ServerOption {
+	return newFuncServerOption(func(o *serverOptions) {
+		if o.streamInt != nil {
+			panic("The stream server interceptor was already set and may not be reset.")
+		}
+		o.streamInt = i
+	})
+}
+```
+
+在初始化云端tunnel时，会将`grpc.StreamInterceptor(ServerStreamInterceptor)`构建成grpc ServerOption，并将ServerStreamInterceptor作为StreamServerInterceptor传递给grpc连接：
+
+```go
+func ServerStreamInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	klog.Info("start verifying the token !")
+	md, ok := metadata.FromIncomingContext(ss.Context())
+	if !ok {
+		klog.Error("missing metadata")
+		return ErrMissingMetadata
+	}
+	if len(md["authorization"]) < 1 {
+		klog.Errorf("failed to obtain token")
+		return fmt.Errorf("failed to obtain token")
+	}
+	tk := strings.TrimPrefix(md["authorization"][0], "Bearer ")
+	auth, err := token.ParseToken(tk)
+	if err != nil {
+		klog.Error("token deserialization failed !")
+		return err
+	}
+	if auth.Token != token.GetTokenFromCache(auth.NodeName) {
+		klog.Errorf("invalid token node = %s", auth.NodeName)
+		return ErrInvalidToken
+	}
+	klog.Infof("token verification successful node = %s", auth.NodeName)
+	err = handler(srv, newServerWrappedStream(ss, auth.NodeName))
+	if err != nil {
+		ctx.GetContext().RemoveNode(auth.NodeName)
+		klog.Errorf("node disconnected node = %s err = %v", auth.NodeName, err)
+	}
+	return err
+}
+
+func ParseToken(token string) (*Token, error) {
+	rtoken := &Token{}
+	err := json.Unmarshal([]byte(token), rtoken)
+	if err != nil {
+		return rtoken, err
+	}
+	return rtoken, nil
+}
+```
+
+ServerStreamInterceptor会从grpc.ServerStream authorization中解析出此grpc连接对应的边缘节点名和token，并对该token进行校验，然后根据节点名构建wrappedServerStream作为与该边缘节点通信的处理对象：
+
+```go
+
+```
+
+2、tcpProxy(tcp代理)
+
+3、https(https请求)
 
 ## 总结
 

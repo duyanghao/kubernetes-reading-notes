@@ -187,6 +187,50 @@ type nodeContext struct {
 
 nodeContext表示本tunnel上所有相关节点信息，其中nodes key为边缘节点名称，value为node
 
+6、TcpConn
+
+```go
+type TcpConn struct {
+	Conn     net.Conn
+	uid      string
+	stopChan chan struct{}
+	Type     string
+	C        context.Conn
+	n        context.Node
+	Addr     string
+	once     sync.Once
+}
+```
+
+TcpConn为tcp代理模块封装的数据结构：
+
+* Conn：云端组件与云端tunnel的底层tcp连接
+* uid：TcpConn唯一标识
+* Type：TcpConn类型
+* C：TcpConn使用的context.Conn
+* n：TcpConn使用的context.Node
+* Addr：边缘服务监听地址及端口
+
+7、HttpsMsg
+
+```go
+type HttpsMsg struct {
+	StatusCode  int               `json:"status_code"`
+	HttpsStatus string            `json:"https_status"`
+	HttpBody    []byte            `json:"http_body"`
+	Header      map[string]string `json:"header"`
+	Method      string            `json:"method"`
+}
+```
+
+HttpsMsg为https消息传输中转结构：
+
+* StatusCode：http response返回码
+* HttpsStatus：http response status
+* HttpBody：http 请求 or 回应 body
+* Header：http请求 or 回应报头
+* Method：http请求Method
+
 在介绍完tunnel核心配置和数据结构后，下面开始分析源码
 
 ## tunnel源码分析
@@ -926,6 +970,81 @@ HeartbeatHandler会从msg.Node中获取边缘节点对应node，然后将该Stre
 * 不管是边端还是云端都会通过context.node数据结构在SendMsg以及RecvMsg之间中转StreamMsg，而该StreamMsg包括心跳，tcp代理以及https请求等不同类型消息
 
 2、tcpProxy(tcp代理)
+
+tcpProxy模块负责在多集群管理中建立云端与边缘的一条代理隧道：
+
+```go
+func (tcp *TcpProxy) Start(mode string) {
+	context.GetContext().RegisterHandler(util.TCP_BACKEND, tcp.Name(), tcpmsg.BackendHandler)
+	context.GetContext().RegisterHandler(util.TCP_FRONTEND, tcp.Name(), tcpmsg.FrontendHandler)
+	context.GetContext().RegisterHandler(util.TCP_CONTROL, tcp.Name(), tcpmsg.ControlHandler)
+	if mode == util.CLOUD {
+		for front, backend := range conf.TunnelConf.TunnlMode.Cloud.Tcp {
+			go func(front, backend string) {
+				ln, err := net.Listen("tcp", front)
+				if err != nil {
+					klog.Errorf("cloud proxy start %s fail ,error = %s", front, err)
+					return
+				}
+				defer ln.Close()
+				klog.Infof("the tcp server of the cloud tunnel listen on %s\n", front)
+				for {
+					rawConn, err := ln.Accept()
+					if err != nil {
+						klog.Errorf("cloud proxy accept error!")
+						return
+					}
+					nodes := context.GetContext().GetNodes()
+					if len(nodes) == 0 {
+						rawConn.Close()
+						klog.Errorf("len(nodes)==0")
+						continue
+					}
+					uuid := uuid.NewV4().String()
+					node := nodes[0]
+					fp := tcpmng.NewTcpConn(uuid, backend, node)
+					fp.Conn = rawConn
+					fp.Type = util.TCP_FRONTEND
+					go fp.Write()
+					go fp.Read()
+				}
+			}(front, backend)
+		}
+	}
+}
+```
+
+Start函数首先注册了三种消息的处理函数：
+
+* category为TCP_BACKEND，type为tcp，对应处理函数为tcpmsg.BackendHandler
+* category为TCP_FRONTEND，type为tcp，对应处理函数为tcpmsg.FrontendHandler
+* category为TCP_CONTROL，type为tcp，对应处理函数为tcpmsg.ControlHandler
+
+然后在云端监听TunnelConf.TunnlMode.Cloud.Tcp参数key端口，并在接受到云端组件的请求后获取边缘节点列表中的第一个节点构建TcpConn：
+
+```go
+func NewTcpConn(uuid, addr, node string) *TcpConn {
+	tcp := &TcpConn{
+		uid:      uuid,
+		stopChan: make(chan struct{}, 1),
+		C:        context.GetContext().AddConn(uuid),
+		Addr:     addr,
+		n:        context.GetContext().AddNode(node),
+	}
+	tcp.n.BindNode(uuid)
+	return tcp
+}
+
+func (edge *node) BindNode(uuid string) {
+	edge.connsLock.Lock()
+	if edge.conns == nil {
+		edge.conns = &[]string{uuid}
+	}
+	edge.connsLock.Unlock()
+}
+```
+
+
 
 3、https(https请求)
 

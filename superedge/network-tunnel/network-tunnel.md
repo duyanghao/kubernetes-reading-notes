@@ -1168,7 +1168,7 @@ func (tcp *TcpConn) Write() {
 }
 ```
 
-Write函数会从conn.ch中接收StreamMsg，并将msg.data利用tcp socket发送给边端代理服务。从而实现云端tunnel tcp代理的功能：
+Write函数会从conn.ch中接收StreamMsg，并将msg.data利用tcp socket发送给边端代理服务。从而实现云端tunnel tcp代理的功能，数据流如下：
 
 ```
 云端组件 -> 云端tunnel -> 边端tunnel -> 边端服务 
@@ -1190,7 +1190,7 @@ func BackendHandler(msg *proto.StreamMsg) error {
 }
 ```
 
-BackendHandler会根据msg.Topic(conn uid)获取conn，并调用conn.Send2Conn发送StreamMsg，而TcpConn.Write会接受该消息，并通过云端tunnel与云端组件建立的tcp连接将msg.data发送给云端组件，流程如下：
+BackendHandler会根据msg.Topic(conn uid)获取conn，并调用conn.Send2Conn发送StreamMsg，而TcpConn.Write会接受该消息，并通过云端tunnel与云端组件建立的tcp连接将msg.data发送给云端组件，数据流如下：
 
 ```
 边端服务 -> 边端tunnel -> 云端tunnel -> 边端服务 
@@ -1203,9 +1203,271 @@ BackendHandler会根据msg.Topic(conn uid)获取conn，并调用conn.Send2Conn�
 总结如下：
 
 * tcp模块负责在多集群管理中建立云端与边端的tcp代理
-* 当云端组件与云端tunnel tcp代理建立连接时，云端tunnel会选择它所管理的边缘节点列表中第一个节点以及边端代理服务地址端口 创建代表tcp代理的结构体TcpConn，并从云端组件与云端tunnel建立的tcp连接中接受以及发送数据；边端tunnel在初次接受到云端tunnel发送的消息时，会与边端代理服务建立连接，并传输数据
+* 当云端组件与云端tunnel tcp代理建立连接时，云端tunnel会选择它所管理的边缘节点列表中第一个节点以及边端代理服务地址端口 创建代表tcp代理的结构体TcpConn，并从云端组件与云端tunnel建立的tcp连接中接受以及发送数据，之后转发给边端tunnel；边端tunnel在初次接受到云端tunnel发送的消息时，会与边端代理服务建立连接，并传输数据
+* 通过context.conn在tunnel grpc隧道与tcp代理之间中转StreamMsg。并区分各tcp代理连接
 
-3、https(https请求)
+3、https(https代理)
+
+https模块负责建立云边的https代理，将云端组件(例如：kube-apiserver)的https请求转发给边端服务(例如：kubelet)
+
+```go
+func (https *Https) Start(mode string) {
+	context.GetContext().RegisterHandler(util.CONNECTING, util.HTTPS, httpsmsg.ConnectingHandler)
+	context.GetContext().RegisterHandler(util.CONNECTED, util.HTTPS, httpsmsg.ConnectedAndTransmission)
+	context.GetContext().RegisterHandler(util.CLOSED, util.HTTPS, httpsmsg.ConnectedAndTransmission)
+	context.GetContext().RegisterHandler(util.TRANSNMISSION, util.HTTPS, httpsmsg.ConnectedAndTransmission)
+	if mode == util.CLOUD {
+		go httpsmng.StartServer()
+	}
+}
+```
+
+Start函数首先注册了四种消息的处理函数：
+
+* category为https，type为CONNECTING，对应处理函数为httpsmsg.ConnectingHandler
+* category为https，type为CONNECTED，对应处理函数为httpsmsg.ConnectedAndTransmission
+* category为https，type为TRANSNMISSION，对应处理函数为httpsmsg.ConnectedAndTransmission
+* category为https，type为CLOSED，对应处理函数为httpsmsg.ConnectedAndTransmission
+
+并在云端调用StartServer启动服务：
+
+```go
+func StartServer() {
+	cert, err := tls.LoadX509KeyPair(conf.TunnelConf.TunnlMode.Cloud.Https.Cert, conf.TunnelConf.TunnlMode.Cloud.Https.Key)
+	if err != nil {
+		klog.Errorf("client load cert fail certpath = %s keypath = %s \n", conf.TunnelConf.TunnlMode.Cloud.Https.Cert, conf.TunnelConf.TunnlMode.Cloud.Https.Key)
+		return
+	}
+	config := &tls.Config{
+		Certificates:       []tls.Certificate{cert},
+		InsecureSkipVerify: true,
+	}
+	for k := range conf.TunnelConf.TunnlMode.Cloud.Https.Addr {
+		serverHandler := &ServerHandler{
+			port: k,
+		}
+		s := &http.Server{
+			Addr:      "0.0.0.0:" + k,
+			Handler:   serverHandler,
+			TLSConfig: config,
+		}
+		klog.Infof("the https server of the cloud tunnel listen on %s", s.Addr)
+		go func(server *http.Server) {
+			err = s.ListenAndServeTLS("", "")
+			if err != nil {
+				klog.Errorf("server start fail,add = %s err = %v", s.Addr, err)
+			}
+		}(s)
+	}
+}
+```
+
+这里云端tunnel会将ServerHandler设置为http.Server的handler，并监听TunnelConf.TunnlMode.Cloud.Https.Addr key端口(10250)。ServerHandler处理逻辑如下：
+
+```go
+func (serverHandler *ServerHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	var nodeName string
+	nodeinfo := strings.Split(request.Host, ":")
+	if context.GetContext().NodeIsExist(nodeinfo[0]) {
+		nodeName = nodeinfo[0]
+	} else {
+		nodeName = request.TLS.ServerName
+	}
+	node := context.GetContext().GetNode(nodeName)
+	if node == nil {
+		fmt.Fprintf(writer, "edge node disconnected node = %s", nodeinfo[0])
+		return
+	}
+	uid := uuid.NewV4().String()
+	node.BindNode(uid)
+	conn := context.GetContext().AddConn(uid)
+
+	requestBody, err := ioutil.ReadAll(request.Body)
+	if err != nil {
+		klog.Errorf("traceid = %s read request body fail err = %v ", uid, err)
+		fmt.Fprintf(writer, "traceid = %s read request body fail err = %v ", uid, err)
+		return
+	}
+	httpmsg := &HttpsMsg{
+		HttpsStatus: util.CONNECTING,
+		Header:      make(map[string]string),
+		Method:      request.Method,
+		HttpBody:    requestBody,
+	}
+	for k, v := range request.Header {
+		for _, vv := range v {
+			httpmsg.Header[k] = vv
+		}
+	}
+	bmsg := httpmsg.Serialization()
+	if len(bmsg) == 0 {
+		klog.Errorf("traceid = %s httpsmsg serialization failed err = %v req = %v serverName = %s", uid, err, request, request.TLS.ServerName)
+		fmt.Fprintf(writer, "traceid = %s httpsmsg serialization failed err = %v", uid, err)
+		return
+	}
+	node.Send2Node(&proto.StreamMsg{
+		Node:     nodeName,
+		Category: util.HTTPS,
+		Type:     util.CONNECTING,
+		Topic:    uid,
+		Data:     bmsg,
+		Addr:     "https://" + conf.TunnelConf.TunnlMode.Cloud.Https.Addr[serverHandler.port] + request.URL.String(),
+	})
+	if err != nil {
+		klog.Errorf("traceid = %s httpsServer send request msg failed err = %v", uid, err)
+		fmt.Fprintf(writer, "traceid = %s httpsServer send request msg failed err = %v", uid, err)
+		return
+	}
+	resp := <-conn.ConnRecv()
+	rmsg, err := Deserialization(resp.Data)
+	if err != nil {
+		klog.Errorf("traceid = %s httpsmag deserialization failed err = %v", uid, err)
+		fmt.Fprintf(writer, "traceid = %s httpsmag deserialization failed err = %v", uid, err)
+		return
+	}
+	node.Send2Node(&proto.StreamMsg{
+		Node:     nodeName,
+		Category: util.HTTPS,
+		Type:     util.CONNECTED,
+		Topic:    uid,
+	})
+	if err != nil {
+		klog.Errorf("traceid = %s httpsServer send confirm msg failed err = %v", uid, err)
+		fmt.Fprintf(writer, "traceid = %s httpsServer send confirm msg failed err = %v", uid, err)
+		return
+	}
+	if rmsg.StatusCode != http.StatusSwitchingProtocols {
+		handleServerHttp(rmsg, writer, request, node, conn)
+	} else {
+		handleServerSwitchingProtocols(writer, node, conn)
+	}
+}
+```
+
+当云端组件向云端tunnel发送https请求时，serverHandler会首先从request.Host字段解析节点名，若不存在则从request.TLS.ServerName解析节点名，这里解释一下这样做的原因：
+
+由于apiserver或者其它组件本来要访问的对象是边端节点上的某个服务，通过coredns DNS劫持后，会将host中的节点名解析为tunnel-cloud的podIp，但是host以及request.TLS.ServerName依旧保持不变，因此可以通过解析这两个字段得出要访问的边缘节点名称
+
+之后读取request.Body以及request.Header构建HttpsMsg结构体，并序列化。之后创建StreamMsg，各字段含义如下：
+
+* Node：边缘节点名
+* Category：util.HTTPS
+* Type：util.CONNECTING
+* Topic：conn uid
+* Data：序列化后的HttpsMsg
+* Addr：边缘节点https服务访问URL
+
+之后通过Send2Node传递该StreamMsg，而stream SendMsg会接受该消息并发送给对应边缘节点
+
+边缘节点会接受该消息，并执行上述注册的httpsmsg.ConnectingHandler函数：
+
+```go
+func ConnectingHandler(msg *proto.StreamMsg) error {
+	go httpsmng.Request(msg)
+	return nil
+}
+
+func Request(msg *proto.StreamMsg) {
+	httpConn, err := getHttpConn(msg)
+	if err != nil {
+		klog.Errorf("traceid = %s failed to get httpclient httpConn err = %v", msg.Topic, err)
+		return
+	}
+	rawResponse := bytes.NewBuffer(make([]byte, 0, util.MaxResponseSize))
+	rawResponse.Reset()
+	respReader := bufio.NewReader(io.TeeReader(httpConn, rawResponse))
+	resp, err := http.ReadResponse(respReader, nil)
+	if err != nil {
+		klog.Errorf("traceid = %s httpsclient read response failed err = %v", msg.Topic, err)
+		return
+	}
+
+	bodyMsg := HttpsMsg{
+		StatusCode:  resp.StatusCode,
+		HttpsStatus: util.CONNECTED,
+		Header:      make(map[string]string),
+	}
+	for k, v := range resp.Header {
+		for _, vv := range v {
+			bodyMsg.Header[k] = vv
+		}
+	}
+	msgData := bodyMsg.Serialization()
+	if len(msgData) == 0 {
+		klog.Errorf("traceid = %s httpsclient httpsmsg serialization failed", msg.Topic)
+		return
+	}
+	node := context.GetContext().GetNode(msg.Node)
+	if node == nil {
+		klog.Errorf("traceid = %s httpClient failed to get node", msg.Topic)
+		return
+	}
+	node.Send2Node(&proto.StreamMsg{
+		Node:     msg.Node,
+		Category: msg.Category,
+		Type:     util.CONNECTED,
+		Topic:    msg.Topic,
+		Data:     msgData,
+	})
+	conn := context.GetContext().AddConn(msg.Topic)
+	node.BindNode(msg.Topic)
+	confirm := true
+	for confirm {
+		confirmMsg := <-conn.ConnRecv()
+		if confirmMsg.Type == util.CONNECTED {
+			confirm = false
+		}
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		handleClientHttp(resp, rawResponse, httpConn, msg, node, conn)
+	} else {
+		handleClientSwitchingProtocols(httpConn, rawResponse, msg, node, conn)
+	}
+}
+
+func getHttpConn(msg *proto.StreamMsg) (net.Conn, error) {
+	cert, err := tls.LoadX509KeyPair(conf.TunnelConf.TunnlMode.EDGE.Https.Cert, conf.TunnelConf.TunnlMode.EDGE.Https.Key)
+	if err != nil {
+		klog.Errorf("tranceid = %s httpsclient load cert fail certpath = %s keypath = %s", msg.Topic, conf.TunnelConf.TunnlMode.EDGE.Https.Cert, conf.TunnelConf.TunnlMode.EDGE.Https.Key)
+		return nil, err
+	}
+	requestMsg, err := Deserialization(msg.Data)
+	if err != nil {
+		klog.Errorf("traceid = %s httpsclient deserialization failed err = %v", msg.Topic, err)
+		return nil, err
+	}
+	request, err := http.NewRequest(requestMsg.Method, msg.Addr, bytes.NewBuffer(requestMsg.HttpBody))
+	if err != nil {
+		klog.Errorf("traceid = %s httpsclient get request fail err = %v", msg.Topic, err)
+		return nil, err
+	}
+	for k, v := range requestMsg.Header {
+		request.Header.Add(k, v)
+	}
+	conn, err := tls.Dial("tcp", request.Host, &tls.Config{
+		Certificates:       []tls.Certificate{cert},
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		klog.Errorf("traceid = %s httpsclient request failed err = %v", msg.Topic, err)
+		return nil, err
+	}
+	err = request.Write(conn)
+	if err != nil {
+		klog.Errorf("traceid = %s https clinet request failed to write conn err = %v", msg.Topic, err)
+		return nil, err
+	}
+	return conn, nil
+}
+```
+
+ConnectingHandler会调用Request对该StreamMsg进行处理。Reqeust首先通过getHttpConn发起对StreamMsg.Addr也即边缘节点https服务的https请求，请求内容复用了云端组件对云端tunnel的请求(method，headler，body等)。并返回了建立的tls连接
+
+之后通过tls连接创建了respReader，并调用http.ReadResponse构建HttpsMsg
+
+架构如下所示：
+
+![](images/tunnel-https.png)
 
 ## 总结
 

@@ -111,9 +111,9 @@ TunnelCloud包含如下结构：
 
 在介绍完tunnel的配置后，下面介绍tunnel使用的内部数据结构(github.com/superedge/superedge/pkg/tunnel/context)：
 
-1、StreamMsg(grpc隧道)
+1、StreamMsg
 
-StreamMsg为云边grpc隧道传输的数据格式：
+StreamMsg为云边grpc隧道传输的消息数据格式：
 
 ```
 message StreamMsg {

@@ -421,9 +421,177 @@ func (dns *CoreDns) checkHosts() error {
 }
 ```
 
-首先调用parseHosts获取本节点
+首先调用parseHosts获取所有云端tunnel连接的边缘节点名称以及对应云端tunnel pod ip映射列表，然后写入hostsBuffer(`tunnel pod ip` `nodeName`形式)，如果有变化则将这个内容覆盖写入configmap并更新
+
+而如果tunnel位于边端，则会调用StartSendClient进行隧道的打通：
+
+```go
+func StartSendClient() {
+	conn, clictx, cancle, err := StartClient()
+	if err != nil {
+		klog.Error("edge start client error !")
+		klog.Flush()
+		os.Exit(1)
+	}
+	streamConn = conn
+	defer func() {
+		conn.Close()
+		cancle()
+	}()
+
+	go func(monitor *grpc.ClientConn) {
+		mcount := 0
+		for {
+			if conn.GetState() == connectivity.Ready {
+				mcount = 0
+			} else {
+				mcount += 1
+			}
+			klog.V(8).Infof("grpc connection status = %s count = %v", conn.GetState(), mcount)
+			if mcount >= util.TIMEOUT_EXIT {
+				klog.Error("grpc connection rebuild timed out, container exited !")
+				klog.Flush()
+				os.Exit(1)
+			}
+			klog.V(8).Infof("grpc connection status of node = %v", conn.GetState())
+			time.Sleep(1 * time.Second)
+		}
+	}(conn)
+	running := true
+	count := 0
+	for running {
+		if conn.GetState() == connectivity.Ready {
+			cli := proto.NewStreamClient(conn)
+			stream.Send(cli, clictx)
+			count = 0
+		}
+		count += 1
+		klog.V(8).Infof("node connection status = %s count = %v", conn.GetState(), count)
+		time.Sleep(1 * time.Second)
+		if count >= util.TIMEOUT_EXIT {
+			klog.Error("the streamClient retrying to establish a connection timed out and the container exited !")
+			klog.Flush()
+			os.Exit(1)
+		}
+	}
+}
+```
+
+首先调用StartClient根据云端tunnel域名构建证书，并对云端tunnel服务地址调用grpc.Dial连接grpc连接，并返回grpc.ClientConn
+
+```go
+func StartClient() (*grpc.ClientConn, ctx.Context, ctx.CancelFunc, error) {
+	creds, err := credentials.NewClientTLSFromFile(conf.TunnelConf.TunnlMode.EDGE.StreamEdge.Client.Cert, conf.TunnelConf.TunnlMode.EDGE.StreamEdge.Client.Dns)
+	if err != nil {
+		klog.Errorf("failed to load credentials: %v", err)
+		return nil, nil, nil, err
+	}
+	opts := []grpc.DialOption{grpc.WithKeepaliveParams(kacp), grpc.WithStreamInterceptor(ClientStreamInterceptor), grpc.WithTransportCredentials(creds)}
+	conn, err := grpc.Dial(conf.TunnelConf.TunnlMode.EDGE.StreamEdge.Client.ServerName, opts...)
+	if err != nil {
+		klog.Error("edge start client fail !")
+		return nil, nil, nil, err
+	}
+	clictx, cancle := ctx.WithTimeout(ctx.Background(), time.Duration(math.MaxInt64))
+	return conn, clictx, cancle, nil
+}
+```
+
+之后等待grpc连接状态变为Ready(隧道建立好了)，然后调用proto.NewStreamClient在grpc.ClientConn上建立streamClient，并对streamClient执行stream.Send：
+
+```go
+func Send(client proto.StreamClient, clictx ctx.Context) {
+	stream, err := client.TunnelStreaming(clictx)
+	if err != nil {
+		klog.Error("EDGE-SEND fetch stream failed !")
+		return
+	}
+	klog.Info("streamClient created successfully")
+	errChan := make(chan error, 2)
+	go func(send proto.Stream_TunnelStreamingClient, sc chan error) {
+		sendErr := send.SendMsg(nil)
+		if sendErr != nil {
+			klog.Errorf("streamClient failed to send message err = %v", sendErr)
+		}
+		sc <- sendErr
+	}(stream, errChan)
+
+	go func(recv proto.Stream_TunnelStreamingClient, rc chan error) {
+		recvErr := recv.RecvMsg(nil)
+		if recvErr != nil {
+			klog.Errorf("streamClient failed to receive message err = %v", recvErr)
+		}
+		rc <- recvErr
+	}(stream, errChan)
+
+	e := <-errChan
+	klog.Errorf("the stream of streamClient is disconnected err = %v", e)
+	err = stream.CloseSend()
+	if err != nil {
+		klog.Errorf("failed to close stream send err: %v", err)
+	}
+}
+```
+
+stream.Send会向grpc连接对端，也即云端tunnel，发送空消息并等待对方回应
+
+相应的，云端tunnel会对该消息进行接受并回应，如下：
+
+```go
+func StartServer() {
+	creds, err := credentials.NewServerTLSFromFile(conf.TunnelConf.TunnlMode.Cloud.Stream.Server.Cert, conf.TunnelConf.TunnlMode.Cloud.Stream.Server.Key)
+	if err != nil {
+		klog.Errorf("failed to create credentials: %v", err)
+		return
+	}
+	opts := []grpc.ServerOption{grpc.KeepaliveEnforcementPolicy(kaep), grpc.KeepaliveParams(kasp), grpc.StreamInterceptor(ServerStreamInterceptor), grpc.Creds(creds)}
+	s := grpc.NewServer(opts...)
+	proto.RegisterStreamServer(s, &stream.Server{})
+
+	lis, err := net.Listen("tcp", "0.0.0.0:"+strconv.Itoa(conf.TunnelConf.TunnlMode.Cloud.Stream.Server.GrpcPort))
+	klog.Infof("the https server of the cloud tunnel  listen on %s", "0.0.0.0:"+strconv.Itoa(conf.TunnelConf.TunnlMode.Cloud.Stream.Server.GrpcPort))
+	if err != nil {
+		klog.Fatalf("failed to listen: %v", err)
+		return
+	}
+	if err := s.Serve(lis); err != nil {
+		klog.Fatalf("failed to serve: %v", err)
+		return
+	}
+}
+
+type Server struct{}
+
+func (s *Server) TunnelStreaming(stream proto.Stream_TunnelStreamingServer) error {
+	errChan := make(chan error, 2)
+
+	go func(sendStream proto.Stream_TunnelStreamingServer, sendChan chan error) {
+		sendErr := sendStream.SendMsg(nil)
+		if sendErr != nil {
+			klog.Errorf("streamServer failed to send message err = %v", sendErr)
+		}
+		sendChan <- sendErr
+	}(stream, errChan)
+
+	go func(recvStream proto.Stream_TunnelStreamingServer, recvChan chan error) {
+		recvErr := stream.RecvMsg(nil)
+		if recvErr != nil {
+			klog.Errorf("streamServer failed to receive message err = %v", recvErr)
+		}
+		recvChan <- recvErr
+	}(stream, errChan)
+
+	e := <-errChan
+	klog.Errorf("the stream of streamServer is disconnected err = %v", e)
+	return e
+}
+```
+
+之后StartSendClient会每隔1s发送空消息给云端tunnel，并接受回应，来保持连接一直处于Ready状态
 
 2、tcpProxy
+
+
 
 3、https
 

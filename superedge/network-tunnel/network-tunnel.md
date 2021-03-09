@@ -1131,7 +1131,79 @@ func FrontendHandler(msg *proto.StreamMsg) error {
 }
 ```
 
-FrontendHandler首先
+FrontendHandler首先根据msg.Topic，msg.Addr以及msg.Node构建TcpConn，然后利用msg.Addr与边端的代理服务建立tcp连接，并将该连接赋值给TcpConn.Conn，因此边端tunnel创建出的TcpConn各字段含义如下：
+
+* uid：云端TcpConn对应的uid
+* Conn：边端tunnel与边端代理服务建立的tcp连接
+* Type：TCP_BACKEND
+* C：云端TcpConn对应的uid建立的context.conn
+* n：边缘节点名称
+* addr：边缘节点代理服务监听地址及端口
+
+之后会异步执行该TcpConn的Read以及Write函数，由于这里对StreamMsg执行了Send2Conn，因此会触发Write操作，如下：
+
+```go
+func (tcp *TcpConn) Write() {
+	running := true
+	for running {
+		select {
+		case msg := <-tcp.C.ConnRecv():
+			if msg.Type == util.TCP_CONTROL {
+				tcp.cleanUp()
+				break
+			}
+			_, err := tcp.Conn.Write(msg.Data)
+			if err != nil {
+				klog.Errorf("write conn fail err = %v", err)
+				tcp.cleanUp()
+				break
+			}
+		case <-tcp.stopChan:
+			klog.Info("disconnect tcp and stop sending !")
+			tcp.Conn.Close()
+			tcp.closeOpposite()
+			running = false
+		}
+	}
+}
+```
+
+Write函数会从conn.ch中接收StreamMsg，并将msg.data利用tcp socket发送给边端代理服务。从而实现云端tunnel tcp代理的功能：
+
+```
+云端组件 -> 云端tunnel -> 边端tunnel -> 边端服务 
+```
+
+如果边端服务有回应，则Read函数会从tcp连接中读取回应数据并构建StreamMsg发送给云端tunnel
+
+而云端tunnel在接收到回应StreamMsg后，会调用tcpmsg.BackendHandler进行处理：
+
+```go
+func BackendHandler(msg *proto.StreamMsg) error {
+	conn := context.GetContext().GetConn(msg.Topic)
+	if conn == nil {
+		klog.Errorf("trace_id = %s the stream module failed to distribute the side message module = %s type = %s", msg.Topic, msg.Category, msg.Type)
+		return fmt.Errorf("trace_id = %s the stream module failed to distribute the side message module = %s type = %s ", msg.Topic, msg.Category, msg.Type)
+	}
+	conn.Send2Conn(msg)
+	return nil
+}
+```
+
+BackendHandler会根据msg.Topic(conn uid)获取conn，并调用conn.Send2Conn发送StreamMsg，而TcpConn.Write会接受该消息，并通过云端tunnel与云端组件建立的tcp连接将msg.data发送给云端组件，流程如下：
+
+```
+边端服务 -> 边端tunnel -> 云端tunnel -> 边端服务 
+```
+
+架构如图所示：
+
+![](images/tunnel-tcp.png)
+
+总结如下：
+
+* tcp模块负责在多集群管理中建立云端与边端的tcp代理
+* 当云端组件与云端tunnel tcp代理建立连接时，云端tunnel会选择它所管理的边缘节点列表中第一个节点以及边端代理服务地址端口 创建代表tcp代理的结构体TcpConn，并从云端组件与云端tunnel建立的tcp连接中接受以及发送数据；边端tunnel在初次接受到云端tunnel发送的消息时，会与边端代理服务建立连接，并传输数据
 
 3、https(https请求)
 

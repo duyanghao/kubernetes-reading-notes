@@ -465,7 +465,9 @@ func (dns *CoreDns) checkHosts() error {
 }
 ```
 
-首先调用parseHosts获取所有云端tunnel连接的边缘节点名称以及对应云端tunnel pod ip映射列表，然后写入hostsBuffer(`tunnel pod ip` `nodeName`形式)，如果有变化则将这个内容覆盖写入configmap并更新
+首先调用parseHosts获取所有云端tunnel连接的边缘节点名称以及对应云端tunnel pod ip映射列表，然后写入hostsBuffer(`tunnel pod ip` `nodeName`形式)，如果有变化则将这个内容覆盖写入configmap并更新：
+
+![](images/tunnel-coredns.png)
 
 而如果tunnel位于边端，则会调用StartSendClient进行隧道的打通：
 
@@ -1044,7 +1046,7 @@ func (edge *node) BindNode(uuid string) {
 }
 ```
 
-这里会利用uuid创建context.conn，同时将该conn与node绑定；将TcpConn的type设置为TCP_FRONTEND，同时addr设置为边缘节点服务监听地址以及端口；并异步执行TcpConn Read以及Write函数：
+这里会利用uuid创建context.conn，同时将该conn与node绑定；将TcpConn的type设置为TCP_FRONTEND，同时addr设置为边缘节点服务监听地址以及端口，并异步执行TcpConn Read以及Write函数：
 
 ```go
 func (tcp *TcpConn) Read() {
@@ -1089,7 +1091,46 @@ func (tcp *TcpConn) Read() {
 }
 ```
 
-tcp.Read会从
+tcp.Read会从云端组件与云端tunnel建立的tcp连接中不断读取数据，并构造StreamMsg：
+
+* category：util.TCP
+* Type：TCP_FRONTEND
+* Topic：tcp.uid
+* data：云端组件发送给云端tunnel的数据
+* addr：边缘节点代理服务监听地址以及端口
+* node：边缘节点名称
+
+从前面的分析可以知道在调用Send2Node后，stream SendMsg会从node.ch中获取该StreamMsg，并发送给边端tunnel
+
+边端在接受到该StreamMsg后，会执行对应的处理函数，也即tcpmsg.FrontendHandler：
+
+```go
+func FrontendHandler(msg *proto.StreamMsg) error {
+	c := context.GetContext().GetConn(msg.Topic)
+	if c != nil {
+		c.Send2Conn(msg)
+		return nil
+	}
+	tp := tcpmng.NewTcpConn(msg.Topic, msg.Addr, msg.Node)
+	tp.Type = util.TCP_BACKEND
+	tp.C.Send2Conn(msg)
+	tcpAddr, err := net.ResolveTCPAddr("tcp", tp.Addr)
+	if err != nil {
+		klog.Error("edeg proxy resolve addr fail !")
+		return err
+	}
+	conn, err := net.DialTCP("tcp", nil, tcpAddr)
+	if err != nil {
+		klog.Error("edge proxy connect fail!")
+		return err
+	}
+	tp.Conn = conn
+	go tp.Read()
+	go tp.Write()
+	return nil
+}
+```
+
 
 
 3、https(https请求)

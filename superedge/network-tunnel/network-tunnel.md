@@ -320,7 +320,7 @@ func LoadModules(mode string) {
 
 如下分别介绍stream，tcpProxy以及https模块的Start函数：
 
-1、stream
+1、stream(grpc云边隧道)
 
 ```go
 func (stream *Stream) Start(mode string) {

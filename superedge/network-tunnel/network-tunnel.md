@@ -97,7 +97,7 @@ TunnelCloud包含如下结构：
 
 * HttpsServer：云端tunnel证书，key以及Addr map(key表示云端tunnel https协议监听端口，而value表示边端tunnel需要访问的地址(kubelet监听地址：`127.0.0.1:10250`))
 * StreamCloud：包括StreamServer以及Dns配置：
-  * StreamServer：包括云端tunnel grpc服务证书，key，以及地址
+  * StreamServer：包括云端tunnel grpc服务证书，key，以及监听端口
   * Dns：包括了云端coredns相关信息：
     * Configmap：云端coredns host plugin使用的挂载configmap，其中存放有云端tunnel ip以及边缘节点名映射列表
     * Hosts：云端tunnel对coredns host plugin使用的configmap的本地挂载文件
@@ -191,6 +191,241 @@ nodeContext表示本tunnel上所有相关节点信息，其中nodes key为边缘
 
 ## tunnel源码分析
 
+首先启动函数中会进行若干初始化：
+
+```go
+func NewTunnelCommand() *cobra.Command {
+	option := options.NewTunnelOption()
+	cmd := &cobra.Command{
+		Use: "tunnel",
+		Run: func(cmd *cobra.Command, args []string) {
+			verflag.PrintAndExitIfRequested()
+
+			klog.Infof("Versions: %#v\n", version.Get())
+			util.PrintFlags(cmd.Flags())
+
+			err := conf.InitConf(*option.TunnelMode, *option.TunnelConf)
+			if err != nil {
+				klog.Info("tunnel failed to load configuration file !")
+				return
+			}
+			InitModules(*option.TunnelMode)
+			stream.InitStream(*option.TunnelMode)
+			tcp.InitTcp()
+			https.InitHttps()
+			LoadModules(*option.TunnelMode)
+			ShutDown()
+		},
+	}
+	fs := cmd.Flags()
+	namedFlagSets := option.Addflag()
+	for _, f := range namedFlagSets.FlagSets {
+		fs.AddFlagSet(f)
+	}
+	return cmd
+}
+```
+
+下面分别介绍：
+
+* stream.InitStream
+
+```go
+func InitStream(mode string) {
+	if mode == util.CLOUD {
+		if !conf.TunnelConf.TunnlMode.Cloud.Stream.Dns.Debug {
+			err := connect.InitDNS()
+			if err != nil {
+				klog.Errorf("init client-go fail err = %v", err)
+				return
+			}
+		}
+		err := token.InitTokenCache(conf.TunnelConf.TunnlMode.Cloud.Stream.Server.TokenFile)
+		if err != nil {
+			klog.Error("Error loading token file ！")
+		}
+	} else {
+		err := connect.InitToken(os.Getenv(util.NODE_NAME_ENV), conf.TunnelConf.TunnlMode.EDGE.StreamEdge.Client.Token)
+		if err != nil {
+			klog.Errorf("initialize the edge node token err = %v", err)
+			return
+		}
+	}
+	model.Register(&Stream{})
+	klog.Infof("init module: %s success !", util.STREAM)
+}
+```
+
+InitStream首先判断tunnel是云端还是边缘，对于云端会执行InitDNS初始化coredns host plugins configmap刷新相关配置：
+
+```go
+func InitDNS() error {
+	coreDns = &CoreDns{
+		Update: make(chan struct{}),
+	}
+	coreDns.PodIp = os.Getenv(util.POD_IP_ENV)
+	klog.Infof("endpoint of the proxycloud pod = %s ", coreDns.PodIp)
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		klog.Errorf("client-go get inclusterconfig  fail err = %v", err)
+		return err
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		klog.Errorf("get client fail err = %v", err)
+		return err
+	}
+	coreDns.ClientSet = clientset
+	coreDns.Namespace = os.Getenv(util.POD_NAMESPACE_ENV)
+	return nil
+}
+```
+
+coreDns.PodIp初始化为云端tunnel pod ip；coredns.Namespace初始化为云端tunnel pod所属namespace；同时根据kubeconfig创建kubeclient(inCluster模式)
+
+而对于边端则会执行InitToken初始化clientToken，包括边缘节点名称以及通信携带的token
+
+```go
+// github.com/superedge/superedge/pkg/tunnel/proxy/stream/streammng/connect/streaminterceptor.go
+var clientToken string
+...
+func InitToken(nodeName, tk string) error {
+	var err error
+	clientToken, err = token.GetTonken(nodeName, tk)
+	klog.Infof("stream clinet token nodename = %s token = %s", nodeName, tk)
+	if err != nil {
+		klog.Error("client get token fail !")
+	}
+	return err
+}
+```
+
+最后会注册stream模块(grpc连接隧道)
+
+* tcp.InitTcp：注册了TcpProxy模块(建立在grpc隧道之上)
+* https.InitHttps：注册了https模块(建立在grpc隧道之上)
+* LoadModules：加载各模块，会执行上述已注册模块的Start函数
+```go
+func LoadModules(mode string) {
+	modules := GetModules()
+	for n, m := range modules {
+		context.GetContext().AddModule(n)
+		klog.Infof("starting module:%s", m.Name())
+		m.Start(mode)
+		klog.Infof("start module:%s success !", m.Name())
+	}
+
+}
+```
+
+如下分别介绍stream，tcpProxy以及https模块的Start函数：
+
+1、stream
+
+```go
+func (stream *Stream) Start(mode string) {
+	context.GetContext().RegisterHandler(util.STREAM_HEART_BEAT, util.STREAM, streammsg.HeartbeatHandler)
+	var channelzAddr string
+	if mode == util.CLOUD {
+		go connect.StartServer()
+		if !conf.TunnelConf.TunnlMode.Cloud.Stream.Dns.Debug {
+			go connect.SynCorefile()
+		}
+		channelzAddr = conf.TunnelConf.TunnlMode.Cloud.Stream.Server.ChannelzAddr
+	} else {
+		go connect.StartSendClient()
+		channelzAddr = conf.TunnelConf.TunnlMode.EDGE.StreamEdge.Client.ChannelzAddr
+	}
+
+	go connect.StartLogServer(mode)
+
+	go connect.StartChannelzServer(channelzAddr)
+}
+```
+
+首先调用RegisterHandler注册心跳消息处理函数HeartbeatHandler，其中util.STREAM以及util.STREAM_HEART_BEAT分别对应StreamMsg的category以及type字段
+
+如果tunnel位于云端，则启动grpc server并监听StreamServer.GrpcPort，如下：
+
+```go
+func StartServer() {
+	creds, err := credentials.NewServerTLSFromFile(conf.TunnelConf.TunnlMode.Cloud.Stream.Server.Cert, conf.TunnelConf.TunnlMode.Cloud.Stream.Server.Key)
+	if err != nil {
+		klog.Errorf("failed to create credentials: %v", err)
+		return
+	}
+	opts := []grpc.ServerOption{grpc.KeepaliveEnforcementPolicy(kaep), grpc.KeepaliveParams(kasp), grpc.StreamInterceptor(ServerStreamInterceptor), grpc.Creds(creds)}
+	s := grpc.NewServer(opts...)
+	proto.RegisterStreamServer(s, &stream.Server{})
+
+	lis, err := net.Listen("tcp", "0.0.0.0:"+strconv.Itoa(conf.TunnelConf.TunnlMode.Cloud.Stream.Server.GrpcPort))
+	klog.Infof("the https server of the cloud tunnel  listen on %s", "0.0.0.0:"+strconv.Itoa(conf.TunnelConf.TunnlMode.Cloud.Stream.Server.GrpcPort))
+	if err != nil {
+		klog.Fatalf("failed to listen: %v", err)
+		return
+	}
+	if err := s.Serve(lis); err != nil {
+		klog.Fatalf("failed to serve: %v", err)
+		return
+	}
+}
+```
+
+之后会调用SynCorefile执行同步coredns host plugins configmap刷新逻辑，每隔一分钟执行依次一次checkHosts，如下：
+
+```go
+func SynCorefile() {
+	for {
+		klog.V(8).Infof("connected node total = %d nodes = %v", len(context.GetContext().GetNodes()), context.GetContext().GetNodes())
+		err := coreDns.checkHosts()
+		if err != nil {
+			klog.Errorf("failed to synchronize hosts periodically err = %v", err)
+		}
+		time.Sleep(60 * time.Second)
+	}
+}
+```
+
+而checkHosts负责configmap具体的刷新操作：
+
+```go
+func (dns *CoreDns) checkHosts() error {
+	nodes, flag := parseHosts()
+	if !flag {
+		return nil
+	}
+	var hostsBuffer bytes.Buffer
+	for k, v := range nodes {
+		hostsBuffer.WriteString(v)
+		hostsBuffer.WriteString("    ")
+		hostsBuffer.WriteString(k)
+		hostsBuffer.WriteString("\n")
+	}
+	cm, err := dns.ClientSet.CoreV1().ConfigMaps(dns.Namespace).Get(cctx.TODO(), conf.TunnelConf.TunnlMode.Cloud.Stream.Dns.Configmap, metav1.GetOptions{})
+	if err != nil {
+		klog.Errorf("get configmap fail err = %v", err)
+		return err
+	}
+	if hostsBuffer.Len() != 0 {
+		cm.Data[util.COREFILE_HOSTS_FILE] = hostsBuffer.String()
+	} else {
+		cm.Data[util.COREFILE_HOSTS_FILE] = ""
+	}
+	_, err = dns.ClientSet.CoreV1().ConfigMaps(dns.Namespace).Update(cctx.TODO(), cm, metav1.UpdateOptions{})
+	if err != nil {
+		klog.Errorf("update configmap fail err = %v", err)
+		return err
+	}
+	klog.Infof("update configmap success!")
+	return nil
+}
+```
+
+首先调用parseHosts获取本节点
+
+2、tcpProxy
+
+3、https
 
 
 ## 总结

@@ -1044,6 +1044,52 @@ func (edge *node) BindNode(uuid string) {
 }
 ```
 
+这里会利用uuid创建context.conn，同时将该conn与node绑定；将TcpConn的type设置为TCP_FRONTEND，同时addr设置为边缘节点服务监听地址以及端口；并异步执行TcpConn Read以及Write函数：
+
+```go
+func (tcp *TcpConn) Read() {
+	running := true
+	for running {
+		select {
+		case <-tcp.stopChan:
+			klog.Info("Disconnect tcp and stop receiving !")
+			tcp.Conn.Close()
+			running = false
+		default:
+			size := 32 * 1024
+			if l, ok := interface{}(tcp.Conn).(*io.LimitedReader); ok && int64(size) > l.N {
+				if l.N < 1 {
+					size = 1
+				} else {
+					size = int(l.N)
+				}
+			}
+			buf := make([]byte, size)
+			n, err := tcp.Conn.Read(buf)
+			if err != nil {
+				klog.Errorf("conn read fail，err = %s ", err)
+				tcp.cleanUp()
+				break
+			}
+			tcp.n.Send2Node(&proto.StreamMsg{
+				Category: util.TCP,
+				Type:     tcp.Type,
+				Topic:    tcp.uid,
+				Data:     buf[0:n],
+				Addr:     tcp.Addr,
+				Node:     tcp.n.GetName(),
+			})
+			if err != nil {
+				klog.Errorf("tcp conn failed to send a message to the node err = %v", err)
+				running = false
+				break
+			}
+		}
+	}
+}
+```
+
+tcp.Read会从
 
 
 3、https(https请求)

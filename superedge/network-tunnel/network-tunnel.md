@@ -833,11 +833,97 @@ func ParseToken(token string) (*Token, error) {
 }
 ```
 
-ServerStreamInterceptor会从grpc.ServerStream authorization中解析出此grpc连接对应的边缘节点名和token，并对该token进行校验，然后根据节点名构建wrappedServerStream作为与该边缘节点通信的处理对象：
+ServerStreamInterceptor会从grpc.ServerStream authorization中解析出此grpc连接对应的边缘节点名和token，并对该token进行校验，然后根据节点名构建wrappedServerStream作为与该边缘节点通信的处理对象(每个边缘节点对应一个处理对象)：
 
 ```go
+func newServerWrappedStream(s grpc.ServerStream, node string) grpc.ServerStream {
+	return &wrappedServerStream{s, node}
+}
 
+type wrappedServerStream struct {
+	grpc.ServerStream
+	node string
+}
 ```
+
+wrappedServerStream实现了SendMsg以及RecvMsg分别用于发送与接受处理：
+
+```go
+func (w *wrappedServerStream) SendMsg(m interface{}) error {
+	if m != nil {
+		return w.ServerStream.SendMsg(m)
+	}
+	node := ctx.GetContext().AddNode(w.node)
+	klog.Infof("node added successfully node = %s", node.GetName())
+	defer klog.Infof("streamServer no longer sends messages to edge node: %s", w.node)
+	for {
+		msg := <-node.NodeRecv()
+		if msg.Category == util.STREAM && msg.Type == util.CLOSED {
+			klog.Error("streamServer turns off message sending")
+			return fmt.Errorf("streamServer stops sending messages to node: %s", w.node)
+		}
+		klog.V(8).Infof("streamServer starts to send messages to the client node: %s uuid: %s", msg.Node, msg.Topic)
+		err := w.ServerStream.SendMsg(msg)
+		if err != nil {
+			klog.Errorf("streamServer failed to send a message to the edge node: %s", w.node)
+			return err
+		}
+		klog.V(8).Infof("StreamServer sends a message to the client successfully node: %s uuid: %s", msg.Node, msg.Topic)
+	}
+}
+```
+
+SendMsg会从wrappedServerStream对应边缘节点中接受StreamMsg，并调用ServerStream.SendMsg发送该消息给边缘tunnel
+
+而RecvMsg会不断接受来自边缘tunnel的StreamMsg，并调用该消息对应的处理函数进行操作，例如心跳消息对应HeartbeatHandler：
+
+```go
+func (w *wrappedServerStream) RecvMsg(m interface{}) error {
+	if m != nil {
+		return w.ServerStream.RecvMsg(m)
+	}
+	defer klog.V(8).Infof("streamServer no longer receives messages from edge node: %s", w.node)
+	for {
+		msg := &proto.StreamMsg{}
+		err := w.ServerStream.RecvMsg(msg)
+		klog.V(8).Infof("streamServer receives messages node: %s ", w.node)
+		if err != nil {
+			klog.Errorf("streamServer failed to receive a message to the edge node: %s", w.node)
+			node := ctx.GetContext().GetNode(w.node)
+			if node != nil {
+				node.Send2Node(&proto.StreamMsg{
+					Node:     w.node,
+					Category: util.STREAM,
+					Type:     util.CLOSED,
+				})
+			}
+			return err
+		}
+		klog.V(8).Infof("streamServer received the message successfully node: %s uuid: %s", msg.Node, msg.Topic)
+		ctx.GetContext().Handler(msg, msg.Type, msg.Category)
+	}
+}
+
+...
+func HeartbeatHandler(msg *proto.StreamMsg) error {
+	node := context.GetContext().GetNode(msg.Node)
+	if node == nil {
+		klog.Errorf("failed to send heartbeat to edge node node: %s", msg.Node)
+		return fmt.Errorf("failed to send heartbeat to edge node node: %s", msg.Node)
+	}
+	node.Send2Node(msg)
+	return nil
+}
+```
+
+HeartbeatHandler会从msg.Node中获取边缘节点对应node，然后将该StreamMsg传递给node.ch，同时前面分析的wrappedServerStream.SendMsg会从该node.ch接受心跳StreamMsg并发送给边端
+
+总结stream(grpc隧道)如下：
+
+* stream模块负责建立grpc连接以及通信(云边隧道)
+* 边端tunnel会利用边缘节点名以及token构建grpc连接，而云端tunnel会通过认证信息解析grpc连接对应的边缘节点，并对每个边缘节点分别构建一个wrappedServerStream进行处理(同一个云端tunnel可以处理多个各边缘节点tunnel的连接)
+* 边端tunnel每隔一分钟会向云端tunnel发送代表该节点正常的心跳StreamMsg，而云端tunnel在接受到该心跳后会进行回应，并循环往复这个过程
+* 不管是边端还是云端都会通过context.node数据结构在SendMsg以及RecvMsg之间中转StreamMsg，而该StreamMsg包括心跳，tcp代理以及https请求等不同类型消息
 
 2、tcpProxy(tcp代理)
 

@@ -810,6 +810,15 @@ func ServerStreamInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.S
 	return err
 }
 
+func newServerWrappedStream(s grpc.ServerStream, node string) grpc.ServerStream {
+	return &wrappedServerStream{s, node}
+}
+
+type wrappedServerStream struct {
+	grpc.ServerStream
+	node string
+}
+
 func ParseToken(token string) (*Token, error) {
 	rtoken := &Token{}
 	err := json.Unmarshal([]byte(token), rtoken)
@@ -821,17 +830,6 @@ func ParseToken(token string) (*Token, error) {
 ```
 
 ServerStreamInterceptor会从grpc.ServerStream authorization中解析出此grpc连接对应的边缘节点名和token，并对该token进行校验，然后根据节点名构建wrappedServerStream作为与该边缘节点通信的处理对象(每个边缘节点对应一个处理对象)：
-
-```go
-func newServerWrappedStream(s grpc.ServerStream, node string) grpc.ServerStream {
-	return &wrappedServerStream{s, node}
-}
-
-type wrappedServerStream struct {
-	grpc.ServerStream
-	node string
-}
-```
 
 wrappedServerStream实现了SendMsg以及RecvMsg分别用于发送与接受处理：
 
@@ -912,8 +910,8 @@ HeartbeatHandler会从msg.Node中获取边缘节点对应node，然后将该Stre
 * tunnel-edge与tunnel-cloud建立grpc连接后，tunnel-cloud会把自身的podIp和tunnel-edge所在节点的nodeName的映射写入DNS(tunnel dns)。grpc连接断开之后，tunnel-cloud会删除相关podIp和节点名的映射
 * 边端tunnel会利用边缘节点名以及token构建grpc连接，而云端tunnel会通过认证信息解析grpc连接对应的边缘节点，并对每个边缘节点分别构建一个wrappedServerStream进行处理(同一个云端tunnel可以处理多个边缘节点tunnel的连接)
 * 云端tunnel每隔一分钟向coredns host plugins对应configmap同步一次边缘节点名以及tunnel pod ip的映射(并更新本tunnel连接的边缘节点映射列表)；另外，引入configmap本地挂载文件优化了托管模式下众多集群同时同步coredns时的性能
-* 边端tunnel每隔一分钟会向云端tunnel发送代表该节点正常的心跳StreamMsg，而云端tunnel在接受到该心跳后会进行回应，并循环往复这个过程
-* 不管是边端还是云端都会通过context.node数据结构在SendMsg以及RecvMsg之间中转StreamMsg，而该StreamMsg包括心跳，tcp代理以及https请求等不同类型消息；同时云端tunnel通过context.node区分与不同边缘节点grpc的连接隧道
+* 边端tunnel每隔一分钟会向云端tunnel发送代表该节点正常的心跳StreamMsg，而云端tunnel在接受到该心跳后会进行回应，并循环往复这个过程(心跳是为了探测grpc stream流是否正常)
+* StreamMsg包括心跳，tcp代理以及https请求等不同类型消息；同时云端tunnel通过context.node区分与不同边缘节点grpc的连接隧道
 
 2、tcpProxy(tcp代理)
 
@@ -1494,7 +1492,7 @@ func Request(msg *proto.StreamMsg) {
 }
 ```
 
-在接受到云端的CONNECTED消息之后，认为https代理成功建立。并继续执行handleClientHttp or handleClientSwitchingProtocols，这里只分析handleClientHttp，如下：
+在接受到云端的CONNECTED消息之后，认为https代理成功建立。并继续执行handleClientHttp or handleClientSwitchingProtocols，这里只分析handleClientHttp(非协议提升)，如下：
 
 ```go
 func handleClientHttp(resp *http.Response, rawResponse *bytes.Buffer, httpConn net.Conn, msg *proto.StreamMsg, node context.Node, conn context.Conn) {
@@ -1599,11 +1597,11 @@ func handleServerHttp(rmsg *HttpsMsg, writer http.ResponseWriter, request *http.
 }
 ```
 
-handleServerHttp在接受到StreamMsg后，会将msg.Data，也即边端组件的数据包，发送给云端组件
-
-整个数据流如下所示：
+handleServerHttp在接受到StreamMsg后，会将msg.Data，也即边端组件的数据包，发送给云端组件。整个数据流是单向的由边端向云端传送，如下所示：
 
 ![](images/tunnel-https-data-flow.png)
+
+而对于类似`kubectl exec`的请求，数据流是双向的，此时边端组件(kubelet)会返回StatusCode为101的回包，标示协议提升，之后云端tunnel会切到handleClientSwitchingProtocols对https请求进行读取和写入，完成数据流的双向传输
 
 架构如下所示：
 
@@ -1624,9 +1622,9 @@ handleServerHttp在接受到StreamMsg后，会将msg.Data，也即边端组件�
     * 边缘节点上tunnel-edge主动连接云端tunnel-cloud service，tunnel-cloud service根据负载均衡策略将请求转到tunnel-cloud的具体pod上
     * tunnel-edge与tunnel-cloud建立grpc连接后，tunnel-cloud会把自身的podIp和tunnel-edge所在节点的nodeName的映射写入DNS(tunnel dns)。grpc连接断开之后，tunnel-cloud会删除相关podIp和节点名的映射
     * 边端tunnel会利用边缘节点名以及token构建grpc连接，而云端tunnel会通过认证信息解析grpc连接对应的边缘节点，并对每个边缘节点分别构建一个wrappedServerStream进行处理(同一个云端tunnel可以处理多个边缘节点tunnel的连接)
-    * 边端tunnel每隔一分钟会向云端tunnel发送代表该节点正常的心跳StreamMsg，而云端tunnel在接受到该心跳后会进行回应，并循环往复这个过程
+    * 边端tunnel每隔一分钟会向云端tunnel发送代表该节点正常的心跳StreamMsg，而云端tunnel在接受到该心跳后会进行回应，并循环往复这个过程(心跳是为了探测grpc stream流是否正常)
     * 云端tunnel每隔一分钟向coredns host plugins对应configmap同步一次边缘节点名以及tunnel pod ip的映射(并更新本tunnel连接的边缘节点映射列表)；另外，引入configmap本地挂载文件优化了托管模式下众多集群同时同步coredns时的性能
-    * 不管是边端还是云端都会通过context.node数据结构在SendMsg以及RecvMsg之间中转StreamMsg，而该StreamMsg包括心跳，tcp代理以及https请求等不同类型消息；同时云端tunnel通过context.node区分与不同边缘节点grpc的连接隧道
+    * StreamMsg包括心跳，tcp代理以及https请求等不同类型消息；同时云端tunnel通过context.node区分与不同边缘节点grpc的连接隧道
   * tcp(tcp代理)：负责在多集群管理中建立云端与边端的tcp代理
     * 当云端组件与云端tunnel tcp代理建立连接时，云端tunnel会选择它所管理的边缘节点列表中第一个节点以及边端代理服务地址端口，创建代表tcp代理的结构体TcpConn，并从云端组件与云端tunnel建立的tcp连接中接受以及发送数据，之后转发给边端tunnel；边端tunnel在初次接受到云端tunnel发送的消息时，会与边端代理服务建立连接，并传输数据
     * 通过context.conn在tunnel grpc隧道与tcp代理之间中转StreamMsg。并区分各tcp代理连接

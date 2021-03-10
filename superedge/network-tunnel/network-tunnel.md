@@ -524,7 +524,7 @@ func StartSendClient() {
 }
 ```
 
-首先调用StartClient根据云端tunnel域名构建证书，并对云端tunnel服务地址调用grpc.Dial连接grpc连接，并返回grpc.ClientConn
+首先调用StartClient根据云端tunnel域名构建证书，并对云端tunnel服务地址调用grpc.Dial创建grpc连接，并返回grpc.ClientConn
 
 ```go
 func StartClient() (*grpc.ClientConn, ctx.Context, ctx.CancelFunc, error) {
@@ -765,7 +765,7 @@ func (w *wrappedClientStream) SendMsg(m interface{}) error {
 }
 ```
 
-SendMsg会起goroutine每隔1分钟会构建心跳StreamMsg，并通过node.ch传递。同时不断从node.ch中获取StreamMsg，并调用ClientStream.SendMsg发送StreamMsg给云端tunnel
+SendMsg会起goroutine每隔1分钟构建心跳StreamMsg，并通过node.ch传递。同时不断从node.ch中获取StreamMsg，并调用ClientStream.SendMsg发送StreamMsg给云端tunnel
 
 而RecvMsg会一直接受云端tunnel的StreamMsg，如果StreamMsg为心跳消息，则重置restart参数，使得边端tunnel继续发送心跳；若为其它类型消息，则调用该消息对应的处理函数进行操作：
 
@@ -800,7 +800,7 @@ func (w *wrappedClientStream) RecvMsg(m interface{}) error {
 }
 ```
 
-相应的，后过头来看云端StartServer：
+相应的，回过头来看云端StartServer：
 
 ```go
 func StartServer() {

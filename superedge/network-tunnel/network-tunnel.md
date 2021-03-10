@@ -1197,7 +1197,7 @@ func BackendHandler(msg *proto.StreamMsg) error {
 BackendHandler会根据msg.Topic(conn uid)获取conn，并调用conn.Send2Conn发送StreamMsg，而TcpConn.Write会接受该消息，并通过云端tunnel与云端组件建立的tcp连接将msg.data发送给云端组件，数据流如下：
 
 ```
-边端服务 -> 边端tunnel -> 云端tunnel -> 边端服务 
+边端服务 -> 边端tunnel -> 云端tunnel -> 云端组件 
 ```
 
 架构如图所示：

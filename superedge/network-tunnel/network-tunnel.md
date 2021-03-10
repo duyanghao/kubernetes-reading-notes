@@ -95,7 +95,7 @@ type StreamClient struct {
 
 TunnelCloud包含如下结构：
 
-* HttpsServer：云端tunnel证书，key以及Addr map(key表示云端tunnel https代理监听端口，而value表示边端tunnel需要访问的地址(kubelet监听地址：`127.0.0.1:10250`))
+* HttpsServer：云端tunnel证书，key以及Addr map(key表示云端tunnel https代理监听端口，而value表示边端tunnel需要访问的https服务监听地址(kubelet监听地址：`127.0.0.1:10250`))
 * StreamCloud：包括StreamServer以及Dns配置：
   * StreamServer：包括云端tunnel grpc服务证书，key，以及监听端口
   * Dns：包括了云端coredns相关信息：

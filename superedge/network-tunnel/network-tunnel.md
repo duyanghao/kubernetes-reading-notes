@@ -1137,12 +1137,12 @@ func FrontendHandler(msg *proto.StreamMsg) error {
 
 FrontendHandler首先根据msg.Topic，msg.Addr以及msg.Node构建TcpConn，然后利用msg.Addr与边端的代理服务建立tcp连接，并将该连接赋值给TcpConn.Conn，因此边端tunnel创建出的TcpConn各字段含义如下：
 
-* uid：云端TcpConn对应的uid
+* uid：云端tunnel TcpConn对应的uid
 * Conn：边端tunnel与边端代理服务建立的tcp连接
 * Type：TCP_BACKEND
 * C：云端TcpConn对应的uid建立的context.conn
 * n：边缘节点名称
-* addr：边缘节点代理服务监听地址及端口
+* addr：边缘节点代理服务tcp监听地址及端口
 
 之后会异步执行该TcpConn的Read以及Write函数，由于这里对StreamMsg执行了Send2Conn，因此会触发Write操作，如下：
 

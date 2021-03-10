@@ -226,7 +226,7 @@ type HttpsMsg struct {
 HttpsMsg为https消息传输中转结构：
 
 * StatusCode：http response返回码
-* HttpsStatus：http response status
+* HttpsStatus：https连接状态
 * HttpBody：http 请求 or 回应 body
 * Header：http请求 or 回应报头
 * Method：http请求Method
@@ -1463,13 +1463,211 @@ func getHttpConn(msg *proto.StreamMsg) (net.Conn, error) {
 
 ConnectingHandler会调用Request对该StreamMsg进行处理。Reqeust首先通过getHttpConn发起对StreamMsg.Addr也即边缘节点https服务的https请求，请求内容复用了云端组件对云端tunnel的请求(method，headler，body等)。并返回了建立的tls连接
 
-之后通过tls连接创建了respReader，并调用http.ReadResponse构建HttpsMsg
+之后通过tls连接创建了respReader，并调用http.ReadResponse读取resp.StatusCode以及resp.Header构建出HttpsMsg(HttpsStatus为util.CONNECTED)，序列化后作为StreamMsg的数据部分发送给云端tunnel
+
+云端tunnel在接受到该StreamMsg后，会调用ConnectedAndTransmission进行处理：
+
+```go
+func ConnectedAndTransmission(msg *proto.StreamMsg) error {
+	conn := context.GetContext().GetConn(msg.Topic)
+	if conn == nil {
+		klog.Errorf("trace_id = %s the stream module failed to distribute the side message module = %s type = %s", msg.Topic, msg.Category, msg.Type)
+		return fmt.Errorf("trace_id = %s the stream module failed to distribute the side message module = %s type = %s", msg.Topic, msg.Category, msg.Type)
+	}
+	conn.Send2Conn(msg)
+	return nil
+}
+```
+
+通过msg.Topic(conn uid)获取conn，并通过Send2Conn将消息塞到该conn对应的管道中
+
+而ServerHandler之前在发送完CONNECTING的HttpsMsg后就一直处于阻塞等待conn的管道中：
+
+```go
+func (serverHandler *ServerHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+    ...
+	node.Send2Node(&proto.StreamMsg{
+		Node:     nodeName,
+		Category: util.HTTPS,
+		Type:     util.CONNECTING,
+		Topic:    uid,
+		Data:     bmsg,
+		Addr:     "https://" + conf.TunnelConf.TunnlMode.Cloud.Https.Addr[serverHandler.port] + request.URL.String(),
+	})
+	if err != nil {
+		klog.Errorf("traceid = %s httpsServer send request msg failed err = %v", uid, err)
+		fmt.Fprintf(writer, "traceid = %s httpsServer send request msg failed err = %v", uid, err)
+		return
+	}
+	resp := <-conn.ConnRecv()
+	rmsg, err := Deserialization(resp.Data)
+	if err != nil {
+		klog.Errorf("traceid = %s httpsmag deserialization failed err = %v", uid, err)
+		fmt.Fprintf(writer, "traceid = %s httpsmag deserialization failed err = %v", uid, err)
+		return
+	}
+	node.Send2Node(&proto.StreamMsg{
+		Node:     nodeName,
+		Category: util.HTTPS,
+		Type:     util.CONNECTED,
+		Topic:    uid,
+	})
+	if err != nil {
+		klog.Errorf("traceid = %s httpsServer send confirm msg failed err = %v", uid, err)
+		fmt.Fprintf(writer, "traceid = %s httpsServer send confirm msg failed err = %v", uid, err)
+		return
+	}
+    ...
+}
+```
+
+在接受到来自边端tunnel的CONNECTED回应之后，会继续发送CONNECTED StreamMsg给云端tunnel，而边端tunnel这个时候一直等待接受来自云端tunnel的CONNECTED StreamMsg：
+
+```go
+func Request(msg *proto.StreamMsg) {
+    ...
+	node.Send2Node(&proto.StreamMsg{
+		Node:     msg.Node,
+		Category: msg.Category,
+		Type:     util.CONNECTED,
+		Topic:    msg.Topic,
+		Data:     msgData,
+	})
+	conn := context.GetContext().AddConn(msg.Topic)
+	node.BindNode(msg.Topic)
+	confirm := true
+	for confirm {
+		confirmMsg := <-conn.ConnRecv()
+		if confirmMsg.Type == util.CONNECTED {
+			confirm = false
+		}
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		handleClientHttp(resp, rawResponse, httpConn, msg, node, conn)
+	} else {
+		handleClientSwitchingProtocols(httpConn, rawResponse, msg, node, conn)
+	}
+}
+```
+
+在接受到云端的CONNECTED消息之后，认为https代理成功建立。并继续执行handleClientHttp or handleClientSwitchingProtocols，这里只分析handleClientHttp，如下：
+
+```go
+func handleClientHttp(resp *http.Response, rawResponse *bytes.Buffer, httpConn net.Conn, msg *proto.StreamMsg, node context.Node, conn context.Conn) {
+	readCh := make(chan *proto.StreamMsg, util.MSG_CHANNEL_CAP)
+	stop := make(chan struct{})
+	go func(read chan *proto.StreamMsg, response *http.Response, buf *bytes.Buffer, stopRead chan struct{}) {
+		rrunning := true
+		for rrunning {
+			bbody := make([]byte, util.MaxResponseSize)
+			n, err := response.Body.Read(bbody)
+			respMsg := &proto.StreamMsg{
+				Node:     msg.Node,
+				Category: msg.Category,
+				Type:     util.CONNECTED,
+				Topic:    msg.Topic,
+				Data:     bbody[:n],
+			}
+			if err != nil {
+				if err == io.EOF {
+					klog.V(4).Infof("traceid = %s httpsclient read fail err = %v", msg.Topic, err)
+				} else {
+					klog.Errorf("traceid = %s httpsclient read fail err = %v", msg.Topic, err)
+				}
+				rrunning = false
+				respMsg.Type = util.CLOSED
+			} else {
+				respMsg.Type = util.TRANSNMISSION
+				buf.Reset()
+			}
+			read <- respMsg
+		}
+		<-stop
+		close(read)
+	}(readCh, resp, rawResponse, stop)
+	running := true
+	for running {
+		select {
+		case cloudMsg := <-conn.ConnRecv():
+			if cloudMsg.Type == util.CLOSED {
+				klog.Infof("traceid = %s httpsclient receive close msg", msg.Topic)
+				httpConn.Close()
+				stop <- struct{}{}
+			}
+		case respMsg := <-readCh:
+			if respMsg == nil {
+				running = false
+				break
+			}
+			node.Send2Node(respMsg)
+			if respMsg.Type == util.CLOSED {
+				stop <- struct{}{}
+				klog.V(4).Infof("traceid = %s httpsclient read fail !", msg.Topic)
+				running = false
+			}
+
+		}
+	}
+	node.UnbindNode(conn.GetUid())
+	context.GetContext().RemoveConn(conn.GetUid())
+}
+```
+
+这里handleClientHttp会一直尝试读取来自边端组件的数据包，并构建成TRANSNMISSION类型的StreamMsg发送给云端tunnel，云端tunnel在接受到该消息后会执行ConnectedAndTransmission，并将该消息塞到代表https代理请求的conn管道中
+
+而云端tunnel在发送完CONNECTED消息之后，会继续执行handleServerHttp处理https数据传输：
+
+```go
+func handleServerHttp(rmsg *HttpsMsg, writer http.ResponseWriter, request *http.Request, node context.Node, conn context.Conn) {
+	for k, v := range rmsg.Header {
+		writer.Header().Add(k, v)
+	}
+	flusher, ok := writer.(http.Flusher)
+	if ok {
+		running := true
+		for running {
+			select {
+			case <-request.Context().Done():
+				klog.Infof("traceid = %s httpServer context close! ", conn.GetUid())
+				node.Send2Node(&proto.StreamMsg{
+					Node:     node.GetName(),
+					Category: util.HTTPS,
+					Type:     util.CLOSED,
+					Topic:    conn.GetUid(),
+				})
+				running = false
+			case msg := <-conn.ConnRecv():
+				if msg.Data != nil && len(msg.Data) != 0 {
+					_, err := writer.Write(msg.Data)
+					if err != nil {
+						klog.Errorf("traceid = %s httpsServer write data failed err = %v", conn.GetUid(), err)
+					}
+					flusher.Flush()
+				}
+				if msg.Type == util.CLOSED {
+					running = false
+					break
+				}
+			}
+		}
+	}
+	context.GetContext().RemoveConn(conn.GetUid())
+}
+```
+
+handleServerHttp在接受到StreamMsg后，会将msg.Data，也即边端组件的数据包，发送给云端组件
+
+整个数据流如下所示：
+
+![](images/tunnel-https-data-flow.png)
 
 架构如下所示：
 
 ![](images/tunnel-https.png)
 
 ## 总结
+
+
 
 ## 展望
 

@@ -222,12 +222,12 @@ type HttpsMsg struct {
 }
 ```
 
-HttpsMsg为https消息传输中转结构：
+HttpsMsg为https代理消息传输中转结构：
 
 * StatusCode：http response返回码
 * HttpsStatus：https连接状态
-* HttpBody：http 请求 or 回应 body
-* Header：http请求 or 回应报头
+* HttpBody：http 请求 or 回应 Body
+* Header：http 请求 or 回应 报头
 * Method：http请求Method
 
 在介绍完tunnel核心配置和数据结构后，下面开始分析源码

@@ -553,7 +553,42 @@ func StartClient() (*grpc.ClientConn, ctx.Context, ctx.CancelFunc, error) {
 }
 ```
 
-之后等待grpc连接状态变为Ready(隧道建立好了)，然后调用proto.NewStreamClient在grpc.ClientConn上建立streamClient，并对streamClient执行stream.Send：
+在调用grpc.Dial时会传递`grpc.WithStreamInterceptor(ClientStreamInterceptor)` DialOption，将ClientStreamInterceptor作为StreamClientInterceptor传递给grpc连接：
+
+```go
+func ClientStreamInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+	var credsConfigured bool
+	for _, o := range opts {
+		_, ok := o.(*grpc.PerRPCCredsCallOption)
+		if ok {
+			credsConfigured = true
+		}
+	}
+	if !credsConfigured {
+		opts = append(opts, grpc.PerRPCCredentials(oauth.NewOauthAccess(&oauth2.Token{
+			AccessToken: clientToken,
+		})))
+	}
+	s, err := streamer(ctx, desc, cc, method, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return newClientWrappedStream(s), nil
+}
+
+func newClientWrappedStream(s grpc.ClientStream) grpc.ClientStream {
+	return &wrappedClientStream{s, false}
+}
+
+type wrappedClientStream struct {
+	grpc.ClientStream
+	restart bool
+}
+```
+
+ClientStreamInterceptor会将边缘节点名称以及token构造成oauth2.Token.AccessToken进行认证传递，并构建wrappedClientStream
+
+之后等待grpc连接状态变为Ready，然后执行stream.Send：
 
 ```go
 func Send(client proto.StreamClient, clictx ctx.Context) {
@@ -589,124 +624,7 @@ func Send(client proto.StreamClient, clictx ctx.Context) {
 }
 ```
 
-stream.Send会向grpc连接对端，也即云端tunnel，发送空消息并等待对方回应
-
-相应的，云端tunnel会接受消息并回应，如下：
-
-```go
-func StartServer() {
-	creds, err := credentials.NewServerTLSFromFile(conf.TunnelConf.TunnlMode.Cloud.Stream.Server.Cert, conf.TunnelConf.TunnlMode.Cloud.Stream.Server.Key)
-	if err != nil {
-		klog.Errorf("failed to create credentials: %v", err)
-		return
-	}
-	opts := []grpc.ServerOption{grpc.KeepaliveEnforcementPolicy(kaep), grpc.KeepaliveParams(kasp), grpc.StreamInterceptor(ServerStreamInterceptor), grpc.Creds(creds)}
-	s := grpc.NewServer(opts...)
-	proto.RegisterStreamServer(s, &stream.Server{})
-
-	lis, err := net.Listen("tcp", "0.0.0.0:"+strconv.Itoa(conf.TunnelConf.TunnlMode.Cloud.Stream.Server.GrpcPort))
-	klog.Infof("the https server of the cloud tunnel  listen on %s", "0.0.0.0:"+strconv.Itoa(conf.TunnelConf.TunnlMode.Cloud.Stream.Server.GrpcPort))
-	if err != nil {
-		klog.Fatalf("failed to listen: %v", err)
-		return
-	}
-	if err := s.Serve(lis); err != nil {
-		klog.Fatalf("failed to serve: %v", err)
-		return
-	}
-}
-
-type Server struct{}
-
-func (s *Server) TunnelStreaming(stream proto.Stream_TunnelStreamingServer) error {
-	errChan := make(chan error, 2)
-
-	go func(sendStream proto.Stream_TunnelStreamingServer, sendChan chan error) {
-		sendErr := sendStream.SendMsg(nil)
-		if sendErr != nil {
-			klog.Errorf("streamServer failed to send message err = %v", sendErr)
-		}
-		sendChan <- sendErr
-	}(stream, errChan)
-
-	go func(recvStream proto.Stream_TunnelStreamingServer, recvChan chan error) {
-		recvErr := stream.RecvMsg(nil)
-		if recvErr != nil {
-			klog.Errorf("streamServer failed to receive message err = %v", recvErr)
-		}
-		recvChan <- recvErr
-	}(stream, errChan)
-
-	e := <-errChan
-	klog.Errorf("the stream of streamServer is disconnected err = %v", e)
-	return e
-}
-```
-
-之后StartSendClient会每隔1s发送空消息给云端tunnel，并接受回应，来保持连接一直处于Ready状态
-
-这里重新回到StartClient函数：
-
-```go
-func StartClient() (*grpc.ClientConn, ctx.Context, ctx.CancelFunc, error) {
-	creds, err := credentials.NewClientTLSFromFile(conf.TunnelConf.TunnlMode.EDGE.StreamEdge.Client.Cert, conf.TunnelConf.TunnlMode.EDGE.StreamEdge.Client.Dns)
-	if err != nil {
-		klog.Errorf("failed to load credentials: %v", err)
-		return nil, nil, nil, err
-	}
-	opts := []grpc.DialOption{grpc.WithKeepaliveParams(kacp), grpc.WithStreamInterceptor(ClientStreamInterceptor), grpc.WithTransportCredentials(creds)}
-	conn, err := grpc.Dial(conf.TunnelConf.TunnlMode.EDGE.StreamEdge.Client.ServerName, opts...)
-	if err != nil {
-		klog.Error("edge start client fail !")
-		return nil, nil, nil, err
-	}
-	clictx, cancle := ctx.WithTimeout(ctx.Background(), time.Duration(math.MaxInt64))
-	return conn, clictx, cancle, nil
-}
-
-// WithStreamInterceptor returns a DialOption that specifies the interceptor for
-// streaming RPCs.
-func WithStreamInterceptor(f StreamClientInterceptor) DialOption {
-	return newFuncDialOption(func(o *dialOptions) {
-		o.streamInt = f
-	})
-}
-```
-
-在调用grpc.Dial时会传递`grpc.WithStreamInterceptor(ClientStreamInterceptor)` DialOption，将ClientStreamInterceptor作为StreamClientInterceptor传递给grpc连接：
-
-```go
-func ClientStreamInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-	var credsConfigured bool
-	for _, o := range opts {
-		_, ok := o.(*grpc.PerRPCCredsCallOption)
-		if ok {
-			credsConfigured = true
-		}
-	}
-	if !credsConfigured {
-		opts = append(opts, grpc.PerRPCCredentials(oauth.NewOauthAccess(&oauth2.Token{
-			AccessToken: clientToken,
-		})))
-	}
-	s, err := streamer(ctx, desc, cc, method, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return newClientWrappedStream(s), nil
-}
-
-func newClientWrappedStream(s grpc.ClientStream) grpc.ClientStream {
-	return &wrappedClientStream{s, false}
-}
-
-type wrappedClientStream struct {
-	grpc.ClientStream
-	restart bool
-}
-```
-
-ClientStreamInterceptor会将边缘节点名称以及token构造成oauth2.Token.AccessToken进行认证传递，并构建wrappedClientStream，利用SendMsg以及RecvMsg分别进行发送以及接受操作，下面依次进行分析：
+stream.Send会并发调用wrappedClientStream.SendMsg以及wrappedClientStream.RecvMsg分别用于边端tunnel发送以及接受，并阻塞等待
 
 ```go
 func (w *wrappedClientStream) SendMsg(m interface{}) error {
@@ -809,7 +727,35 @@ func (w *wrappedClientStream) RecvMsg(m interface{}) error {
 }
 ```
 
-相应的，回过头来看云端StartServer：
+相应的，云端TunnelStreaming会并发调用wrappedServerStream.SendMsg以及wrappedServerStream.RecvMsg分别用于云端tunnel的发送以及接受，并阻塞等待，如下：
+
+```go
+func (s *Server) TunnelStreaming(stream proto.Stream_TunnelStreamingServer) error {
+	errChan := make(chan error, 2)
+
+	go func(sendStream proto.Stream_TunnelStreamingServer, sendChan chan error) {
+		sendErr := sendStream.SendMsg(nil)
+		if sendErr != nil {
+			klog.Errorf("streamServer failed to send message err = %v", sendErr)
+		}
+		sendChan <- sendErr
+	}(stream, errChan)
+
+	go func(recvStream proto.Stream_TunnelStreamingServer, recvChan chan error) {
+		recvErr := stream.RecvMsg(nil)
+		if recvErr != nil {
+			klog.Errorf("streamServer failed to receive message err = %v", recvErr)
+		}
+		recvChan <- recvErr
+	}(stream, errChan)
+
+	e := <-errChan
+	klog.Errorf("the stream of streamServer is disconnected err = %v", e)
+	return e
+}
+```
+
+在初始化云端tunnel时，会将`grpc.StreamInterceptor(ServerStreamInterceptor)`构建成grpc ServerOption，并将ServerStreamInterceptor作为StreamServerInterceptor传递给grpc连接：
 
 ```go
 func StartServer() {
@@ -834,21 +780,6 @@ func StartServer() {
 	}
 }
 
-// StreamInterceptor returns a ServerOption that sets the StreamServerInterceptor for the
-// server. Only one stream interceptor can be installed.
-func StreamInterceptor(i StreamServerInterceptor) ServerOption {
-	return newFuncServerOption(func(o *serverOptions) {
-		if o.streamInt != nil {
-			panic("The stream server interceptor was already set and may not be reset.")
-		}
-		o.streamInt = i
-	})
-}
-```
-
-在初始化云端tunnel时，会将`grpc.StreamInterceptor(ServerStreamInterceptor)`构建成grpc ServerOption，并将ServerStreamInterceptor作为StreamServerInterceptor传递给grpc连接：
-
-```go
 func ServerStreamInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	klog.Info("start verifying the token !")
 	md, ok := metadata.FromIncomingContext(ss.Context())

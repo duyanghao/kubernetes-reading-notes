@@ -973,7 +973,7 @@ HeartbeatHandler会从msg.Node中获取边缘节点对应node，然后将该Stre
 * 边端tunnel会利用边缘节点名以及token构建grpc连接，而云端tunnel会通过认证信息解析grpc连接对应的边缘节点，并对每个边缘节点分别构建一个wrappedServerStream进行处理(同一个云端tunnel可以处理多个边缘节点tunnel的连接)
 * 云端tunnel每隔一分钟向coredns host plugins对应configmap同步一次边缘节点名以及tunnel pod ip的映射(并更新本tunnel连接的边缘节点映射列表)；另外，引入configmap本地挂载文件优化了托管模式下众多集群同时同步coredns时的性能
 * 边端tunnel每隔一分钟会向云端tunnel发送代表该节点正常的心跳StreamMsg，而云端tunnel在接受到该心跳后会进行回应，并循环往复这个过程
-* 不管是边端还是云端都会通过context.node数据结构在SendMsg以及RecvMsg之间中转StreamMsg，而该StreamMsg包括心跳，tcp代理以及https请求等不同类型消息
+* 不管是边端还是云端都会通过context.node数据结构在SendMsg以及RecvMsg之间中转StreamMsg，而该StreamMsg包括心跳，tcp代理以及https请求等不同类型消息；同时云端tunnel通过context.node区分与不同边缘节点grpc的连接隧道
 
 2、tcpProxy(tcp代理)
 
@@ -1686,7 +1686,7 @@ handleServerHttp在接受到StreamMsg后，会将msg.Data，也即边端组件�
     * 边端tunnel会利用边缘节点名以及token构建grpc连接，而云端tunnel会通过认证信息解析grpc连接对应的边缘节点，并对每个边缘节点分别构建一个wrappedServerStream进行处理(同一个云端tunnel可以处理多个边缘节点tunnel的连接)
     * 边端tunnel每隔一分钟会向云端tunnel发送代表该节点正常的心跳StreamMsg，而云端tunnel在接受到该心跳后会进行回应，并循环往复这个过程
     * 云端tunnel每隔一分钟向coredns host plugins对应configmap同步一次边缘节点名以及tunnel pod ip的映射(并更新本tunnel连接的边缘节点映射列表)；另外，引入configmap本地挂载文件优化了托管模式下众多集群同时同步coredns时的性能
-    * 不管是边端还是云端都会通过context.node数据结构在SendMsg以及RecvMsg之间中转StreamMsg，而该StreamMsg包括心跳，tcp代理以及https请求等不同类型消息
+    * 不管是边端还是云端都会通过context.node数据结构在SendMsg以及RecvMsg之间中转StreamMsg，而该StreamMsg包括心跳，tcp代理以及https请求等不同类型消息；同时云端tunnel通过context.node区分与不同边缘节点grpc的连接隧道
   * tcp(tcp代理)：负责在多集群管理中建立云端与边端的tcp代理
     * 当云端组件与云端tunnel tcp代理建立连接时，云端tunnel会选择它所管理的边缘节点列表中第一个节点以及边端代理服务地址端口，创建代表tcp代理的结构体TcpConn，并从云端组件与云端tunnel建立的tcp连接中接受以及发送数据，之后转发给边端tunnel；边端tunnel在初次接受到云端tunnel发送的消息时，会与边端代理服务建立连接，并传输数据
     * 通过context.conn在tunnel grpc隧道与tcp代理之间中转StreamMsg。并区分各tcp代理连接

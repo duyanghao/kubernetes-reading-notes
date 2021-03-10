@@ -920,7 +920,7 @@ func (w *wrappedServerStream) SendMsg(m interface{}) error {
 }
 ```
 
-SendMsg会从wrappedServerStream对应边缘节点中接受StreamMsg，并调用ServerStream.SendMsg发送该消息给边缘tunnel
+SendMsg会从wrappedServerStream对应边缘节点node中接受StreamMsg，并调用ServerStream.SendMsg发送该消息给边缘tunnel
 
 而RecvMsg会不断接受来自边缘tunnel的StreamMsg，并调用该消息对应的处理函数进行操作，例如心跳消息对应HeartbeatHandler：
 

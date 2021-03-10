@@ -203,12 +203,12 @@ type TcpConn struct {
 
 TcpConn为tcp代理模块封装的数据结构，代表了grpc隧道上的一个tcp代理连接：
 
-* Conn：云端组件与云端tunnel的底层tcp连接
+* Conn：云端组件与云端tunnel的底层tcp连接 or 边端tunnel与边端组件的底层tcp连接
 * uid：TcpConn唯一标识
 * Type：TcpConn类型
 * C：TcpConn使用的context.Conn
-* n：TcpConn使用的context.Node
-* Addr：边缘服务监听地址及端口
+* n：TcpConn对应的context.Node
+* Addr：边缘服务tcp监听地址及端口
 
 7、HttpsMsg
 

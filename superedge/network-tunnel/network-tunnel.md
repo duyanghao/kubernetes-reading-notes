@@ -95,14 +95,14 @@ type StreamClient struct {
 
 TunnelCloud包含如下结构：
 
-* HttpsServer：云端tunnel证书，key以及Addr map(key表示云端tunnel https代理监听端口，而value表示边端tunnel需要访问的https服务监听地址(kubelet监听地址：`127.0.0.1:10250`))
+* HttpsServer：云端tunnel证书，key以及Addr map(key表示云端tunnel https代理监听端口，而value表示边端tunnel需要访问的https服务监听地址(kubelet监听地址：`127.0.0.1:10250`)
 * StreamCloud：包括StreamServer以及Dns配置：
   * StreamServer：包括云端tunnel grpc服务证书，key，以及监听端口
   * Dns：包括了云端coredns相关信息：
     * Configmap：云端coredns host plugin使用的挂载configmap，其中存放有云端tunnel ip以及边缘节点名映射列表
     * Hosts：云端tunnel对coredns host plugin使用的configmap的本地挂载文件
     * Service：云端tunnel service名称
-* Tcp：包括了云端tunnel tcp监听地址以及边端节点某进程的tcp监听地址
+* Tcp：包括了云端tunnel tcp监听地址以及边缘节点某进程的tcp监听地址
 
 TunnelCloud包含如下结构：
 
@@ -1350,7 +1350,7 @@ func (serverHandler *ServerHandler) ServeHTTP(writer http.ResponseWriter, reques
 
 当云端组件向云端tunnel发送https请求时，serverHandler会首先从request.Host字段解析节点名，若不存在则从request.TLS.ServerName解析节点名，这里解释一下这样做的原因：
 
-由于apiserver或者其它组件本来要访问的对象是边端节点上的某个服务，通过coredns DNS劫持后，会将host中的节点名解析为tunnel-cloud的podIp，但是host以及request.TLS.ServerName依旧保持不变，因此可以通过解析这两个字段得出要访问的边缘节点名称
+由于apiserver或者其它组件本来要访问的对象是边缘节点上的某个服务，通过coredns DNS劫持后，会将host中的节点名解析为tunnel-cloud的podIp，但是host以及request.TLS.ServerName依旧保持不变，因此可以通过解析这两个字段得出要访问的边缘节点名称
 
 之后读取request.Body以及request.Header构建HttpsMsg结构体，并序列化。之后创建StreamMsg，各字段含义如下：
 

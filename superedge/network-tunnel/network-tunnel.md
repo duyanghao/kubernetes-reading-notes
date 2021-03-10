@@ -142,7 +142,7 @@ type conn struct {
 }
 ```
 
-conn表示tunnel grpc连接隧道上的连接(包括tcp以及https代理)：
+conn表示tunnel grpc隧道上的连接(包括tcp以及https代理)：
 
 * uid：表示conn uid
 * ch：StreamMsg消息传递的管道
@@ -1673,7 +1673,7 @@ handleServerHttp在接受到StreamMsg后，会将msg.Data，也即边端组件�
 
 * tunnel配置包括云端以及边端配置；tunnel数据结构如下：
   * StreamMsg：云边grpc隧道传输的消息数据格式
-  * conn：tunnel grpc连接隧道上的连接(包括tcp以及https代理)
+  * conn：tunnel grpc隧道上的连接(包括tcp以及https代理)
   * connContext：tunnel grpc上所有连接，其中conns key为conn uid，value为conn
   * node：边缘节点相关连接信息
   * nodeContext：tunnel上所有相关节点信息，其中nodes key为边缘节点名称，value为node

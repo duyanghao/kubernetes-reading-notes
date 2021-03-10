@@ -414,7 +414,7 @@ func StartServer() {
 }
 ```
 
-之后会调用SynCorefile执行同步coredns host plugins configmap刷新逻辑，每隔一分钟执行依次一次checkHosts，如下：
+之后会调用SynCorefile执行同步coredns host plugins configmap刷新逻辑，每隔一分钟执行一次checkHosts，如下：
 
 ```go
 func SynCorefile() {
@@ -464,11 +464,11 @@ func (dns *CoreDns) checkHosts() error {
 }
 ```
 
-首先调用parseHosts获取所有云端tunnel连接的边缘节点名称以及对应云端tunnel pod ip映射列表，然后写入hostsBuffer(`tunnel pod ip` `nodeName`形式)，如果有变化则将这个内容覆盖写入configmap并更新：
+首先调用parseHosts获取所有云端tunnel连接的边缘节点名称以及对应云端tunnel pod ip映射列表(并更新本tunnel连接的边缘节点映射列表)，然后写入hostsBuffer(`tunnel pod ip` `nodeName`形式)，如果有变化则将这个内容覆盖写入configmap并更新：
 
 ![](images/tunnel-coredns.png)
 
-**另外，这里云端tunnel引入本地文件的目的是：优化托管模式下众多集群同时同步coredns时的性能**
+**另外，这里云端tunnel引入configmap本地挂载文件的目的是：优化托管模式下众多集群同时同步coredns时的性能**
 
 而如果tunnel位于边端，则会调用StartSendClient进行隧道的打通：
 

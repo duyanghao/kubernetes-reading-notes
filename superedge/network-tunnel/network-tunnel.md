@@ -533,7 +533,7 @@ func StartSendClient() {
 }
 ```
 
-首先调用StartClient根据云端tunnel域名构建证书，并对云端tunnel服务地址调用grpc.Dial创建grpc连接，并返回grpc.ClientConn
+首先调用StartClient根据云端tunnel域名构建证书，对云端tunnel服务地址调用grpc.Dial创建grpc连接，并返回grpc.ClientConn
 
 ```go
 func StartClient() (*grpc.ClientConn, ctx.Context, ctx.CancelFunc, error) {
@@ -1492,7 +1492,7 @@ func Request(msg *proto.StreamMsg) {
 }
 ```
 
-在接受到云端的CONNECTED消息之后，认为https代理成功建立。并继续执行handleClientHttp or handleClientSwitchingProtocols，这里只分析handleClientHttp(非协议提升)，如下：
+在接受到云端的CONNECTED消息之后，认为https代理成功建立。并继续执行handleClientHttp or handleClientSwitchingProtocols进行数据传输，这里只分析handleClientHttp非协议提升下的数据传输过程，如下：
 
 ```go
 func handleClientHttp(resp *http.Response, rawResponse *bytes.Buffer, httpConn net.Conn, msg *proto.StreamMsg, node context.Node, conn context.Conn) {
@@ -1557,7 +1557,7 @@ func handleClientHttp(resp *http.Response, rawResponse *bytes.Buffer, httpConn n
 
 这里handleClientHttp会一直尝试读取来自边端组件的数据包，并构建成TRANSNMISSION类型的StreamMsg发送给云端tunnel，云端tunnel在接受到该消息后会执行ConnectedAndTransmission，并将该消息塞到代表https代理请求的conn管道中
 
-而云端tunnel在发送完CONNECTED消息之后，会继续执行handleServerHttp处理https数据传输：
+而云端tunnel在发送完CONNECTED消息之后，会继续执行handleServerHttp(非协议提升) or handleServerSwitchingProtocols(协议提升)处理https数据传输，这里只分析非协议提升下的数据传输：
 
 ```go
 func handleServerHttp(rmsg *HttpsMsg, writer http.ResponseWriter, request *http.Request, node context.Node, conn context.Conn) {
@@ -1601,7 +1601,7 @@ handleServerHttp在接受到StreamMsg后，会将msg.Data，也即边端组件�
 
 ![](images/tunnel-https-data-flow.png)
 
-而对于类似`kubectl exec`的请求，数据流是双向的，此时边端组件(kubelet)会返回StatusCode为101的回包，标示协议提升，之后云端tunnel会切到handleClientSwitchingProtocols对https请求进行读取和写入，完成数据流的双向传输
+而对于类似`kubectl exec`的请求，数据流是双向的，此时边端组件(kubelet)会返回StatusCode为101的回包，标示协议提升，之后云端tunnel以及边端tunnel会分别切到handleServerSwitchingProtocols以及handleClientSwitchingProtocols对https底层连接进行读取和写入，完成数据流的双向传输
 
 架构如下所示：
 

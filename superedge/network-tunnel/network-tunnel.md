@@ -184,7 +184,7 @@ type nodeContext struct {
 }
 ```
 
-nodeContext表示本tunnel上所有相关节点信息，其中nodes key为边缘节点名称，value为node
+nodeContext表示本tunnel上所有连接的相关节点信息，其中nodes key为边缘节点名称，value为node
 
 6、TcpConn
 
@@ -1676,7 +1676,7 @@ handleServerHttp在接受到StreamMsg后，会将msg.Data，也即边端组件�
   * conn：tunnel grpc隧道上的连接(包括tcp以及https代理)
   * connContext：tunnel grpc上所有连接，其中conns key为conn uid，value为conn
   * node：边缘节点相关连接信息
-  * nodeContext：tunnel上所有相关节点信息，其中nodes key为边缘节点名称，value为node
+  * nodeContext：tunnel上所有连接的相关节点信息，其中nodes key为边缘节点名称，value为node
   * TcpConn：tcp代理模块封装的数据结构，代表了grpc隧道上的一个tcp代理连接
   * HttpsMsg：https消息传输中转结构
 * tunnel首先会执行初始化注册各模块，然后分别执行如下模块：

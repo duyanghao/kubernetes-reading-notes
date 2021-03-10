@@ -977,7 +977,7 @@ HeartbeatHandler会从msg.Node中获取边缘节点对应node，然后将该Stre
 
 2、tcpProxy(tcp代理)
 
-tcpProxy模块负责在多集群管理中建立云端与边缘的一条代理隧道：
+tcpProxy模块负责在多集群管理中建立云端与边缘的一条tcp代理隧道：
 
 ```go
 func (tcp *TcpProxy) Start(mode string) {

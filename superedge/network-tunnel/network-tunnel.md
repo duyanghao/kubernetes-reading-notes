@@ -1050,7 +1050,7 @@ func (edge *node) BindNode(uuid string) {
 }
 ```
 
-这里会利用uuid创建context.conn，同时将该conn与node绑定；将TcpConn的type设置为TCP_FRONTEND，同时addr设置为边缘节点服务监听地址以及端口，并异步执行TcpConn Read以及Write函数：
+这里会利用uuid创建context.conn，同时将该conn与node绑定；将TcpConn的type设置为TCP_FRONTEND，同时addr设置为边缘节点服务tcp监听地址以及端口，并异步执行TcpConn Read以及Write函数：
 
 ```go
 func (tcp *TcpConn) Read() {
@@ -1101,7 +1101,7 @@ tcp.Read会从云端组件与云端tunnel建立的tcp连接中不断读取数据
 * Type：TCP_FRONTEND
 * Topic：tcp.uid
 * data：云端组件发送给云端tunnel的数据
-* addr：边缘节点代理服务监听地址以及端口
+* addr：边缘节点tcp代理服务监听地址以及端口
 * node：边缘节点名称
 
 从前面的分析可以知道在调用Send2Node后，stream SendMsg会从node.ch中获取该StreamMsg，并发送给边端tunnel

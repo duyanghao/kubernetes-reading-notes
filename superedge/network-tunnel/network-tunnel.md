@@ -345,8 +345,8 @@ func InitToken(nodeName, tk string) error {
 
 最后会注册stream模块(grpc连接隧道)
 
-* tcp.InitTcp：注册了TcpProxy模块(建立在grpc隧道之上)
-* https.InitHttps：注册了https模块(建立在grpc隧道之上)
+* tcp.InitTcp：注册了Tcp代理模块(建立在grpc隧道上)
+* https.InitHttps：注册了https代理模块(建立在grpc隧道上)
 * LoadModules：加载各模块，会执行上述已注册模块的Start函数
 ```go
 func LoadModules(mode string) {

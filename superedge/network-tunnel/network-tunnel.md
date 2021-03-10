@@ -1465,7 +1465,7 @@ func getHttpConn(msg *proto.StreamMsg) (net.Conn, error) {
 }
 ```
 
-ConnectingHandler会调用Request对该StreamMsg进行处理。Reqeust首先通过getHttpConn发起对StreamMsg.Addr也即边缘节点https服务的https请求，请求内容复用了云端组件对云端tunnel的请求(method，headler，body等)。并返回了建立的tls连接
+ConnectingHandler会调用Request对该StreamMsg进行处理。Reqeust首先通过getHttpConn发起对StreamMsg.Addr也即边缘节点https服务的https请求，请求内容复用了云端组件对云端tunnel的请求(method，header，body等)。并返回了建立的tls连接
 
 之后通过tls连接创建了respReader，并调用http.ReadResponse读取resp.StatusCode以及resp.Header构建出HttpsMsg(HttpsStatus为util.CONNECTED)，序列化后作为StreamMsg的数据部分发送给云端tunnel
 

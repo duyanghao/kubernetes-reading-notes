@@ -104,10 +104,10 @@ TunnelCloud包含如下结构：
     * Service：云端tunnel service名称
 * Tcp：包括了云端tunnel tcp监听地址以及边缘节点某进程的tcp监听地址
 
-TunnelCloud包含如下结构：
+TunnelEdge包含如下结构：
 
-* HttpsClient：包括边缘https进程的证书，key
-* StreamEdge：包括了云端tunnel service的dns以及地址ServerName
+* HttpsClient：包括边缘节点https进程的证书，key
+* StreamEdge：包括了云端tunnel service的dns以及服务访问地址和端口ServerName
 
 在介绍完tunnel的配置后，下面介绍tunnel使用的内部数据结构(github.com/superedge/superedge/pkg/tunnel/context)：
 

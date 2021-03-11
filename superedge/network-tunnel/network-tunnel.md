@@ -633,6 +633,8 @@ stream.Send会并发调用wrappedClientStream.SendMsg以及wrappedClientStream.R
 
 ![](images/tunnel-edge.png)
 
+SendMsg会起goroutine每隔1分钟构建心跳StreamMsg，并通过node.ch传递。同时不断从node.ch中获取StreamMsg，并调用ClientStream.SendMsg发送StreamMsg给云端tunnel
+
 ```go
 func (w *wrappedClientStream) SendMsg(m interface{}) error {
 	if m != nil {
@@ -698,8 +700,6 @@ func (w *wrappedClientStream) SendMsg(m interface{}) error {
 	}
 }
 ```
-
-SendMsg会起goroutine每隔1分钟构建心跳StreamMsg，并通过node.ch传递。同时不断从node.ch中获取StreamMsg，并调用ClientStream.SendMsg发送StreamMsg给云端tunnel
 
 而RecvMsg会一直接受云端tunnel的StreamMsg，如果StreamMsg为心跳消息，则重置restart参数，使得边端tunnel继续发送心跳；若为其它类型消息，则调用该消息对应的处理函数进行操作：
 

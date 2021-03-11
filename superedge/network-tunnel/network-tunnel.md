@@ -626,7 +626,9 @@ func Send(client proto.StreamClient, clictx ctx.Context) {
 ```
 ClientStreamInterceptor会将边缘节点名称以及token构造成oauth2.Token.AccessToken进行认证传递，并构建wrappedClientStream
 stream.Send会并发调用wrappedClientStream.SendMsg以及wrappedClientStream.RecvMsg分别用于边端tunnel发送以及接受，并阻塞等待。
+
 整个过程如下图所示:
+
 ![](images/tunnel-edge.png)
 
 ```go

@@ -760,7 +760,7 @@ func (s *Server) TunnelStreaming(stream proto.Stream_TunnelStreamingServer) erro
 }
 ```
 
-在初始化云端tunnel时，会将`grpc.StreamInterceptor(ServerStreamInterceptor)`构建成grpc ServerOption，并将ServerStreamInterceptor作为StreamServerInterceptor传递给grpc连接：
+在初始化云端tunnel时，会将`grpc.StreamInterceptor(ServerStreamInterceptor)`构建成grpc ServerOption，并将ServerStreamInterceptor作为StreamServerInterceptor传递给grpc.Server：
 
 ```go
 func StartServer() {
@@ -834,7 +834,7 @@ func ParseToken(token string) (*Token, error) {
 }
 ```
 
-ServerStreamInterceptor会从grpc.ServerStream authorization中解析出此grpc连接对应的边缘节点名和token，并对该token进行校验，然后根据节点名构建wrappedServerStream作为与该边缘节点通信的处理对象(每个边缘节点对应一个处理对象)：
+ServerStreamInterceptor会从grpc.ServerStream authorization中解析出此grpc连接对应的边缘节点名和token，并对该token进行校验，然后根据节点名构建wrappedServerStream作为与该边缘节点通信的处理对象(每个边缘节点对应一个处理对象),handler函数会调用stream.TunnelStreaming:
 
 wrappedServerStream实现了SendMsg以及RecvMsg分别用于发送与接受处理：
 
@@ -914,7 +914,7 @@ HeartbeatHandler会从msg.Node中获取边缘节点对应node，然后将该Stre
 * 边缘节点上tunnel-edge主动连接云端tunnel-cloud service，tunnel-cloud service根据负载均衡策略将请求转到tunnel-cloud的具体pod上
 * tunnel-edge与tunnel-cloud建立grpc连接后，tunnel-cloud会把自身的podIp和tunnel-edge所在节点的nodeName的映射写入DNS(tunnel dns)。grpc连接断开之后，tunnel-cloud会删除相关podIp和节点名的映射
 * 边端tunnel会利用边缘节点名以及token构建grpc连接，而云端tunnel会通过认证信息解析grpc连接对应的边缘节点，并对每个边缘节点分别构建一个wrappedServerStream进行处理(同一个云端tunnel可以处理多个边缘节点tunnel的连接)
-* 云端tunnel每隔一分钟向coredns host plugins对应configmap同步一次边缘节点名以及tunnel pod ip的映射(并更新本tunnel连接的边缘节点映射列表)；另外，引入configmap本地挂载文件优化了托管模式下众多集群同时同步coredns时的性能
+* 云端tunnel每隔一分钟向coredns host plugins对应configmap同步一次边缘节点名以及tunnel pod ip的映射(并更新本tunnel连接的边缘节点映射列表)；另外，引入configmap本地挂载文件优化了[托管模式](https://mp.weixin.qq.com/s/9e1V3QNdlnkTTJibHavTGQ)下众多集群同时同步coredns时的性能
 * 边端tunnel每隔一分钟会向云端tunnel发送代表该节点正常的心跳StreamMsg，而云端tunnel在接受到该心跳后会进行回应，并循环往复这个过程(心跳是为了探测grpc stream流是否正常)
 * StreamMsg包括心跳，tcp代理以及https请求等不同类型消息；同时云端tunnel通过context.node区分与不同边缘节点grpc的连接隧道
 
@@ -1291,7 +1291,7 @@ func (serverHandler *ServerHandler) ServeHTTP(writer http.ResponseWriter, reques
 }
 ```
 
-当云端组件向云端tunnel发送https请求时，serverHandler会首先从request.Host字段解析节点名，若不存在则从request.TLS.ServerName解析节点名，这里解释一下这样做的原因：
+当云端组件向云端tunnel发送https请求时，serverHandler会首先从request.Host字段解析节点名，若先建立tls连接，然后在连接中写入http的request对象，此时的request的hosts可以不设置，则需要从request.TLS.ServerName解析节点名，这里解释一下这样做的原因：
 
 由于apiserver或者其它组件本来要访问的对象是边缘节点上的某个服务，通过coredns DNS劫持后，会将host中的节点名解析为tunnel-cloud的podIp，但是host以及request.TLS.ServerName依旧保持不变，因此可以通过解析这两个字段得出要访问的边缘节点名称
 
@@ -1643,7 +1643,7 @@ handleServerHttp在接受到StreamMsg后，会将msg.Data，也即边端组件�
   
 ## 展望
 
-* 目前tunnel整体代码不易读懂，需要改善
-* 支持更多的网络协议
+* 目前tunnel整体代码不易读懂，希望推出tunnel相关文章
+* 支持更多的网络协议(已支持https和tcp)
 * 支持云端访问边缘节点业务pod server
 * 多个边缘节点同时加入集群时，多副本云端tunnel pod对coredns host plguins对应configmap更新冲突解决

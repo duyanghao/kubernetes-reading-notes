@@ -480,7 +480,7 @@ func (dns *CoreDns) checkHosts() error {
 
 ![](images/tunnel-coredns.png)
 
-**另外，这里云端tunnel引入configmap本地挂载文件的目的是：优化托管模式下众多集群同时同步coredns时的性能**
+**另外，这里云端tunnel引入configmap本地挂载文件的目的是：优化[托管模式](https://www.baidu.com)下众多集群同时同步coredns时的性能**
 
 而如果tunnel位于边端，则会调用StartSendClient进行隧道的打通：
 
@@ -556,7 +556,7 @@ func StartClient() (*grpc.ClientConn, ctx.Context, ctx.CancelFunc, error) {
 }
 ```
 
-在调用grpc.Dial时会传递`grpc.WithStreamInterceptor(ClientStreamInterceptor)` DialOption，将ClientStreamInterceptor作为StreamClientInterceptor传递给grpc连接：
+在调用grpc.Dial时会传递`grpc.WithStreamInterceptor(ClientStreamInterceptor)` DialOption，将ClientStreamInterceptor作为StreamClientInterceptor传递给grpc.ClientConn：
 
 ```go
 func ClientStreamInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
@@ -589,9 +589,7 @@ type wrappedClientStream struct {
 }
 ```
 
-ClientStreamInterceptor会将边缘节点名称以及token构造成oauth2.Token.AccessToken进行认证传递，并构建wrappedClientStream
-
-之后等待grpc连接状态变为Ready，然后执行stream.Send：
+等待grpc连接状态变为Ready，然后执行Send函数。streamClient.TunnelStreaming调用StreamClientInterceptor返回wrappedClientStream对象
 
 ```go
 func Send(client proto.StreamClient, clictx ctx.Context) {
@@ -626,8 +624,10 @@ func Send(client proto.StreamClient, clictx ctx.Context) {
 	}
 }
 ```
-
-stream.Send会并发调用wrappedClientStream.SendMsg以及wrappedClientStream.RecvMsg分别用于边端tunnel发送以及接受，并阻塞等待
+ClientStreamInterceptor会将边缘节点名称以及token构造成oauth2.Token.AccessToken进行认证传递，并构建wrappedClientStream
+stream.Send会并发调用wrappedClientStream.SendMsg以及wrappedClientStream.RecvMsg分别用于边端tunnel发送以及接受，并阻塞等待。
+整个过程如下图所示:
+![](images/tunnel-edge.png)
 
 ```go
 func (w *wrappedClientStream) SendMsg(m interface{}) error {

@@ -1076,4 +1076,4 @@ interceptServiceRequest逻辑与interceptEndpointsRequest一致，这里不再�
 
 ## 展望
 
-目前SuperEdge service group实现的拓扑算法功能部分与社区重合，而且随着Kubernetes的发展，application-grid-wrapper的维护成本会越来越大，因此未来的发展方向会是将SuperEdge拓扑算法推到社区，直接采用Kubernetes service topology awareness
+目前SuperEdge service group实现的拓扑算法功能更加灵活方便，如何处理与Kubernetes社区service topology awareness之间的关系值得探索，建议将SuperEdge拓扑算法推到社区

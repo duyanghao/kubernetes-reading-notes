@@ -111,6 +111,7 @@ TunnelCloud包含如下结构：
     * Configmap：云端coredns host plugin使用的挂载configmap，其中存放有云端tunnel ip以及边缘节点名映射列表
     * Hosts：云端tunnel对coredns host plugin使用的configmap的本地挂载文件
     * Service：云端tunnel service名称
+    * Debug： 默认值false, true为本地调试模式,不更新本地节点名到configmap
 * Tcp：包括了云端tunnel tcp监听地址以及边缘节点某进程的tcp监听地址
 
 TunnelEdge包含如下结构：
@@ -136,11 +137,11 @@ message StreamMsg {
 ```
 
 * node：表示边缘节点名称
-* category：消息范畴
+* category：消息所属的模块(stream、https或tls)
 * type：消息类型
-* topic：消息含义标示
+* topic：消息的唯一标示
 * data：消息数据内容
-* addr：相关地址
+* addr：边缘端请求的server的地址
 
 2、conn
 
@@ -165,7 +166,7 @@ type connContext struct {
 }
 ```
 
-connContext表示本tunnel grpc上所有连接，其中conns key为conn uid，value为conn
+connContext表示tcp和https模块代理转发的所有连接，其中conns key为conn uid，value为conn
 
 4、node
 
@@ -182,7 +183,7 @@ node表示边缘节点相关连接信息：
 
 * name：边缘节点名称
 * ch：消息传输的管道
-* conns：该边缘节点产生的所有conn uid列表
+* conns：保存转发到节点所有的https和tcp分配的channel的uuid,当节点断连之后，通过数组内保存的uid，向转发的所有的https和tcp连接发送断开的msg
 
 5、nodeContext
 
@@ -194,6 +195,8 @@ type nodeContext struct {
 ```
 
 nodeContext表示本tunnel上所有连接的相关节点信息，其中nodes key为边缘节点名称，value为node
+
+nodeContext和connContext都是做channel的管理，但是节点的grpc长连接的和转发上层的请求的连接(tcp和https)的生命周期是不相同的，因此需要分开管理
 
 6、TcpConn
 

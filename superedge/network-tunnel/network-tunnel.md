@@ -111,7 +111,7 @@ TunnelCloud包含如下结构：
     * Configmap：云端coredns host plugin使用的挂载configmap，其中存放有云端tunnel ip以及边缘节点名映射列表
     * Hosts：云端tunnel对coredns host plugin使用的configmap的本地挂载文件
     * Service：云端tunnel service名称
-    * Debug： 默认值false, true为本地调试模式,不更新本地节点名到configmap
+    * Debug： 默认值false，true为本地调试模式，不更新本tunnel连接的边缘节点映射到configmap
 * Tcp：包括了云端tunnel tcp监听地址以及边缘节点某进程的tcp监听地址
 
 TunnelEdge包含如下结构：
@@ -183,7 +183,7 @@ node表示边缘节点相关连接信息：
 
 * name：边缘节点名称
 * ch：消息传输的管道
-* conns：保存转发到节点所有的https和tcp分配的channel的uuid,当节点断连之后，通过数组内保存的uid，向转发的所有的https和tcp连接发送断开的msg
+* conns：保存转发到本节点所有的https和tcp分配的连接的uuid。当节点断连之后，通过数组内保存的uuid，向转发的所有的https和tcp连接发送断开的msg，通知对端关闭连接
 
 5、nodeContext
 
@@ -196,7 +196,7 @@ type nodeContext struct {
 
 nodeContext表示本tunnel上所有连接的相关节点信息，其中nodes key为边缘节点名称，value为node
 
-nodeContext和connContext都是做channel的管理，但是节点的grpc长连接的和转发上层的请求的连接(tcp和https)的生命周期是不相同的，因此需要分开管理
+nodeContext和connContext都是做连接的管理，但是节点的grpc长连接的和上层转发请求的连接(tcp和https)的生命周期是不相同的，因此需要分开管理
 
 6、TcpConn
 
@@ -480,7 +480,7 @@ func (dns *CoreDns) checkHosts() error {
 
 ![](images/tunnel-coredns.png)
 
-**另外，这里云端tunnel引入configmap本地挂载文件的目的是：优化[托管模式](https://www.baidu.com)下众多集群同时同步coredns时的性能**
+**另外，这里云端tunnel引入configmap本地挂载文件的目的是：优化[托管模式](https://mp.weixin.qq.com/s/9e1V3QNdlnkTTJibHavTGQ)下众多集群同时同步coredns时的性能**
 
 而如果tunnel位于边端，则会调用StartSendClient进行隧道的打通：
 
@@ -556,7 +556,9 @@ func StartClient() (*grpc.ClientConn, ctx.Context, ctx.CancelFunc, error) {
 }
 ```
 
-在调用grpc.Dial时会传递`grpc.WithStreamInterceptor(ClientStreamInterceptor)` DialOption，将ClientStreamInterceptor作为StreamClientInterceptor传递给grpc.ClientConn：
+在调用grpc.Dial时会传递`grpc.WithStreamInterceptor(ClientStreamInterceptor)` DialOption，将ClientStreamInterceptor作为StreamClientInterceptor传递给grpc.ClientConn
+
+之后等待grpc连接状态变为Ready，然后执行Send函数。streamClient.TunnelStreaming调用StreamClientInterceptor返回wrappedClientStream对象
 
 ```go
 func ClientStreamInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
@@ -587,11 +589,7 @@ type wrappedClientStream struct {
 	grpc.ClientStream
 	restart bool
 }
-```
 
-等待grpc连接状态变为Ready，然后执行Send函数。streamClient.TunnelStreaming调用StreamClientInterceptor返回wrappedClientStream对象
-
-```go
 func Send(client proto.StreamClient, clictx ctx.Context) {
 	stream, err := client.TunnelStreaming(clictx)
 	if err != nil {
@@ -624,8 +622,12 @@ func Send(client proto.StreamClient, clictx ctx.Context) {
 	}
 }
 ```
+
 ClientStreamInterceptor会将边缘节点名称以及token构造成oauth2.Token.AccessToken进行认证传递，并构建wrappedClientStream
-stream.Send会并发调用wrappedClientStream.SendMsg以及wrappedClientStream.RecvMsg分别用于边端tunnel发送以及接受，并阻塞等待。
+
+stream.Send会并发调用wrappedClientStream.SendMsg以及wrappedClientStream.RecvMsg分别用于边端tunnel发送以及接受，并阻塞等待
+
+**注意：tunnel edge向tunnel cloud注册节点信息是在建立grpc stream时，而不是创建grpc.connClient的时候**
 
 整个过程如下图所示:
 
@@ -732,35 +734,7 @@ func (w *wrappedClientStream) RecvMsg(m interface{}) error {
 }
 ```
 
-相应的，云端TunnelStreaming会并发调用wrappedServerStream.SendMsg以及wrappedServerStream.RecvMsg分别用于云端tunnel的发送以及接受，并阻塞等待，如下：
-
-```go
-func (s *Server) TunnelStreaming(stream proto.Stream_TunnelStreamingServer) error {
-	errChan := make(chan error, 2)
-
-	go func(sendStream proto.Stream_TunnelStreamingServer, sendChan chan error) {
-		sendErr := sendStream.SendMsg(nil)
-		if sendErr != nil {
-			klog.Errorf("streamServer failed to send message err = %v", sendErr)
-		}
-		sendChan <- sendErr
-	}(stream, errChan)
-
-	go func(recvStream proto.Stream_TunnelStreamingServer, recvChan chan error) {
-		recvErr := stream.RecvMsg(nil)
-		if recvErr != nil {
-			klog.Errorf("streamServer failed to receive message err = %v", recvErr)
-		}
-		recvChan <- recvErr
-	}(stream, errChan)
-
-	e := <-errChan
-	klog.Errorf("the stream of streamServer is disconnected err = %v", e)
-	return e
-}
-```
-
-在初始化云端tunnel时，会将`grpc.StreamInterceptor(ServerStreamInterceptor)`构建成grpc ServerOption，并将ServerStreamInterceptor作为StreamServerInterceptor传递给grpc.Server：
+相应的，在初始化云端tunnel时，会将`grpc.StreamInterceptor(ServerStreamInterceptor)`构建成grpc ServerOption，并将ServerStreamInterceptor作为StreamServerInterceptor传递给grpc.Server：
 
 ```go
 func StartServer() {
@@ -784,7 +758,11 @@ func StartServer() {
 		return
 	}
 }
+```
 
+云端grpc服务在接受到边端tunnel请求(建立stream流)时，会调用ServerStreamInterceptor，而ServerStreamInterceptor会从[grpc metadata](https://github.com/grpc/grpc-go/blob/master/Documentation/grpc-metadata.md)中解析出此grpc连接对应的边缘节点名和token，并对该token进行校验，然后根据节点名构建wrappedServerStream作为与该边缘节点通信的处理对象(每个边缘节点对应一个处理对象)，handler函数会调用stream.TunnelStreaming，并将wrappedServerStream传递给它(wrappedServerStream实现了proto.Stream_TunnelStreamingServer接口)
+
+```go
 func ServerStreamInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	klog.Info("start verifying the token !")
 	md, ok := metadata.FromIncomingContext(ss.Context())
@@ -834,9 +812,39 @@ func ParseToken(token string) (*Token, error) {
 }
 ```
 
-ServerStreamInterceptor会从grpc.ServerStream authorization中解析出此grpc连接对应的边缘节点名和token，并对该token进行校验，然后根据节点名构建wrappedServerStream作为与该边缘节点通信的处理对象(每个边缘节点对应一个处理对象),handler函数会调用stream.TunnelStreaming:
+而当TunnelStreaming方法退出时，就会执ServerStreamInterceptor移除节点的逻辑`ctx.GetContext().RemoveNode`
 
-wrappedServerStream实现了SendMsg以及RecvMsg分别用于发送与接受处理：
+TunnelStreaming会并发调用wrappedServerStream.SendMsg以及wrappedServerStream.RecvMsg分别用于云端tunnel发送以及接受，并阻塞等待：
+
+```go
+type Server struct{}
+
+func (s *Server) TunnelStreaming(stream proto.Stream_TunnelStreamingServer) error {
+	errChan := make(chan error, 2)
+
+	go func(sendStream proto.Stream_TunnelStreamingServer, sendChan chan error) {
+		sendErr := sendStream.SendMsg(nil)
+		if sendErr != nil {
+			klog.Errorf("streamServer failed to send message err = %v", sendErr)
+		}
+		sendChan <- sendErr
+	}(stream, errChan)
+
+	go func(recvStream proto.Stream_TunnelStreamingServer, recvChan chan error) {
+		recvErr := stream.RecvMsg(nil)
+		if recvErr != nil {
+			klog.Errorf("streamServer failed to receive message err = %v", recvErr)
+		}
+		recvChan <- recvErr
+	}(stream, errChan)
+
+	e := <-errChan
+	klog.Errorf("the stream of streamServer is disconnected err = %v", e)
+	return e
+}
+```
+
+SendMsg会从wrappedServerStream对应边缘节点node中接受StreamMsg，并调用ServerStream.SendMsg发送该消息给边缘tunnel
 
 ```go
 func (w *wrappedServerStream) SendMsg(m interface{}) error {
@@ -862,8 +870,6 @@ func (w *wrappedServerStream) SendMsg(m interface{}) error {
 	}
 }
 ```
-
-SendMsg会从wrappedServerStream对应边缘节点node中接受StreamMsg，并调用ServerStream.SendMsg发送该消息给边缘tunnel
 
 而RecvMsg会不断接受来自边缘tunnel的StreamMsg，并调用该消息对应的处理函数进行操作，例如心跳消息对应HeartbeatHandler：
 
@@ -1291,7 +1297,7 @@ func (serverHandler *ServerHandler) ServeHTTP(writer http.ResponseWriter, reques
 }
 ```
 
-当云端组件向云端tunnel发送https请求时，serverHandler会首先从request.Host字段解析节点名，若先建立tls连接，然后在连接中写入http的request对象，此时的request的hosts可以不设置，则需要从request.TLS.ServerName解析节点名，这里解释一下这样做的原因：
+当云端组件向云端tunnel发送https请求时，serverHandler会首先从request.Host字段解析节点名，若先建立TLS连接，然后在连接中写入http的request对象，此时的request.Host可以不设置，则需要从request.TLS.ServerName解析节点名，这里解释一下这样做的原因：
 
 由于apiserver或者其它组件本来要访问的对象是边缘节点上的某个服务，通过coredns DNS劫持后，会将host中的节点名解析为tunnel-cloud的podIp，但是host以及request.TLS.ServerName依旧保持不变，因此可以通过解析这两个字段得出要访问的边缘节点名称
 
@@ -1643,7 +1649,6 @@ handleServerHttp在接受到StreamMsg后，会将msg.Data，也即边端组件�
   
 ## 展望
 
-* 目前tunnel整体代码不易读懂，希望推出tunnel相关文章
 * 支持更多的网络协议(已支持https和tcp)
 * 支持云端访问边缘节点业务pod server
 * 多个边缘节点同时加入集群时，多副本云端tunnel pod对coredns host plguins对应configmap更新冲突解决

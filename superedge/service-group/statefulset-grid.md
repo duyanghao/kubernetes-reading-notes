@@ -3,9 +3,7 @@ SuperEdge StatefulSetGrid源码分析
 
 ## 前言
 
-SuperEdge StatefulSetGrid由本人在官方提出方案[SEP: ServiceGroup StatefulSetGrid Design Specification](https://github.com/superedge/superedge/issues/26)，最终与[chenkaiyue](https://github.com/chenkaiyue)合作开发完成
-
-初衷是为了补充service group对有状态服务的支持，设计架构图如下：
+SuperEdge StatefulSetGrid设计方案见[SEP: ServiceGroup StatefulSetGrid Design Specification](https://github.com/superedge/superedge/issues/26)。初衷是为了补充service group对有状态服务的支持，设计架构图如下：
 
 ![](images/statefulset-grid-design.png)
 

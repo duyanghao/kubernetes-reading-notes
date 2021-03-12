@@ -844,7 +844,7 @@ func (s *Server) TunnelStreaming(stream proto.Stream_TunnelStreamingServer) erro
 }
 ```
 
-SendMsg会从wrappedServerStream对应边缘节点node中接受StreamMsg，并调用ServerStream.SendMsg发送该消息给边缘tunnel
+SendMsg会从上层模块(https和tcp)接收发送到对应边缘节点node的StreamMsg，并调用ServerStream.SendMsg发送该消息给边缘tunnel
 
 ```go
 func (w *wrappedServerStream) SendMsg(m interface{}) error {

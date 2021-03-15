@@ -6,9 +6,8 @@ Based on go1.13.5, and **Stay tuned as this evolves!**
 ## Contents
 
 * [http transport](http/README.md)
-* [golang module](golang-module.md)
-* [golang testing](testing)
-* [golang runtime](golang-runtime.md)
-* [golang gc](golang-gc.md)
-* [golang 同步互斥](golang-sync.md)
-* [golang debug](golang-debug.md)
+* [Go module](golang-module.md)
+* [Go testing](testing)
+* [Go runtime](runtime/README.md)
+* [Go 同步互斥](golang-sync.md)
+* [Go debug](golang-debug.md)

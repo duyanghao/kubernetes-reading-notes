@@ -603,7 +603,7 @@ CheckOrUpdateHosts参数含义如下：
 根据如上参数会进行增删改逻辑如下：
 
 * 如果hostsMap中不存在PodDomainInfoToHosts map中某个pod FQDN，则添加该FQDN记录到hostsMap中
-* 如果PodDomainInfoToHosts map中存在某个hostsMap中不存在的pod FQDN，则从hostsMap中删除该FQDN记录(可以解释上述利用空map做记录删除的逻辑)
+* 如果hostsMap中存在某个PodDomainInfoToHosts map中不存在的pod FQDN，则从hostsMap中删除该FQDN记录(可以解释上述利用空map做记录删除的逻辑)
 * 如果两者同时存在，但是ip不一致，则更新hostsMap为PodDomainInfoToHosts map的对应ip
 
 2、syncDnsHostsAsWhole

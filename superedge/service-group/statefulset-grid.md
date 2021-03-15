@@ -3,9 +3,7 @@ SuperEdge StatefulSetGrid源码分析
 
 ## 前言
 
-SuperEdge StatefulSetGrid由本人在官方提出方案[SEP: ServiceGroup StatefulSetGrid Design Specification](https://github.com/superedge/superedge/issues/26)，最终与[chenkaiyue](https://github.com/chenkaiyue)合作开发完成
-
-初衷是为了补充service group对有状态服务的支持，设计架构图如下：
+SuperEdge StatefulSetGrid设计方案见[SEP: ServiceGroup StatefulSetGrid Design Specification](https://github.com/superedge/superedge/issues/26)。初衷是为了补充service group对有状态服务的支持，设计架构图如下：
 
 ![](images/statefulset-grid-design.png)
 
@@ -800,7 +798,7 @@ func (h *Hosts) parseHostsToFile() string {
 
 ## 总结
 
-* StatefulSetGrid由本人在官方提出方案[SEP: ServiceGroup StatefulSetGrid Design Specification](https://github.com/superedge/superedge/issues/26)，最终与[chenkaiyue](https://github.com/chenkaiyue)合作开发完成。初衷是为了补充service group对有状态服务的支持
+* SuperEdge StatefulSetGrid设计方案见[SEP: ServiceGroup StatefulSetGrid Design Specification](https://github.com/superedge/superedge/issues/26)。初衷是为了补充service group对有状态服务的支持
 * StatefulSetGrid目前支持两种访问方式：
   * 通过统一的service name进行访问，会路由到本组内的服务(要求service.Spec.clusterIP不能设置成None，也即非headless service)
   * 通过statefulset pod FDQN进行访问。采用屏蔽NodeUnit的统一FQDN访问形式：`{StatefulSetGrid}-{0..N-1}.{StatefulSetGrid}-svc.ns.svc.cluster.local`，实际转化为各个NodeUnit内的statefulset pod：`{StatefulSetGrid}-{NodeUnit}-{0..N-1}.{StatefulSetGrid}-svc.ns.svc.cluster.local`

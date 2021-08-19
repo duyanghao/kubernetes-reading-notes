@@ -9,4 +9,5 @@ Other useful modules relevant to Kubernetes
 * [harbor](harbor/README.md)
 * [demo kernel](kernel/DemoOs.md)
 * [gin](gin/gin-apiserver.md)
+* [webshell](webshell/webshell.md)
 

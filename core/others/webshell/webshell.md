@@ -80,7 +80,6 @@ func ExecPod(ws *websocket.Conn, clusterName, namespace, podName, container, cmd
 			}
 			err = json.Unmarshal(buf[:l], &arg)
 			if err == nil {
-				fmt.Print(arg)
 				size := remotecommand.TerminalSize{Width: uint16(arg.Cols), Height: uint16(arg.Rows)}
 				que.Size <- size
 				continue

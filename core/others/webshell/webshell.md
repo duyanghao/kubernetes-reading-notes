@@ -11,12 +11,12 @@ Kubernetes WebShell
 
 ```go
 func main() {
-...	
-go func() {
-    http.HandleFunc("/websocket", websocket.ServeWebSocket)
-    http.ListenAndServe(":8080", nil)
-}()
-...
+	...
+	go func() {
+		http.HandleFunc("/websocket", websocket.ServeWebSocket)
+		http.ListenAndServe(":8082", nil)
+	}()
+	...
 }
 ```
 

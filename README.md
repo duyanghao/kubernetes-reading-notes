@@ -17,6 +17,7 @@ Kubernetes reading notes based on v1.17.4
 * [kubelet](core/kubelet/README.md)
 * [container-runtime](core/container-runtime/README.md)
 * [边缘计算框架SuperEdge](superedge/README.md)
+* [联易融边缘计算平台BeeEdge](beeedge/README.md)  
 * [others(golang, harbor, kernel and etc)](core/others/README.md)
 
 ## Shares

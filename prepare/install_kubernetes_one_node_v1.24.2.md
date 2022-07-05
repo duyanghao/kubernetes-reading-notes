@@ -1,7 +1,7 @@
 Kubernetes v1.24.2 环境准备
 ==========================
 
-本文基于最新的[Kubernetes 1.24.2](https://github.com/kubernetes/kubernetes/tree/v1.24.2)环境进行源码分析以及实践，如下是基于CentOS7系统部署该版本单节点环境所需要的详细步骤(参考[Bootstrapping clusters with kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/))，其它系统请参考修改：
+如下是基于CentOS7系统部署Kubernetes v1.24.2 版本单节点环境所需要的详细步骤(参考[Bootstrapping clusters with kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/))，其它系统请参考修改：
 
 Step1：配置系统参数
 

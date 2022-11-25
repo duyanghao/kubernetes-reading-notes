@@ -22,6 +22,10 @@ Kubernetes reading notes based on v1.17.4
 
 ## Shares
 
+* 技术成长分享
+
+  PPT见[这里](shares/技术成长之路-杜杨浩.pptx)
+
 * [大咖说-边缘计算杂谈](https://mp.weixin.qq.com/s?__biz=MzI3MDQyMzkzMQ==&mid=2247496680&idx=3&sn=71ce72ed2ef189bf6f265304db88ec61&chksm=ead3f1fcdda478ea200e4f1279a45eefb9c7ea7a4c2c1fd548654b9b00b2c22cb9c54b9c5bd1&cur_album_id=2283017709137412099&scene=189#wechat_redirect) 
 
 * [全球边缘计算大会(深圳站) - 联易融边缘计算在供应链金融领域的应用](https://m.inmuu.com/v1/live/albums/3670)

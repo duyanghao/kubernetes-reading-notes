@@ -19,12 +19,13 @@ Kubernetes reading notes based on v1.17.4
 * [边缘计算框架SuperEdge](superedge/README.md)
 * [边缘计算](edge-computing/README.md)  
 * [others(golang, harbor, kernel and etc)](core/others/README.md)
+* [技术成长过程中的一些思考](technology-development-think.md)
 
 ## Shares
 
 * 技术成长分享
 
-  PPT见[这里](shares/技术成长之路-杜杨浩.pptx)
+  PPT见[这里](shares/技术成长之路(外部版)-杜杨浩.pptx)
 
 * [大咖说-边缘计算杂谈](https://mp.weixin.qq.com/s?__biz=MzI3MDQyMzkzMQ==&mid=2247496680&idx=3&sn=71ce72ed2ef189bf6f265304db88ec61&chksm=ead3f1fcdda478ea200e4f1279a45eefb9c7ea7a4c2c1fd548654b9b00b2c22cb9c54b9c5bd1&cur_album_id=2283017709137412099&scene=189#wechat_redirect) 
 

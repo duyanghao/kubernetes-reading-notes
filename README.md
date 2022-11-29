@@ -7,6 +7,7 @@ Kubernetes reading notes based on v1.17.4
 
 ## Contents
 
+* [技术成长过程中的一些思考](technology-development-think.md)
 * [environment](prepare/install_kubernetes_one_node.md)
 * [debug](debug/remote_debug.md)
 * [scheduler](core/scheduler/README.md)
@@ -19,7 +20,6 @@ Kubernetes reading notes based on v1.17.4
 * [边缘计算框架SuperEdge](superedge/README.md)
 * [边缘计算](edge-computing/README.md)  
 * [others(golang, harbor, kernel and etc)](core/others/README.md)
-* [技术成长过程中的一些思考](technology-development-think.md)
 
 ## Shares
 

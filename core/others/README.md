@@ -5,6 +5,7 @@ Other useful modules relevant to Kubernetes
 
 ## Contents
 
+* [开源](open-source.md)
 * [golang](golang/README.md)
 * [harbor](harbor/README.md)
 * [demo kernel](kernel/DemoOs.md)

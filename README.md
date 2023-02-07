@@ -23,7 +23,7 @@ Kubernetes reading notes based on v1.17.4
 
 ## Shares
 
-* [开源总结](core/others/open-source.md)
+* [开源商业模式研究](core/others/open-source.md)
 
 * 技术成长分享
 

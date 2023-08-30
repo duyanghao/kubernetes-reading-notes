@@ -1,7 +1,7 @@
 Install_kubernetes_one_node
 ===========================
 
-Here is the process for Creating a single control-plane cluster with kubeadm:
+Here is the process for creating a single control-plane cluster with kubeadm:
 
 ## Install
 

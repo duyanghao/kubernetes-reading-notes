@@ -7,6 +7,7 @@ Kubernetes reading notes based on v1.17.4
 
 ## Contents
 
+* [大模型工程](llm/README.md)
 * [技术成长过程中的一些思考](technology-development-think.md)
 * [environment](prepare/install_kubernetes_one_node.md)
 * [debug](debug/remote_debug.md)

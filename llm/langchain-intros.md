@@ -56,12 +56,14 @@ LangChain串联了大模型与向量数据库，通过向量数据库集成领�
 
 应用开发技术架构分层如下：
 
+![](images/langchain-develop-arch.png)
+
 * 大语言模型管理：包括对大语言模型的选型，微调，训练等
 * LangChain框架开发维护：包括对LangChain各类组件进行定制化开发维护，如接入各类私有大语言模型以及新增Chain组件等
 * 向量数据库全生命周期管理：包括对向量数据库的开发、部署、迁移、性能优化以及界面化操作等全生命周期管理
 * 大模型应用：包括将LangChain集成到应用中，根据需求构建大模型应用
 
-三、LangChain vs LangChain-ChatGLM
+## LangChain vs LangChain-ChatGLM
 
 | \ | LangChain | LangChain-ChatGLM |
 | :-----: | :----: | :----: |

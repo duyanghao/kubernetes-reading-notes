@@ -21,8 +21,6 @@ eg：根据注释生成正则表达式
 
 利用上下文和注释（函数名）快速生成测试用例
 
-eg：根据函数生成测试用例
-
 4. 代码转换
 
 eg：重构时可以将java代码转换为golang代码
@@ -31,21 +29,17 @@ eg：重构时可以将java代码转换为golang代码
 
 1. 增加清理调试日志
 
-当需要自动增加日志时，可以使用Copilot labs的增加日志功能
-
-当需要删除日志时，可以使用Copilot labs的清理功能
+当需要自动增加/清理日志时，可以使用Copilot labs的增加/清理日志功能
 
 2. 修复bug及增强健壮性
 
-Copilot labs可以检测出代码的bug，从而修复（这里是数值溢出问题）
+Copilot labs可以检测出代码的bug，从而修复
 
-Copilot labs可以提高代码的健壮性（增加错误输出）
-
-Copilot labs也可以增加代码复用性（抽象函数）
+Copilot labs可以提高代码的健壮性及复用性
 
 3. 解释注释函数
 
-Copilot labs可以解释整个函数（并发执行函数）
+Copilot labs可以解释整个函数
 
 Copilot labs可以为关键逻辑代码添加注释
 

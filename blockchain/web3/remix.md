@@ -33,7 +33,7 @@ Remix是以太坊官方推荐的智能合约开发IDE，支持在浏览器中部
 
 * Account: 钱包地址（the list of accounts associated with the current environment (and their associated balances). On the Remix VM, you have a choice of 5 accounts. If using Injected Web3 with MetaMask, you need to change the account in MetaMask.）
 * Gas Limit：合约Gas Limit（This sets the maximum amount of gas that will be allowed for all the transactions created in Remix.）
-* Value：给合约发送的以太币（This sets the amount of ETH, WEI, GWEI etc that is sent to a contract or a payable function.）
+* Value：给合约或者payable函数发送的以太币数量，单位可以是ETH、WEI、GWEI等（This sets the amount of ETH, WEI, GWEI etc that is sent to a contract or a payable function.）
 
 在CONTRACT栏中选择要部署的合约Storage。1_Storage.sol文件中只有一个合约，因此默认就是部署它；但当文件包含多个合约时，我们需要手动选择要部署的合约，点击DEPLOY键，部署完毕。
 
@@ -60,3 +60,4 @@ store函数文本框中输入100，并点击函数名调用。调用成功后，
 ## Refs
 
 * [Solidity极简入门-工具篇1：Remix](https://mirror.xyz/wtfacademy.eth/dSYXG9zF_Vclw58Bgcvsv6HSA0SU6pmBoYLFwLAgVbU)
+* [Remix Deploy & Run](https://remix-ide.readthedocs.io/en/latest/run.html#environment)

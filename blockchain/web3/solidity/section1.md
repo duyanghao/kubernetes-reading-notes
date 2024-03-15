@@ -295,7 +295,47 @@ Calls are limited to a depth of 1024, which means that for more complex operatio
 
 调用合约内部的函数也被称为消息调用吗？
 
+7、委托调用和库
 
+There exists a special variant of a message call, named delegatecall which is identical to a message call apart from the fact that the code at the target address is executed in the context (i.e. at the address) of the calling contract and msg.sender and msg.value do not change their values.
+
+This means that a contract can dynamically load code from a different address at runtime. Storage, current address and balance still refer to the calling contract, only the code is taken from the called address.
+
+This makes it possible to implement the “library” feature in Solidity: Reusable library code that can be applied to a contract’s storage, e.g. in order to implement a complex data structure.
+
+存在一种特殊的消息调用，被称为 委托调用（delegatecall）， 除了目标地址的代码是在调用合约的上下文（即地址）中执行， msg.sender 和 msg.value 的值不会更改之外，其他与消息调用相同
+
+这意味着合约可以在运行时动态地从不同的地址加载代码。 存储，当前地址和余额仍然指的是调用合约，只是代码取自被调用的地址。
+
+这使得在Solidity中实现 “库” 的功能成为可能： 可重复使用的库代码，可以放在一个合约的存储上，例如，用来实现复杂的数据结构的库。
+
+8、日志
+
+It is possible to store data in a specially indexed data structure that maps all the way up to the block level. This feature called logs is used by Solidity in order to implement events. Contracts cannot access log data after it has been created, but they can be efficiently accessed from outside the blockchain. Since some part of the log data is stored in bloom filters, it is possible to search for this data in an efficient and cryptographically secure way, so network peers that do not download the whole blockchain (so-called “light clients”) can still find these logs.
+
+有一种特殊的可索引的数据结构，其存储的数据可以一路映射直到区块层级。 这个特性被称为 日志（logs） ，Solidity用它来实现 事件。
+
+9、创建
+
+合约甚至可以通过一个特殊的指令来创建其他合约（不是简单的调用零地址）。 创建合约的调用 create calls 和普通消息调用的唯一区别在于，负载会被执行，执行的结果被存储为合约代码，调用者/创建者在栈上得到新合约的地址。
+
+Note：创建合约两种方式：消息调用零地址及crate calls
+
+10、停用和自毁
+
+从区块链上删除代码的唯一方法是当该地址的合约执行 selfdestruct 操作。 存储在该地址的剩余以太币被发送到一个指定的目标，然后存储和代码被从状态中删除。 删除合约在理论上听起来是个好主意，但它有潜在的危险性， 因为如果有人向被删除的合约发送以太币，以太币就会永远丢失。
+
+Note：即使一个合约通过 selfdestruct 删除，它仍然是区块链历史的一部分， 可能被大多数以太坊节点保留。 因此，使用 selfdestruct 与从硬盘上删除数据不一样。
+
+尽管一个合约的代码中没有显式地调用 selfdestruct ， 它仍然有可能通过 delegatecall 或 callcode 执行自毁操作。
+
+如果您想停用您的合约，您可以通过改变一些内部状态来 停用 它们， 从而使再次调用所有的功能都会被恢复。这样就无法使用合约了，因为它立即返回以太。
+
+11、预编译合约
+
+有一小群合约地址是特殊的。 1 和（包括） 8 之间的地址范围包含 “预编译合约“， 可以像其他合约一样被调用，但它们的行为（和它们的gas消耗） 不是由存储在该地址的EVM代码定义的（它们不包含代码）， 而是由EVM执行环境本身实现。
+
+不同的EVM兼容链可能使用不同的预编译合约集。 未来也有可能在以太坊主链上添加新的预编译合约， 但您可以合理地预期它们总是在 1 和 0xffff （包括）之间。
 
 ## Refs
 

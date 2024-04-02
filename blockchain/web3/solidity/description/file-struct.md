@@ -120,16 +120,7 @@ contract KumquatTree is Tree, Plant {
 
 所有标签都是可选的。下表解释了每个 NatSpec 标签的目的和它可能被使用的地方。 有一种特殊情况，如果没有使用标签，那么 Solidity 编译器将以同样的方式进行 /// 或 /** 注释， 如同它被标记为 @notice。
 
-=============== ====================================================================================== =============================
-``@title``      一个应该描述合约/接口的标题                                                                contract, library, interface
-``@author``     作者的名字                                                                              contract, library, interface
-``@notice``     向终端用户解释这个东西的作用                                                               contract, library, interface, function, public state variable, event
-``@dev``        向开发人员解释任何额外的细节                                                               contract, library, interface, function, state variable, event
-``@param``      就像在Doxygen中一样记录一个参数（必须在参数名之后）                                           function, event
-``@return``     记录一个合约的函数的返回变量                                                                function, public state variable
-``@inheritdoc`` 从基本函数中复制所有缺失的标签（必须在合约名称之后）                                            function, public state variable
-``@custom:...`` 自定义标签，语义由应用程序定义                                                              everywhere
-=============== ====================================================================================== =============================
+![](../../images/notspec-label.png)
 
 如果您的函数返回多个值，如 (int quotient, int remainder) 那么使用多个 @return 语句，格式与 @param 语句相同。
 

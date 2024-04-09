@@ -143,7 +143,111 @@ Note：It is best to avoid relying on hardcoded gas values in your smart contrac
 
 * code 和 codehash
 
+您可以查询任何智能合约的部署代码。使用 .code 获得作为 bytes memory 的EVM字节码， 这可能是空的。使用 .codehash 获得该代码的Keccak-256哈希值（作为 bytes32）。 注意，使用 addr.codehash 比 keccak256(addr.code) 更便宜。
 
+Note:所有的合约都可以转换为 address 类型，所以可以用 address(this).balance 查询当前合约的余额。
 
 2.6、合约类型
+
+每个 合约 都定义了自己的类型。 您可以隐式地将一个合约转换为它们所继承的另一个合约。 合约可以显式地转换为 address 类型，也可以从 address 类型中转换。
+
+只有在合约类型具有 receive 或 payable 类型的 fallback 函数的情况下， 才有可能明确转换为 address payable 类型和从该类型转换。 这种转换仍然使用 address(x) 进行转换。如果合约类型没有一个 receive 或 payable 类型的 fallback 函数， 可以使用 payable(address(x)) 来转换为 address payable 。 您可以在 地址类型 一节中找到更多信息。
+
+如果您声明了一个本地类型的变量（ MyContract c ），您可以调用该合约上的函数。 注意要从相同合约类型的地方将其赋值。
+
+您也可以实例化合约（这意味着它们是新创建的）。 您可以在 '通过关键字new创建合约' 部分找到更多细节。
+
+合约不支持任何运算符。
+
+合约类型的成员是合约的外部函数，包括任何标记为 public 的状态变量。
+
+对于一个合约 C，您可以使用 type(C) 来访问 关于该合约的 类型信息 。
+
+。。。
+
+2.7 枚举类型
+
+枚举是在 Solidity 中创建用户定义类型的一种方式。 它们可以显式地转换为所有整数类型，和从整数类型来转换，但不允许隐式转换。 从整数的显式转换在运行时检查该值是否在枚举的范围内，否则会导致 异常。 枚举要求至少有一个成员，其声明时的默认值是第一个成员。 枚举不能有超过256个成员。
+
+数据表示与 C 语言中的枚举相同。选项由后续的从 0 开始无符号整数值表示。
+
+使用 type(NameOfEnum).min 和 type(NameOfEnum).max 您可以得到给定枚举的最小值和最大值。
+
+```solidity
+pragma solidity ^0.8.8;
+
+contract test {
+    enum ActionChoices { GoLeft, GoRight, GoStraight, SitStill }
+    ActionChoices choice;
+    ActionChoices constant defaultChoice = ActionChoices.GoStraight;
+
+    function setGoStraight() public {
+        choice = ActionChoices.GoStraight;
+    }
+
+    // 由于枚举类型不属于ABI的一部分，因此对于所有来自 Solidity 外部的调用，
+    // "getChoice" 的签名会自动被改成 "getChoice() returns (uint8)"。
+    function getChoice() public view returns (ActionChoices) {
+        return choice;
+    }
+
+    function getDefaultChoice() public pure returns (uint) {
+        return uint(defaultChoice);
+    }
+
+    function getLargestValue() public pure returns (ActionChoices) {
+        return type(ActionChoices).max;
+    }
+
+    function getSmallestValue() public pure returns (ActionChoices) {
+        return type(ActionChoices).min;
+    }
+}
+```
+
+2.8 用户定义的值类型
+
+一个用户定义的值类型允许在一个基本的值类型上创建一个零成本的抽象。 这类似于一个别名，但有更严格的类型要求。
+
+一个用户定义的值类型是用 type C is V 定义的，其中 C 是新引入的类型的名称， V 必须是一个内置的值类型（“底层类型”）。 函数 C.wrap 被用来从底层类型转换到自定义类型。同样地， 函数 C.unwrap 被用来从自定义类型转换到底层类型。
+
+类型 C 没有任何运算符或附加成员函数。特别是，甚至运算符 == 也没有定义。 不允许对其他类型进行显式和隐式转换。
+
+下面的例子说明了一个自定义类型 UFixed256x18， 代表一个有18位小数的十进制定点类型和一个最小的库来对该类型做算术运算。
+
+```solidity
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.8;
+
+// 使用用户定义的值类型表示一个18位小数，256位宽的定点类型。
+type UFixed256x18 is uint256;
+
+/// 一个在UFixed256x18上进行定点操作的最小库。
+library FixedMath {
+    uint constant multiplier = 10**18;
+
+    /// 将两个UFixed256x18的数字相加。溢出时将返回，依靠uint256的算术检查。
+    function add(UFixed256x18 a, UFixed256x18 b) internal pure returns (UFixed256x18) {
+        return UFixed256x18.wrap(UFixed256x18.unwrap(a) + UFixed256x18.unwrap(b));
+    }
+    /// 将UFixed256x18和uint256相乘。溢出时将返回，依靠uint256的算术检查。
+    function mul(UFixed256x18 a, uint256 b) internal pure returns (UFixed256x18) {
+        return UFixed256x18.wrap(UFixed256x18.unwrap(a) * b);
+    }
+    /// 对一个UFixed256x18类型的数字相下取整。
+    /// @return 不超过 `a` 的最大整数。
+    function floor(UFixed256x18 a) internal pure returns (uint256) {
+        return UFixed256x18.unwrap(a) / multiplier;
+    }
+    /// 将一个uint256转化为相同值的UFixed256x18。
+    /// 如果整数太大，则恢复计算。
+    function toUFixed256x18(uint256 a) internal pure returns (UFixed256x18) {
+        return UFixed256x18.wrap(a * multiplier);
+    }
+}
+```
+
+2.9 函数类型
+
+
 

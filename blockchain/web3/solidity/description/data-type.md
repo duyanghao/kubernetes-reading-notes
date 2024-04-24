@@ -249,5 +249,188 @@ library FixedMath {
 
 2.9 函数类型
 
+函数类型是一种表示函数的类型。可以将一个函数赋值给另一个函数类型的变量， 也可以将一个函数作为参数进行传递，还能在函数调用中返回函数类型变量。 函数类型有两类：- 内部（internal） 函数和 外部（external） 函数：
 
+内部函数只能在当前合约内被调用（更具体来说， 在当前代码块内，包括内部库函数和继承的函数中）， 因为它们不能在当前合约上下文的外部被执行。 调用一个内部函数是通过跳转到它的入口标签来实现的， 就像在当前合约的内部调用一个函数。
+
+外部函数由一个地址和一个函数签名组成，可以通过外部函数调用传递或者返回。
+
+函数类型表示成如下的形式：
+
+```solidity
+function (<parameter types>) {internal|external} [pure|view|payable] [returns (<return types>)]
+```
+
+与参数类型相反，返回类型不能为空 —— 如果函数类型不需要返回， 则需要删除整个 returns (<return types>) 部分。
+
+默认情况下，函数类型是内部函数，所以可以省略 internal 关键字。 注意，这只适用于函数类型。对于合约中定义的函数， 必须明确指定其可见性，它们没有默认类型。
+
+转换：
+
+当且仅当它们的参数类型相同，它们的返回类型相同，它们的内部/外部属性相同， 并且 A 的状态可变性比 B 的状态可变性更具限制性时， 一个函数类型 A 就可以隐式转换为一个函数类型 B。特别是：
+
+pure 函数可以转换为 view 和 非 payable 函数
+
+view 函数可以转换为 非 payable 函数
+
+payable 函数可以转换为 非 payable 函数
+
+其他函数类型之间的转换是不可能的。
+
+关于 payable 和 非 payable 的规则可能有点混乱， 但实质上，如果一个函数是 payable，这意味着 它也接受零以太的支付，所以它也是 非 payable。 另一方面，一个 非 payable 的函数将拒收发送给它的以太， 所以 非 payable 的函数不能被转换为 payable 的函数。 声明一下，拒收以太比不拒收以太更有限制性。 这意味着您可以用一个不可支付的函数覆写一个可支付的函数，但不能反过来。
+
+。。。
+
+
+以下例子展示如何使用这些成员：
+
+```solidity
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity >=0.6.4 <0.9.0;
+
+contract Example {
+    function f() public payable returns (bytes4) {
+        assert(this.f.address == address(this));
+        return this.f.selector;
+    }
+
+    function g() public {
+        this.f{gas: 10, value: 800}();
+    }
+}
+```
+
+以下例子展示如何使用内部函数类型：
+
+```solidity
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity >=0.4.16 <0.9.0;
+
+library ArrayUtils {
+    // 内部函数可以在内部库函数中使用，因为它们将是同一代码上下文的一部分
+    function map(uint[] memory self, function (uint) pure returns (uint) f)
+        internal
+        pure
+        returns (uint[] memory r)
+    {
+        r = new uint[](self.length);
+        for (uint i = 0; i < self.length; i++) {
+            r[i] = f(self[i]);
+        }
+    }
+
+    function reduce(
+        uint[] memory self,
+        function (uint, uint) pure returns (uint) f
+    )
+        internal
+        pure
+        returns (uint r)
+    {
+        r = self[0];
+        for (uint i = 1; i < self.length; i++) {
+            r = f(r, self[i]);
+        }
+    }
+
+    function range(uint length) internal pure returns (uint[] memory r) {
+        r = new uint[](length);
+        for (uint i = 0; i < r.length; i++) {
+            r[i] = i;
+        }
+    }
+}
+
+
+contract Pyramid {
+    using ArrayUtils for *;
+
+    function pyramid(uint l) public pure returns (uint) {
+        return ArrayUtils.range(l).map(square).reduce(sum);
+    }
+
+    function square(uint x) internal pure returns (uint) {
+        return x * x;
+    }
+
+    function sum(uint x, uint y) internal pure returns (uint) {
+        return x + y;
+    }
+}
+```
+
+Q：solidity function可以直接变量.使用function？用法有点奇怪？
+
+3、引用类型
+
+3.1 数组
+
+数组可以在声明时指定长度，也可以动态调整大小。
+
+一个元素类型为 T，固定长度为 k 的数组可以声明为 T[k]， 而动态数组声明为 T[]。
+
+数组成员
+
+length:
+数组有 length 成员变量表示当前数组的长度。一经创建， 内存memory数组的大小就是固定的（但却是动态的，也就是说，它依赖于运行时的参数）。
+
+push():
+动态存储数组和 bytes （不是 string ）有一个叫 push() 的成员函数， 您可以用它在数组的末尾追加一个零初始化的元素。它返回一个元素的引用， 因此可以像 x.push().t = 2 或 x.push() = b 那样使用。
+
+push(x):
+动态存储数组和 bytes （不是 string ）有一个叫 push(x) 的成员函数， 您可以用它在数组的末端追加一个指定的元素。该函数不返回任何东西。
+
+pop():
+动态存储数组和 bytes （不是 string ）有一个叫 pop() 的成员函数， 您可以用它来从数组的末端移除一个元素。 这也隐含地在被删除的元素上调用 delete。该函数不返回任何东西。
+
+数组切片
+
+数组切片是对一个数组的连续部分的预览。 它们被写成 x[start:end]，其中 start 和 end 是表达式， 结果是uint256类型（或隐含的可转换类型）。分片的第一个元素是 x[start]， 最后一个元素是 x[end - 1]。
+
+如果 start 大于 end，或者 end 大于数组的长度， 就会出现异常。
+
+start 和 end 都是可选的： start 默认为 0， end 默认为数组的长度。
+
+3.2、结构体
+
+Solidity 提供了一种以结构形式定义新类型的方法，结构类型可以在映射和数组内使用， 它们本身可以包含映射和数组。
+
+结构体不可能包含其自身类型的成员，尽管结构本身可以是映射成员的值类型， 或者它可以包含其类型的动态大小的数组。 这一限制是必要的，因为结构的大小必须是有限的。
+
+3.3、映射类型
+
+映射类型使用语法 mapping(KeyType KeyName? => ValueType ValueName?)， 映射类型的变量使用语法 mapping(KeyType KeyName? => ValueType ValueName?) VariableName 声明。 KeyType 可以是任何内置的值类型， bytes， string，或任何合约或枚举类型。 其他用户定义的或复杂的类型，如映射，结构体或数组类型是不允许的。 ValueType 可以是任何类型，包括映射，数组和结构体。 KeyName 和 ValueName 是可选的（所以 mapping(KeyType => ValueType) 也可以使用）， 可以是任何有效的标识符，而不是一个类型。
+
+```solidity
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity >=0.4.0 <0.9.0;
+
+contract MappingExample {
+    mapping(address => uint) public balances;
+
+    function update(uint newBalance) public {
+        balances[msg.sender] = newBalance;
+    }
+}
+
+contract MappingUser {
+    function f() public returns (uint) {
+        MappingExample m = new MappingExample();
+        m.update(100);
+        return m.balances(address(this));
+    }
+}
+```
+
+4、地址类型
+
+正如在 地址字面常数（Address Literals） 中所描述的那样，正确大小并通过校验测试的十六进制字是 address 类型。 其他字面常数不能隐含地转换为 address 类型。
+
+只允许从 bytes20 和 uint160 显式转换到 address。
+
+address a 可以通过 payable(a) 显式转换为 address payable。
+
+Note：在 0.8.0 版本之前，可以显式地从任何整数类型（任何大小，有符号或无符号）转换为 address 或 address payable 类型。 从 0.8.0 开始，只允许从 uint160 转换。
+
+Note：该篇文章内容丰富，后续遇到问题再细致查阅，本次只做概览目的
 
